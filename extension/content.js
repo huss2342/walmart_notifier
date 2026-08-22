@@ -72,3 +72,40 @@ const observer = new MutationObserver(() => {
 });
 observer.observe(document.body, { childList: true, subtree: true });
 relay();
+
+// --- Self-refresh -----------------------------------------------------------
+// Reloads the reviewer tab on an interval so a tab left open keeps finding new
+// items on its own. This is your own browser and your own signed-in session,
+// so it looks like what it is: a page someone left open.
+
+const INTERACTION_GRACE_MS = 30_000;
+const RETRY_MS = 15_000;
+const JITTER = 0.2;
+
+let lastInteraction = 0;
+for (const evt of ['click', 'keydown', 'scroll']) {
+  document.addEventListener(evt, () => { lastInteraction = Date.now(); },
+                            { passive: true, capture: true });
+}
+
+function reloadWhenIdle() {
+  // Never yank the page out from under someone mid-claim.
+  if (Date.now() - lastInteraction < INTERACTION_GRACE_MS) {
+    setTimeout(reloadWhenIdle, RETRY_MS);
+    return;
+  }
+  location.reload();
+}
+
+async function scheduleRefresh() {
+  if (!REVIEW_PATH.test(location.pathname)) return;
+  const { refreshMinutes = 0 } = await chrome.storage.sync.get(['refreshMinutes']);
+  if (!refreshMinutes || refreshMinutes <= 0) return;
+
+  // +/-20% jitter: staggered reloads beat a metronome, and it costs nothing.
+  const base = refreshMinutes * 60_000;
+  const delay = base * (1 + (Math.random() * 2 - 1) * JITTER);
+  setTimeout(reloadWhenIdle, delay);
+}
+
+scheduleRefresh();

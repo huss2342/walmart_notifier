@@ -9,20 +9,43 @@
   button { margin-top: 1.25rem; padding: .5rem 1.25rem; font: inherit;
            background: #0071dc; color: #fff; border: 0; border-radius: 4px; cursor: pointer; }
   .hint { color: #666; font-weight: 400; font-size: .85em; }
-  #status { margin-left: .75rem; color: #087443; }
+  #saved { margin-left: .75rem; color: #087443; }
+  .status { margin-top: 2rem; padding: .75rem 1rem; border-radius: 6px;
+            background: #f4f6f8; border: 1px solid #e2e6ea; }
+  .status h2 { margin: 0 0 .5rem; font-size: 1em; }
+  .ok { color: #087443; } .warn { color: #a15c00; } .bad { color: #b3261e; }
 </style>
 <h1>Reviewer Item Relay</h1>
 <p class="hint">
   Reads items from the reviewer page you already have open and signed in, and
   posts them to your own notifier. No Walmart credentials are stored here.
 </p>
+
 <label>Ingest endpoint
   <span class="hint">The <code>ingestUrl</code> printed by <code>infra/deploy.sh</code>, including its <code>?code=</code> function key.</span>
   <input id="endpoint" type="url" placeholder="https://wmrev-func-abc123.azurewebsites.net/api/ingest?code=...">
 </label>
+
 <label>Ingest token
   <span class="hint">Matches the <code>INGEST_TOKEN</code> app setting. Optional.</span>
   <input id="token" type="password" placeholder="optional shared secret">
 </label>
-<button id="save">Save</button><span id="status"></span>
+
+<label>Auto-refresh every (minutes)
+  <span class="hint">
+    Reloads the reviewer tab on its own so you can leave it open and walk away.
+    <strong>0 disables it</strong> — the relay then only reads the page when you
+    load it yourself. A reload is deferred while you are actively clicking or
+    scrolling, so it will not interrupt a claim.
+  </span>
+  <input id="refreshMinutes" type="number" min="0" max="120" step="1" placeholder="0">
+</label>
+
+<button id="save">Save</button><span id="saved"></span>
+
+<div class="status">
+  <h2>Status</h2>
+  <div id="status">Loading…</div>
+</div>
+
 <script src="options.js"></script>

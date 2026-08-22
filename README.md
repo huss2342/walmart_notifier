@@ -4,6 +4,52 @@ Instant phone alerts when new items appear in the Walmart Recognized Reviewer
 ("Spark Reviewer") program, filtered by keyword and minimum retail value.
 Runs on Azure for well under $1/month.
 
+## Does it work?
+
+Yes. To be precise about which parts are which:
+
+**The alerting engine is built, tested and working.** Given an item, it applies
+your rules (`value >= $100`, keywords, exclusions), skips anything it has
+already alerted on, and pushes to your phone. 69 tests cover it. That part is
+done.
+
+**It needs something feeding it items.** There are two feeds, and they cover
+different situations:
+
+| | Reads the actual portal | Runs when your computer is off | Needs |
+|---|---|---|---|
+| **Browser tab** | yes | no | a tab left open, signed in |
+| **Email** | no — reads Walmart's mail to you | yes, 24/7 | Walmart to email you about drops |
+
+**Check this first:** search your inbox for past Walmart/Bazaarvoice reviewer
+mail. If they email you when items drop, turn on the email source and you get
+genuine 24/7 alerting with nothing running on your machine. If they don't, the
+browser tab is your real source and alerting runs whenever your computer is
+awake. I could not confirm either way from public documentation — your inbox is
+the authority.
+
+Nothing stops you running both. They feed the same endpoint and the same dedupe
+store, so an item arriving twice still only buzzes once.
+
+### The leave-a-tab-open mode
+
+This is the mode to use, and the extension does it. Set **auto-refresh** in the
+extension options to e.g. 3 minutes and leave the reviewer page open in a tab.
+It reloads itself, reads what appeared, and relays anything new. A reload is
+deferred while you are clicking or scrolling, so it won't interrupt you
+mid-claim, and the interval is jittered rather than metronomic.
+
+It's your own browser, your own residential IP, your own session, and a real
+browser fingerprint — which is why this works where a datacenter bot doesn't.
+The honest caveat is that it is still automated retrieval on a schedule, so the
+ToS clause quoted below is broad enough to reach it. It is much lower exposure
+than a headless bot, not zero exposure. Your account, your call.
+
+Its limitation is the obvious one: a sleeping laptop relays nothing. If you want
+coverage while your machine is off and Walmart doesn't email you, there is no
+clean way to get it — that gap is real, and closing it is exactly what would
+require the credential bot below.
+
 ## Read this before you deploy
 
 Your idea is technically doable, and most of it is built here. But the specific
@@ -71,11 +117,10 @@ Two sources, both things you already have access to:
   without touching your main account. This is the recommended default.
 - **Browser extension (`extension/`)** — a small Chrome extension that reads the
   reviewer page *you* have open in *your* signed-in browser and POSTs what it
-  sees to your endpoint. No stored credentials, no headless browser, no
-  datacenter IP, nothing to evade — it only ever sees a page you navigated to
-  yourself. Note this is still automated reading of page content, which the ToS
-  language above is broad enough to cover; it is materially less exposed than a
-  datacenter bot, but it is not zero. Read the clause and decide for yourself.
+  sees to your endpoint. With auto-refresh on it reloads that tab on a jittered
+  interval, so leaving the tab open is the whole operating procedure. No stored
+  credentials, no headless browser, no datacenter IP, nothing to evade. See
+  [The leave-a-tab-open mode](#the-leave-a-tab-open-mode) for the trade-off.
 
 For true push latency instead of a 2-minute poll, forward Walmart mail to the
 `/api/ingest` endpoint via SendGrid Inbound Parse or Cloudflare Email Workers —
@@ -142,8 +187,17 @@ export INGEST_TOKEN="$(openssl rand -hex 24)"
 curl -s "https://<app>.azurewebsites.net/api/health" | python3 -m json.tool
 ```
 
-Then load `extension/` via `chrome://extensions` → Developer mode → Load
-unpacked, and paste the `ingestUrl` and `INGEST_TOKEN` into its options page.
+Then set up the browser tab mode:
+
+1. `chrome://extensions` → Developer mode → **Load unpacked** → pick `extension/`
+2. Open its **options** page, paste the `ingestUrl` and `INGEST_TOKEN`
+3. Set **auto-refresh** to 3 minutes (0 disables it)
+4. Open your reviewer page in a tab and leave it there
+
+The options page shows a **Status** panel — last relay time, items read, alerts
+sent, and any error. If it says "Nothing relayed yet" after you've loaded the
+reviewer page, the endpoint or token is wrong. Silent failure is the main risk
+with a background relay, so check that panel occasionally.
 
 ## Cost
 
