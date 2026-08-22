@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "Reviewer Item Relay",
+  "version": "1.0.0",
+  "description": "Relays items from your own signed-in reviewer page to your notifier endpoint.",
+  "permissions": ["storage", "alarms"],
+  "host_permissions": ["https://www.walmart.com/*"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": ["https://www.walmart.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "options_page": "options.html",
+  "action": { "default_title": "Reviewer Item Relay" }
+}

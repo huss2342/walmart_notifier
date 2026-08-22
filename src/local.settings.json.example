@@ -1,0 +1,19 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+
+    "POLL_SCHEDULE": "0 */2 * * * *",
+
+    "NOTIFY_PROVIDER": "ntfy",
+    "NTFY_TOPIC": "replace-with-a-long-random-string",
+
+    "IMAP_HOST": "imap.gmail.com",
+    "IMAP_USER": "you@gmail.com",
+    "IMAP_PASSWORD": "<gmail app password - NOT your account password>",
+    "IMAP_SENDERS": "walmart.com,bazaarvoice.com",
+
+    "INGEST_TOKEN": "another-long-random-string"
+  }
+}

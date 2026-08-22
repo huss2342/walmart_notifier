@@ -1,0 +1,13 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "namePrefix":     { "value": "wmrev" },
+    "notifyProvider": { "value": "ntfy" },
+    "pollSchedule":   { "value": "0 */2 * * * *" },
+    "ntfyTopic":      { "value": "CHANGE-ME-long-random-string" },
+    "imapHost":       { "value": "imap.gmail.com" },
+    "imapUser":       { "value": "you@gmail.com" },
+    "enableAppInsights": { "value": true }
+  }
+}

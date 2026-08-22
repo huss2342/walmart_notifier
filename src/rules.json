@@ -1,0 +1,17 @@
+{
+  "_comment": "Items in the Recognized Reviewer program are free to claim, so min_value_usd filters on RETAIL value - 'only wake me for the expensive stuff'. Rules are evaluated top-down; the first match wins and sets the notification priority.",
+  "rules": [
+    {
+      "name": "big-ticket",
+      "min_value_usd": 100.0,
+      "priority": "high",
+      "exclude_keywords": ["gift card", "protection plan", "warranty"]
+    },
+    {
+      "name": "watched-keywords",
+      "keywords": ["laptop", "headphones", "monitor", "vacuum", "espresso", "air fryer"],
+      "min_value_usd": 40.0,
+      "priority": "normal"
+    }
+  ]
+}
