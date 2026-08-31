@@ -8,6 +8,7 @@ import os
 import requests
 
 from models import Item
+
 from .base import format_message
 
 log = logging.getLogger(__name__)
@@ -25,7 +26,7 @@ class PushoverNotifier:
         self.device = device
 
     @classmethod
-    def from_env(cls) -> "PushoverNotifier":
+    def from_env(cls) -> PushoverNotifier:
         return cls(
             token=os.environ.get("PUSHOVER_TOKEN", ""),
             user_key=os.environ.get("PUSHOVER_USER_KEY", ""),

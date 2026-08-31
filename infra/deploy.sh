@@ -5,6 +5,7 @@ set -euo pipefail
 RG="${RG:-walmart-notifier-rg}"
 LOCATION="${LOCATION:-eastus}"
 PREFIX="${PREFIX:-wmrev}"
+SEED_MODE="${SEED_MODE:-false}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 for tool in az func; do
@@ -16,7 +17,7 @@ done
 echo "==> Resource group $RG ($LOCATION)"
 az group create --name "$RG" --location "$LOCATION" --output none
 
-echo "==> Provisioning infrastructure"
+echo "==> Provisioning infrastructure (seedMode=$SEED_MODE)"
 OUTPUTS=$(az deployment group create \
   --resource-group "$RG" \
   --template-file "$ROOT/infra/main.bicep" \
@@ -30,6 +31,7 @@ OUTPUTS=$(az deployment group create \
       imapPassword="${IMAP_PASSWORD:-}" \
       ingestToken="${INGEST_TOKEN:-}" \
       notifySecret="${NOTIFY_SECRET:-}" \
+      seedMode="$SEED_MODE" \
   --query properties.outputs --output json)
 
 APP_NAME=$(echo "$OUTPUTS" | python3 -c 'import json,sys; print(json.load(sys.stdin)["functionAppName"]["value"])')
@@ -45,10 +47,43 @@ az functionapp restart --name "$APP_NAME" --resource-group "$RG" --output none
 echo "==> Publishing function code to $APP_NAME"
 ( cd "$ROOT/src" && func azure functionapp publish "$APP_NAME" --python --build remote )
 
+# The ingest route is auth_level=FUNCTION, so the URL is useless without its
+# key. Key listing only works once the runtime has indexed the new code, which
+# lags the publish by a few seconds.
+echo "==> Fetching the ingest function key"
+INGEST_KEY=""
+for attempt in 1 2 3 4 5 6; do
+  INGEST_KEY=$(az functionapp function keys list \
+    --resource-group "$RG" --name "$APP_NAME" --function-name ingest \
+    --query default --output tsv 2>/dev/null || true)
+  [ -n "$INGEST_KEY" ] && break
+  sleep 10
+done
+if [ -z "$INGEST_KEY" ]; then
+  # Host keys work on any function in the app and are a fine fallback.
+  INGEST_KEY=$(az functionapp keys list --resource-group "$RG" --name "$APP_NAME" \
+    --query 'functionKeys.default' --output tsv 2>/dev/null || true)
+fi
+
 echo
 echo "Deployed."
 echo "  health: $HEALTH"
-echo "  ingest: $INGEST"
-echo "  ntfy:   subscribe to '$NTFY_TOPIC' in the ntfy app"
+if [ -n "$INGEST_KEY" ]; then
+  echo "  ingest: $INGEST?code=$INGEST_KEY"
+  echo "          ^ paste this whole URL into the extension options page"
+else
+  echo "  ingest: $INGEST"
+  echo "  warning: could not read the function key. The extension needs it. Run:" >&2
+  echo "    az functionapp function keys list -g $RG -n $APP_NAME --function-name ingest --query default -o tsv" >&2
+fi
+echo "  ntfy:   subscribe to your topic in the ntfy app"
+echo
+if [ "$SEED_MODE" = "true" ]; then
+  echo "SEED_MODE is on: items are recorded as seen and nothing is sent."
+  echo "Let one poll cycle run, then redeploy with SEED_MODE=false to start alerting."
+else
+  echo "Note: on a fresh dedupe table the first run alerts on everything it finds."
+  echo "To avoid that, deploy once with SEED_MODE=true, then again with false."
+fi
 echo
 echo "Verify with:  curl -s $HEALTH | python3 -m json.tool"

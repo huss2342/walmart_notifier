@@ -9,7 +9,7 @@ import os
 
 import azure.functions as func
 
-from config import load_rules
+from config import load_rules, seed_mode
 from notifiers import build_notifier
 from pipeline import process
 from sources.imap_source import ImapSource
@@ -38,17 +38,29 @@ def poll(timer: func.TimerRequest) -> None:
     rules = load_rules()
     store = SeenStore()
     notifier = build_notifier()
+    seed = seed_mode()
 
+    source = None
     items = []
     if os.environ.get("IMAP_HOST"):
         try:
-            items.extend(ImapSource.from_env().fetch())
+            source = ImapSource.from_env(store=store)
+            items.extend(source.fetch())
         except Exception:
             log.exception("Email source failed this run.")
     else:
         log.info("IMAP_HOST unset; running in ingest-only mode.")
 
-    summary = process(items, rules, store, notifier)
+    summary = process(items, rules, store, notifier, seed_only=seed)
+
+    # Only advance the IMAP high-water mark once everything that matched was
+    # actually delivered. A failed push leaves the marker where it is so the
+    # next run re-reads the same mail and tries again.
+    if source is not None and summary.failed == 0:
+        source.commit_marker()
+    elif source is not None:
+        log.warning("Holding IMAP marker: %s deliveries failed this run.", summary.failed)
+
     log.info("Poll complete: %s", json.dumps(summary.as_dict()))
 
 
@@ -69,7 +81,9 @@ def ingest(req: func.HttpRequest) -> func.HttpResponse:
         log.exception("Could not parse ingest payload.")
         return func.HttpResponse("bad payload", status_code=400)
 
-    summary = process(items, load_rules(), SeenStore(), build_notifier())
+    summary = process(
+        items, load_rules(), SeenStore(), build_notifier(), seed_only=seed_mode()
+    )
     return func.HttpResponse(
         json.dumps(summary.as_dict()),
         status_code=200,
@@ -80,15 +94,20 @@ def ingest(req: func.HttpRequest) -> func.HttpResponse:
 @app.function_name(name="health")
 @app.route(route="health", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
 def health(req: func.HttpRequest) -> func.HttpResponse:
-    """Liveness probe; also surfaces which parts are actually configured."""
+    """Liveness probe.
+
+    Anonymous, so it deliberately reports only whether each part is configured.
+    Rule names and the poll cadence are the user's business, not the internet's.
+    """
+    notifier = build_notifier()
     return func.HttpResponse(
         json.dumps(
             {
                 "status": "ok",
-                "rules": [r.name for r in load_rules()],
-                "notifier": os.environ.get("NOTIFY_PROVIDER", "ntfy"),
+                "rules": len(load_rules()),
+                "notifier_configured": type(notifier).__name__ != "NullNotifier",
                 "email_source": bool(os.environ.get("IMAP_HOST")),
-                "schedule": _poll_schedule(),
+                "seed_mode": seed_mode(),
             }
         ),
         mimetype="application/json",

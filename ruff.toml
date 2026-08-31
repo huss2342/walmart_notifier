@@ -1,0 +1,15 @@
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4", "RET"]
+ignore = [
+  # Azure defines these names; they are not ours to capitalise.
+  "SIM112",
+]
+
+[lint.per-file-ignores]
+# Tests reach into private helpers on purpose, to pin the incremental-fetch
+# behaviour that the public API only exposes indirectly.
+"tests/*" = ["SLF001"]

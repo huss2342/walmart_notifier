@@ -6,7 +6,8 @@ EMAIL_HTML = """
   <h1>New items available to claim</h1>
   <table>
     <tr>
-      <td><a href="https://www.walmart.com/ip/Ninja-Air-Fryer-XL/456789123">Ninja Air Fryer XL</a></td>
+      <td><a href="https://www.walmart.com/ip/Ninja-Air-Fryer-XL/456789123"
+        >Ninja Air Fryer XL</a></td>
       <td>Retail value $129.99</td>
     </tr>
     <tr>

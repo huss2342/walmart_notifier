@@ -1,13 +1,14 @@
 {
   "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
   "contentVersion": "1.0.0.0",
+  "_comment": "Secure parameters (ntfyTopic, imapPassword, ingestToken, notifySecret) are deliberately absent: values in a parameter file land in the deployment history in plaintext. Pass them on the CLI, or let infra/deploy.sh read them from the environment.",
   "parameters": {
     "namePrefix":     { "value": "wmrev" },
     "notifyProvider": { "value": "ntfy" },
     "pollSchedule":   { "value": "0 */2 * * * *" },
-    "ntfyTopic":      { "value": "CHANGE-ME-long-random-string" },
     "imapHost":       { "value": "imap.gmail.com" },
     "imapUser":       { "value": "you@gmail.com" },
+    "seedMode":       { "value": false },
     "enableAppInsights": { "value": true }
   }
 }

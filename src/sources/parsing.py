@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import html
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Iterator
 
 from models import Item, parse_prices
 

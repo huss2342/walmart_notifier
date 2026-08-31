@@ -2,10 +2,45 @@
 // what is on screen and hands it to the background worker -- it does not log
 // in, does not fetch anything on its own, and does nothing on pages the user
 // has not navigated to.
+//
+// The reload schedule lives in background.js, not here: a content script dies
+// with its page, so a reload landing on a sign-in redirect would silently end
+// the loop. This script only reports whether the user is mid-interaction.
 
 const ITEM_LINK = 'a[href*="/ip/"]';
 const PRICE_RE = /\$\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)/;
-const REVIEW_PATH = /\/(reviews|account|reviewer)/i;
+const DEFAULT_PATH_PATTERN = '^/(reviewer|reviews)';
+
+// Order history and tracking pages are full of /ip/ links to things the user
+// already bought. Relaying those would alert on their own past purchases as if
+// they were new offers, so they are excluded whatever the pattern says.
+const EXCLUDE_PATH = /\/(orders?|purchase-history|track|returns)\b/i;
+
+const INTERACTION_GRACE_MS = 30_000;
+
+let lastInteraction = 0;
+for (const evt of ['click', 'keydown', 'scroll']) {
+  document.addEventListener(evt, () => { lastInteraction = Date.now(); },
+                            { passive: true, capture: true });
+}
+
+// Never yank the page out from under someone mid-claim.
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg?.type === 'busy?') {
+    sendResponse({ busy: Date.now() - lastInteraction < INTERACTION_GRACE_MS });
+  }
+});
+
+async function isReviewerPage() {
+  if (EXCLUDE_PATH.test(location.pathname)) return false;
+  const { pathPattern = DEFAULT_PATH_PATTERN } =
+    await chrome.storage.local.get(['pathPattern']);
+  try {
+    return new RegExp(pathPattern, 'i').test(location.pathname);
+  } catch {
+    return new RegExp(DEFAULT_PATH_PATTERN, 'i').test(location.pathname);
+  }
+}
 
 function idFromHref(href) {
   const m = href.match(/\/ip\/(?:[^/?#]+\/)?(\d{6,})/);
@@ -50,62 +85,18 @@ function collect() {
   return [...byId.values()];
 }
 
-let lastPayload = '';
-
-function relay() {
-  if (!REVIEW_PATH.test(location.pathname)) return;
+async function relay() {
+  if (!(await isReviewerPage())) return;
   const items = collect();
   if (!items.length) return;
-
-  // Cheap change detection so idling on a page does not re-POST every few
-  // seconds; the server dedupes too, this just saves the round trip.
-  const fingerprint = items.map((i) => i.item_id).sort().join(',');
-  if (fingerprint === lastPayload) return;
-  lastPayload = fingerprint;
-
+  // The background worker dedupes across reloads and the server dedupes again.
   chrome.runtime.sendMessage({ type: 'items', items });
 }
 
+let relayTimer;
 const observer = new MutationObserver(() => {
-  clearTimeout(window.__relayTimer);
-  window.__relayTimer = setTimeout(relay, 1500);
+  clearTimeout(relayTimer);
+  relayTimer = setTimeout(relay, 1500);
 });
 observer.observe(document.body, { childList: true, subtree: true });
 relay();
-
-// --- Self-refresh -----------------------------------------------------------
-// Reloads the reviewer tab on an interval so a tab left open keeps finding new
-// items on its own. This is your own browser and your own signed-in session,
-// so it looks like what it is: a page someone left open.
-
-const INTERACTION_GRACE_MS = 30_000;
-const RETRY_MS = 15_000;
-const JITTER = 0.2;
-
-let lastInteraction = 0;
-for (const evt of ['click', 'keydown', 'scroll']) {
-  document.addEventListener(evt, () => { lastInteraction = Date.now(); },
-                            { passive: true, capture: true });
-}
-
-function reloadWhenIdle() {
-  // Never yank the page out from under someone mid-claim.
-  if (Date.now() - lastInteraction < INTERACTION_GRACE_MS) {
-    setTimeout(reloadWhenIdle, RETRY_MS);
-    return;
-  }
-  location.reload();
-}
-
-async function scheduleRefresh() {
-  if (!REVIEW_PATH.test(location.pathname)) return;
-  const { refreshMinutes = 0 } = await chrome.storage.sync.get(['refreshMinutes']);
-  if (!refreshMinutes || refreshMinutes <= 0) return;
-
-  // +/-20% jitter: staggered reloads beat a metronome, and it costs nothing.
-  const base = refreshMinutes * 60_000;
-  const delay = base * (1 + (Math.random() * 2 - 1) * JITTER);
-  setTimeout(reloadWhenIdle, delay);
-}
-
-scheduleRefresh();

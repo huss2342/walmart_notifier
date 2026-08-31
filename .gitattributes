@@ -1,0 +1,6 @@
+* text=auto eol=lf
+
+# A shell script with CRLF line endings fails on Linux with a confusing
+# "bad interpreter" error, so pin these regardless of platform.
+*.sh text eol=lf
+*.bicep text eol=lf

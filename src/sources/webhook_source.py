@@ -14,6 +14,7 @@ import logging
 from typing import Any
 
 from models import Item, parse_price
+
 from .parsing import extract_items
 
 log = logging.getLogger(__name__)
