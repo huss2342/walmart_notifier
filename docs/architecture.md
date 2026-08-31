@@ -27,9 +27,25 @@ class ItemSource(Protocol):
     def fetch(self) -> Iterable[Item]: ...
 ```
 
-Sources do not deduplicate; `pipeline.process` does that against `SeenStore`.
-Returning the same items on every poll is expected and correct. Adding a source
-means implementing `fetch()` and appending it in `function_app.poll`.
+Sources do not deduplicate *items*; `pipeline.process` does that against
+`SeenStore`. Returning the same items on every poll is expected and correct.
+Adding a source means implementing `fetch()` and appending it in
+`function_app.poll`.
+
+Sources may still avoid redundant *transport*, which is a different concern.
+`ImapSource` keeps a `uidvalidity:uid` high-water marker in the same table and
+asks the server only for newer messages. Two details make that safe:
+
+- `UID n:*` returns the newest message even when `n` is past the end of the
+  mailbox, so the server's answer is always filtered against the marker rather
+  than trusted.
+- UIDs are only comparable within one `UIDVALIDITY` generation. The generation
+  is stored alongside the marker, and a change resets to a dated backfill
+  window instead of trusting a UID that now means something else.
+
+The marker is *pending* until `commit_marker()`, and `function_app.poll` calls
+that only when no delivery failed. Advancing it on a failed push would mean the
+mail is never read again and the alert is simply lost.
 
 ## Price extraction
 
@@ -61,8 +77,14 @@ rather than dropped; `Rule.alert_on_unknown_value` decides what happens next.
 
 Deliberate choices about what happens when something breaks:
 
-- **Delivery failure leaves the item unmarked**, so the next run retries instead
-  of silently swallowing an item you wanted.
+- **Delivery failure releases the item's claim**, so the next run retries
+  instead of silently swallowing an item you wanted. It also holds the IMAP
+  marker back, so the source re-reads the mail that mentioned it.
+- **Notifying requires winning an atomic claim.** The timer and the ingest
+  endpoint can be holding the same item at the same moment; both will have read
+  the store before either writes. `SeenStore.claim` is a Table Storage entity
+  *create*, which the service rejects for an existing row key, so exactly one
+  of them buzzes the phone.
 - **Dedupe lookup failure fails closed** (treats the item as seen). A storage
   blip should not machine-gun your phone with repeats.
 - **Non-matching items are still marked seen**, so loosening a rule later does
@@ -79,6 +101,24 @@ so a retitled listing does not re-alert. Without a URL it falls back to a hash
 of the normalised title. Ids live in Table Storage under a single partition —
 point lookups by `RowKey`, which is the cheapest access pattern Table Storage
 has.
+
+## The extension's refresh loop
+
+The reload schedule lives in `background.js`, not in the content script. A
+content script dies with its page, so a reload landing on a sign-in redirect or
+a bot-check interstitial would end the loop permanently and silently -- exactly
+the state the refresh exists to escape. A `chrome.alarms` alarm in the service
+worker keeps firing regardless of what the tab currently shows, and asks the
+content script whether the user is mid-interaction before reloading. A tab with
+no content script answering is reloaded anyway.
+
+Change detection also lives in the background worker. In the content script it
+was re-initialised on every reload, so each refresh re-POSTed the whole page.
+
+The worker posts to a different origin than the pages it reads, so the manifest
+needs `https://*.azurewebsites.net/*` in `host_permissions`. Without it the
+fetch is subject to CORS, Azure Functions answers no preflight, and every relay
+fails silently. A custom domain on the Function App means editing that entry.
 
 ## Latency
 

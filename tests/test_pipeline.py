@@ -78,10 +78,61 @@ def test_summary_counts_across_mixed_batch(store, rules):
         Item(title="Laptop", value_usd=899.0),
     ]
     summary = process(items, rules, store, notifier)
-    assert summary.as_dict() == {"seen": 3, "new": 3, "matched": 2, "notified": 2}
+    assert summary.as_dict() == {"seen": 3, "new": 3, "matched": 2, "notified": 2,
+                                 "failed": 0, "seeded": 0}
 
 
 def test_empty_batch_is_a_no_op(store, rules):
     assert process([], rules, store, FakeNotifier()).as_dict() == {
-        "seen": 0, "new": 0, "matched": 0, "notified": 0
+        "seen": 0, "new": 0, "matched": 0, "notified": 0, "failed": 0, "seeded": 0
     }
+
+
+def test_failed_delivery_is_counted(store, rules):
+    summary = process([Item(title="TV", value_usd=500.0)], rules, store,
+                      FakeNotifier(succeed=False))
+    assert summary.failed == 1 and summary.notified == 0
+
+
+def test_seed_mode_records_without_sending(store, rules):
+    notifier = FakeNotifier()
+    items = [Item(title="TV", value_usd=500.0), Item(title="Laptop", value_usd=899.0)]
+
+    seeded = process(items, rules, store, notifier, seed_only=True)
+    assert seeded.seeded == 2 and seeded.notified == 0
+    assert notifier.sent == []
+
+    # Seeded items stay quiet on the next, real run.
+    assert process(items, rules, store, notifier).new == 0
+
+
+def test_concurrent_claim_only_notifies_once(store, rules):
+    """The timer and the ingest endpoint can both be holding the same item.
+
+    Both read the store before either writes, so both see it as new. Only the
+    one that wins the claim is allowed to buzz the phone.
+    """
+    item = Item(title="TV", value_usd=500.0)
+
+    # Simulate the loser of the race: the read said "new", the write says
+    # someone else got there first.
+    store.is_new = lambda item_id: True
+    real_claim = store.claim
+    store.claim = lambda item_id, title="": False
+
+    notifier = FakeNotifier()
+    summary = process([item], rules, store, notifier)
+    assert summary.new == 1
+    assert summary.matched == 0 and summary.notified == 0
+    assert notifier.sent == []
+
+    # The winner does send.
+    store.claim = real_claim
+    assert process([item], rules, store, notifier).notified == 1
+
+
+def test_claim_is_released_when_delivery_fails(store, rules):
+    item = Item(title="TV", value_usd=500.0)
+    process([item], rules, store, FakeNotifier(succeed=False))
+    # The claim is gone, so a later run can take it.
+    assert store.claim(item.item_id) is True

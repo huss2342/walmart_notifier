@@ -8,6 +8,7 @@ import os
 import requests
 
 from models import Item
+
 from .base import format_message
 
 log = logging.getLogger(__name__)
@@ -21,7 +22,7 @@ class TelegramNotifier:
         self.chat_id = chat_id
 
     @classmethod
-    def from_env(cls) -> "TelegramNotifier":
+    def from_env(cls) -> TelegramNotifier:
         return cls(
             bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
             chat_id=os.environ.get("TELEGRAM_CHAT_ID", ""),

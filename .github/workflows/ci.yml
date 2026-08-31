@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"   # matches linuxFxVersion in infra/main.bicep
+      - run: pip install -r src/requirements.txt pytest ruff
+      - run: ruff check .
+      - run: python -m pytest -q
+
+  extension:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      # Cheap syntax gate: a typo in the service worker is otherwise only
+      # visible as a silently dead relay.
+      - run: for f in extension/*.js; do node --check "$f"; done
+      - run: python3 -c "import json,sys; json.load(open('extension/manifest.json'))"
+
+  infra:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # azure-cli is preinstalled on GitHub's ubuntu runners.
+      - run: az bicep build --file infra/main.bicep --stdout > /dev/null
+      - run: bash -n infra/deploy.sh

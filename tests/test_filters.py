@@ -1,4 +1,3 @@
-import pytest
 
 from filters import Rule, first_match, matches
 from models import Item

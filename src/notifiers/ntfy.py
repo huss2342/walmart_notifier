@@ -8,6 +8,7 @@ import os
 import requests
 
 from models import Item
+
 from .base import format_message
 
 log = logging.getLogger(__name__)
@@ -24,7 +25,7 @@ class NtfyNotifier:
         self.token = token
 
     @classmethod
-    def from_env(cls) -> "NtfyNotifier":
+    def from_env(cls) -> NtfyNotifier:
         return cls(
             topic=os.environ.get("NTFY_TOPIC", ""),
             server=os.environ.get("NTFY_SERVER", "https://ntfy.sh"),

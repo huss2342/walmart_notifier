@@ -10,6 +10,7 @@
            background: #0071dc; color: #fff; border: 0; border-radius: 4px; cursor: pointer; }
   .hint { color: #666; font-weight: 400; font-size: .85em; }
   #saved { margin-left: .75rem; color: #087443; }
+  #pathError { color: #b3261e; font-weight: 400; font-size: .85em; }
   .status { margin-top: 2rem; padding: .75rem 1rem; border-radius: 6px;
             background: #f4f6f8; border: 1px solid #e2e6ea; }
   .status h2 { margin: 0 0 .5rem; font-size: 1em; }
@@ -19,10 +20,12 @@
 <p class="hint">
   Reads items from the reviewer page you already have open and signed in, and
   posts them to your own notifier. No Walmart credentials are stored here.
+  Settings are kept in this browser only — they are never synced to your Google
+  account, because the endpoint URL contains a key.
 </p>
 
 <label>Ingest endpoint
-  <span class="hint">The <code>ingestUrl</code> printed by <code>infra/deploy.sh</code>, including its <code>?code=</code> function key.</span>
+  <span class="hint">The <code>ingest</code> URL printed by <code>infra/deploy.sh</code>, including its <code>?code=</code> function key.</span>
   <input id="endpoint" type="url" placeholder="https://wmrev-func-abc123.azurewebsites.net/api/ingest?code=...">
 </label>
 
@@ -31,12 +34,24 @@
   <input id="token" type="password" placeholder="optional shared secret">
 </label>
 
+<label>Reviewer page path
+  <span class="hint">
+    A regular expression matched against the URL path of the page to read and
+    reload. Set this to whatever your reviewer portal actually lives at — the
+    default is a guess. Order and returns pages are always excluded, so the
+    relay never reports your own past purchases as new items.
+  </span>
+  <input id="pathPattern" type="text" placeholder="^/(reviewer|reviews)">
+  <span id="pathError"></span>
+</label>
+
 <label>Auto-refresh every (minutes)
   <span class="hint">
     Reloads the reviewer tab on its own so you can leave it open and walk away.
     <strong>0 disables it</strong> — the relay then only reads the page when you
     load it yourself. A reload is deferred while you are actively clicking or
-    scrolling, so it will not interrupt a claim.
+    scrolling, so it will not interrupt a claim. Chrome will not schedule an
+    alarm below one minute.
   </span>
   <input id="refreshMinutes" type="number" min="0" max="120" step="1" placeholder="0">
 </label>

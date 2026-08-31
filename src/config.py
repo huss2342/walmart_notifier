@@ -13,6 +13,19 @@ log = logging.getLogger(__name__)
 
 DEFAULT_RULES = [Rule(name="high-value", min_value_usd=100.0, priority="high")]
 
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def seed_mode() -> bool:
+    """Whether to record items as seen without alerting on them.
+
+    A fresh dedupe table means every listing already on the page -- and every
+    item in the last day of mail -- looks brand new, so the first real run
+    would fire dozens of pushes at once. Deploy with SEED_MODE=true, let one
+    cycle fill the table, then turn it off.
+    """
+    return os.environ.get("SEED_MODE", "").strip().lower() in _TRUTHY
+
 
 def load_rules() -> list[Rule]:
     """Rules come from RULES_JSON (inline) or RULES_PATH (file), in that order.

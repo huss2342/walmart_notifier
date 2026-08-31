@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
 from typing import Any
-
 
 _PRICE_RE = re.compile(r"\$\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)")
 
@@ -54,7 +53,7 @@ class Item:
     source: str = "unknown"
     raw: dict[str, Any] = field(default_factory=dict)
     first_seen: str = field(
-        default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds")
+        default_factory=lambda: datetime.now(UTC).isoformat(timespec="seconds")
     )
 
     def __post_init__(self) -> None:
@@ -79,8 +78,8 @@ class Item:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Item":
-        known = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
+    def from_dict(cls, data: dict[str, Any]) -> Item:
+        known = set(cls.__dataclass_fields__)  # type: ignore[attr-defined]
         payload = {k: v for k, v in data.items() if k in known}
         if "value_usd" in payload and isinstance(payload["value_usd"], str):
             payload["value_usd"] = parse_price(payload["value_usd"])

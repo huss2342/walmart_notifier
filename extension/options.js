@@ -1,21 +1,40 @@
+// Everything lives in chrome.storage.local: the endpoint carries the function
+// key and the token is a shared secret, so neither belongs in synced storage.
+
+const DEFAULT_PATH_PATTERN = '^/(reviewer|reviews)';
+
 const endpointEl = document.getElementById('endpoint');
 const tokenEl = document.getElementById('token');
+const pathEl = document.getElementById('pathPattern');
+const pathErrorEl = document.getElementById('pathError');
 const refreshEl = document.getElementById('refreshMinutes');
 const savedEl = document.getElementById('saved');
 const statusEl = document.getElementById('status');
 
-chrome.storage.sync.get(['endpoint', 'token', 'refreshMinutes']).then(
-  ({ endpoint = '', token = '', refreshMinutes = 0 }) => {
+chrome.storage.local
+  .get(['endpoint', 'token', 'refreshMinutes', 'pathPattern'])
+  .then(({ endpoint = '', token = '', refreshMinutes = 0,
+           pathPattern = DEFAULT_PATH_PATTERN }) => {
     endpointEl.value = endpoint;
     tokenEl.value = token;
     refreshEl.value = refreshMinutes;
-  }
-);
+    pathEl.value = pathPattern;
+  });
 
 document.getElementById('save').addEventListener('click', async () => {
-  await chrome.storage.sync.set({
+  const pattern = pathEl.value.trim() || DEFAULT_PATH_PATTERN;
+  try {
+    new RegExp(pattern);
+  } catch (err) {
+    pathErrorEl.textContent = `Not a valid regular expression: ${err.message}`;
+    return;
+  }
+  pathErrorEl.textContent = '';
+
+  await chrome.storage.local.set({
     endpoint: endpointEl.value.trim(),
     token: tokenEl.value.trim(),
+    pathPattern: pattern,
     refreshMinutes: Math.max(0, parseInt(refreshEl.value, 10) || 0)
   });
   savedEl.textContent = 'Saved';
@@ -31,35 +50,49 @@ function ago(ts) {
   return hrs === 1 ? '1 hour ago' : `${hrs} hours ago`;
 }
 
-async function renderStatus() {
-  const { endpoint = '' } = await chrome.storage.sync.get(['endpoint']);
-  const { lastRelay, lastSeen = 0, lastNotified = 0, lastError = '', lastErrorAt } =
-    await chrome.storage.local.get(
-      ['lastRelay', 'lastSeen', 'lastNotified', 'lastError', 'lastErrorAt']
-    );
+function line(cls, strong, rest = '') {
+  const span = document.createElement('span');
+  span.className = cls;
+  span.textContent = strong;
+  const div = document.createElement('div');
+  div.appendChild(span);
+  if (rest) div.appendChild(document.createTextNode(` ${rest}`));
+  return div;
+}
 
-  const lines = [];
+async function renderStatus() {
+  const { endpoint = '', lastRelay, lastSeen = 0, lastNotified = 0,
+          lastError = '', lastErrorAt } = await chrome.storage.local.get(
+    ['endpoint', 'lastRelay', 'lastSeen', 'lastNotified', 'lastError', 'lastErrorAt']
+  );
+
+  // Built as nodes rather than an HTML string: lastError can contain a server
+  // response, and that must never be parsed as markup.
+  const frag = document.createDocumentFragment();
   if (!endpoint) {
-    lines.push('<span class="bad">No endpoint configured.</span> Paste your ingest URL above.');
+    frag.appendChild(line('bad', 'No endpoint configured.', 'Paste your ingest URL above.'));
   } else if (!lastRelay) {
-    lines.push(
-      '<span class="warn">Nothing relayed yet.</span> ' +
+    frag.appendChild(line(
+      'warn', 'Nothing relayed yet.',
       'Open your reviewer page in a tab — status updates once it sends.'
-    );
+    ));
   } else {
     const stale = Date.now() - lastRelay > 60 * 60 * 1000;
-    lines.push(
-      `<span class="${stale ? 'warn' : 'ok'}">Last relayed ${ago(lastRelay)}</span> — ` +
-      `${lastSeen} item${lastSeen === 1 ? '' : 's'} read, ${lastNotified} alerted.`
-    );
+    frag.appendChild(line(
+      stale ? 'warn' : 'ok',
+      `Last relayed ${ago(lastRelay)}`,
+      `— ${lastSeen} item${lastSeen === 1 ? '' : 's'} read, ${lastNotified} alerted.`
+    ));
     if (stale) {
-      lines.push('<span class="hint">Over an hour ago. Is the reviewer tab still open?</span>');
+      frag.appendChild(line('hint', 'Over an hour ago.', 'Is the reviewer tab still open?'));
     }
   }
   if (lastError) {
-    lines.push(`<span class="bad">Last error${lastErrorAt ? ` (${ago(lastErrorAt)})` : ''}:</span> ${lastError}`);
+    frag.appendChild(line(
+      'bad', `Last error${lastErrorAt ? ` (${ago(lastErrorAt)})` : ''}:`, lastError
+    ));
   }
-  statusEl.innerHTML = lines.join('<br>');
+  statusEl.replaceChildren(frag);
 }
 
 renderStatus();

@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from config import load_rules
+from config import load_rules, seed_mode
 
 
 @pytest.fixture(autouse=True)
@@ -45,3 +45,17 @@ def test_missing_everything_uses_hardcoded_default(monkeypatch, tmp_path):
     monkeypatch.setenv("RULES_PATH", str(tmp_path / "nope.json"))
     rules = load_rules()
     assert len(rules) == 1 and rules[0].min_value_usd == 100.0
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("true", True), ("True", True), ("1", True), ("yes", True), ("on", True),
+    ("false", False), ("0", False), ("", False), ("maybe", False),
+])
+def test_seed_mode_parsing(monkeypatch, value, expected):
+    monkeypatch.setenv("SEED_MODE", value)
+    assert seed_mode() is expected
+
+
+def test_seed_mode_defaults_off(monkeypatch):
+    monkeypatch.delenv("SEED_MODE", raising=False)
+    assert seed_mode() is False

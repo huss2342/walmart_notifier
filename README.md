@@ -10,7 +10,7 @@ Yes. To be precise about which parts are which:
 
 **The alerting engine is built, tested and working.** Given an item, it applies
 your rules (`value >= $100`, keywords, exclusions), skips anything it has
-already alerted on, and pushes to your phone. 69 tests cover it. That part is
+already alerted on, and pushes to your phone. 102 tests cover it. That part is
 done.
 
 **It needs something feeding it items.** There are two feeds, and they cover
@@ -115,6 +115,11 @@ Two sources, both things you already have access to:
   your own mailbox over IMAP. No Walmart credentials, no scraping, 2FA stays on.
   Use a Gmail/Outlook **app password**: scoped to this one app and revocable
   without touching your main account. This is the recommended default.
+  Fetching is incremental -- it remembers the highest message UID it has read
+  and asks only for newer ones. Re-reading the last 25 messages every two
+  minutes would be roughly a gigabyte a day against Gmail's IMAP bandwidth cap,
+  which gets the mailbox throttled within days. `IMAP_BACKFILL_DAYS` (default
+  `1`) bounds how far back the very first run looks.
 - **Browser extension (`extension/`)** — a small Chrome extension that reads the
   reviewer page *you* have open in *your* signed-in browser and POSTs what it
   sees to your endpoint. With auto-refresh on it reloads that tab on a jittered
@@ -179,20 +184,34 @@ export IMAP_HOST=imap.gmail.com
 export IMAP_USER=you@gmail.com
 export IMAP_PASSWORD='xxxx xxxx xxxx xxxx'
 
-# 3. Deploy
+# 3. Deploy. The first pass records what already exists without alerting --
+#    without it, every item already on the page fires at once.
 export INGEST_TOKEN="$(openssl rand -hex 24)"
-./infra/deploy.sh
+SEED_MODE=true ./infra/deploy.sh
 
-# 4. Verify
-curl -s "https://<app>.azurewebsites.net/api/health" | python3 -m json.tool
+# 4. Verify, then deploy again for real
+curl -s "https://<app>.azurewebsites.net/api/health"
+./infra/deploy.sh
 ```
+
+`deploy.sh` prints the ingest URL **with its `?code=` function key appended** --
+the endpoint is useless without it. Copy that whole line.
 
 Then set up the browser tab mode:
 
 1. `chrome://extensions` → Developer mode → **Load unpacked** → pick `extension/`
-2. Open its **options** page, paste the `ingestUrl` and `INGEST_TOKEN`
-3. Set **auto-refresh** to 3 minutes (0 disables it)
-4. Open your reviewer page in a tab and leave it there
+2. Open its **options** page, paste the full ingest URL (including `?code=`)
+   and your `INGEST_TOKEN`
+3. Set **reviewer page path** to a regex matching your portal's URL path. The
+   default `^/(reviewer|reviews)` is a guess -- open the portal and check.
+   Order and returns pages are excluded no matter what you set, so the relay
+   never reports your own past purchases as new items.
+4. Set **auto-refresh** to 3 minutes (0 disables it; Chrome will not schedule
+   an alarm below one minute)
+5. Open your reviewer page in a tab and leave it there
+
+Settings are stored in this browser only, never in Chrome sync: the endpoint
+URL carries the function key.
 
 The options page shows a **Status** panel — last relay time, items read, alerts
 sent, and any error. If it says "Nothing relayed yet" after you've loaded the
@@ -214,8 +233,10 @@ with a background relay, so check that panel occasionally.
 ## Development
 
 ```bash
-python3 -m venv .venv && .venv/bin/pip install -r src/requirements.txt pytest
-.venv/bin/python -m pytest        # 69 tests
+python -m venv .venv
+.venv/bin/pip install -r src/requirements.txt pytest ruff   # .venv/Scripts on Windows
+.venv/bin/python -m pytest        # 102 tests
+.venv/bin/ruff check .
 ```
 
 Tests use in-memory dedupe and a fake notifier — no Azure and no network.
@@ -230,5 +251,8 @@ Tests use in-memory dedupe and a fake notifier — no Azure and no network.
 | `src/sources/parsing.py` | Item/price extraction from mail and markup |
 | `src/notifiers/` | ntfy, Pushover, Telegram |
 | `infra/main.bicep` | Function App, Storage, Key Vault, RBAC |
+| `src/state.py` | Dedupe claims and the IMAP high-water marker |
 | `extension/` | MV3 browser companion |
+| `tests/` | 102 tests; in-memory dedupe, fake notifier, no network |
+| `.github/workflows/ci.yml` | pytest, ruff, `az bicep build`, `node --check` |
 | `docs/` | Architecture and cost notes |

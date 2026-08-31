@@ -23,13 +23,13 @@ def format_message(item: Item) -> tuple[str, str]:
         lines.append(f"Category: {item.category}")
     if item.url:
         lines.append(item.url)
-    return title[:250], "\n".join(l for l in lines if l)[:1000]
+    return title[:250], "\n".join(line for line in lines if line)[:1000]
 
 
 @runtime_checkable
 class Notifier(Protocol):
     @classmethod
-    def from_env(cls) -> "Notifier": ...
+    def from_env(cls) -> Notifier: ...
 
     def send(self, item: Item, priority: str = "normal") -> bool:
         """Deliver one alert. Returns True on success."""
@@ -41,7 +41,7 @@ class NullNotifier:
     degrades to a log line instead of crashing the whole polling run."""
 
     @classmethod
-    def from_env(cls) -> "NullNotifier":
+    def from_env(cls) -> NullNotifier:
         return cls()
 
     def send(self, item: Item, priority: str = "normal") -> bool:

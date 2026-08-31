@@ -24,10 +24,18 @@ param notifySecret string = ''
 @secure()
 param ingestToken string = ''
 
-@description('Non-secret notifier settings.')
+// The ntfy topic name IS the credential -- anyone who knows it can read your
+// alerts -- so it is @secure() like the rest. Non-secure parameters are stored
+// in plaintext in the deployment history and readable from the portal forever.
+@secure()
 param ntfyTopic string = ''
+
+@description('Non-secret notifier settings.')
 param imapHost string = ''
 param imapUser string = ''
+
+@description('Record items as seen without alerting. Run one cycle like this against a fresh dedupe table, then set it false.')
+param seedMode bool = false
 
 @description('Deploy Application Insights. Adds cost beyond the 5 GB/month free grant.')
 param enableAppInsights bool = true
@@ -100,6 +108,12 @@ resource ingestTokenRes 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if (!em
   properties: { value: ingestToken }
 }
 
+resource ntfyTopicRes 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = if (!empty(ntfyTopic)) {
+  parent: vault
+  name: 'ntfy-topic'
+  properties: { value: ntfyTopic }
+}
+
 resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
   name: functionAppName
   location: location
@@ -109,7 +123,7 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
   // if() evaluates both branches, so referencing a conditionally-created
   // secret fails when it is not deployed), which means the dependency on the
   // secrets has to be declared by hand.
-  dependsOn: [imapSecret, ingestTokenRes, notifySecretRes]
+  dependsOn: [imapSecret, ingestTokenRes, notifySecretRes, ntfyTopicRes]
   properties: {
     serverFarmId: plan.id
     httpsOnly: true
@@ -128,9 +142,15 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
           { name: 'SCM_DO_BUILD_DURING_DEPLOYMENT', value: 'true' }
           { name: 'POLL_SCHEDULE', value: pollSchedule }
           { name: 'NOTIFY_PROVIDER', value: notifyProvider }
-          { name: 'NTFY_TOPIC', value: ntfyTopic }
           { name: 'IMAP_HOST', value: imapHost }
           { name: 'IMAP_USER', value: imapUser }
+          { name: 'SEED_MODE', value: string(seedMode) }
+        ],
+        empty(ntfyTopic) ? [] : [
+          {
+            name: 'NTFY_TOPIC'
+            value: '@Microsoft.KeyVault(SecretUri=${vault.properties.vaultUri}secrets/ntfy-topic)'
+          }
         ],
         empty(imapPassword) ? [] : [
           {
@@ -155,7 +175,9 @@ resource functionApp 'Microsoft.Web/sites@2023-12-01' = {
         !enableAppInsights ? [] : [
           {
             name: 'APPLICATIONINSIGHTS_CONNECTION_STRING'
-            value: insights.properties.ConnectionString
+            // insights! : the branch is already guarded by enableAppInsights,
+            // but Bicep cannot narrow a conditional resource on its own.
+            value: insights!.properties.ConnectionString
           }
         ]
       )
