@@ -18,8 +18,13 @@ echo "==> Resource group $RG ($LOCATION)"
 az group create --name "$RG" --location "$LOCATION" --output none
 
 echo "==> Provisioning infrastructure (seedMode=$SEED_MODE)"
-OUTPUTS=$(az deployment group create \
+# Named so the outputs can be read back with az itself. Reading them through a
+# JSON parser would mean depending on a `python3` that plenty of machines --
+# Windows/Git Bash in particular -- simply do not have.
+DEPLOYMENT="${PREFIX}-deploy"
+az deployment group create \
   --resource-group "$RG" \
+  --name "$DEPLOYMENT" \
   --template-file "$ROOT/infra/main.bicep" \
   --parameters \
       namePrefix="$PREFIX" \
@@ -32,11 +37,16 @@ OUTPUTS=$(az deployment group create \
       ingestToken="${INGEST_TOKEN:-}" \
       notifySecret="${NOTIFY_SECRET:-}" \
       seedMode="$SEED_MODE" \
-  --query properties.outputs --output json)
+  --output none
 
-APP_NAME=$(echo "$OUTPUTS" | python3 -c 'import json,sys; print(json.load(sys.stdin)["functionAppName"]["value"])')
-HEALTH=$(echo "$OUTPUTS"   | python3 -c 'import json,sys; print(json.load(sys.stdin)["healthUrl"]["value"])')
-INGEST=$(echo "$OUTPUTS"   | python3 -c 'import json,sys; print(json.load(sys.stdin)["ingestUrl"]["value"])')
+output() {
+  az deployment group show --resource-group "$RG" --name "$DEPLOYMENT" \
+    --query "properties.outputs.$1.value" --output tsv
+}
+
+APP_NAME=$(output functionAppName)
+HEALTH=$(output healthUrl)
+INGEST=$(output ingestUrl)
 
 # The Key Vault role assignment is created alongside the app, so the app can
 # come up before it can resolve @Microsoft.KeyVault(...) settings. A restart
@@ -86,4 +96,4 @@ else
   echo "To avoid that, deploy once with SEED_MODE=true, then again with false."
 fi
 echo
-echo "Verify with:  curl -s $HEALTH | python3 -m json.tool"
+echo "Verify with:  curl -s $HEALTH"

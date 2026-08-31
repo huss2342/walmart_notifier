@@ -190,7 +190,7 @@ export INGEST_TOKEN="$(openssl rand -hex 24)"
 SEED_MODE=true ./infra/deploy.sh
 
 # 4. Verify, then deploy again for real
-curl -s "https://<app>.azurewebsites.net/api/health" | python3 -m json.tool
+curl -s "https://<app>.azurewebsites.net/api/health"
 ./infra/deploy.sh
 ```
 
@@ -233,9 +233,10 @@ with a background relay, so check that panel occasionally.
 ## Development
 
 ```bash
-python3 -m venv .venv && .venv/bin/pip install -r src/requirements.txt pytest
+python -m venv .venv
+.venv/bin/pip install -r src/requirements.txt pytest ruff   # .venv/Scripts on Windows
 .venv/bin/python -m pytest        # 102 tests
-.venv/bin/pip install ruff && .venv/bin/ruff check .
+.venv/bin/ruff check .
 ```
 
 Tests use in-memory dedupe and a fake notifier — no Azure and no network.
