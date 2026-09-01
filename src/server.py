@@ -24,7 +24,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from config import load_rules, seed_mode  # noqa: E402
+from config import (  # noqa: E402
+    clear_user_rules,
+    load_rules,
+    rules_source,
+    rules_to_dicts,
+    save_user_rules,
+    seed_mode,
+)
 from notifiers import build_notifier  # noqa: E402
 from pipeline import process  # noqa: E402
 from sources.webhook_source import parse_ingest_payload  # noqa: E402
@@ -57,7 +64,8 @@ class Handler(BaseHTTPRequestHandler):
         if origin.startswith("chrome-extension://") or origin.startswith("moz-extension://"):
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Ingest-Token")
-            self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+            self.send_header("Access-Control-Allow-Methods",
+                             "GET, POST, PUT, DELETE, OPTIONS")
 
     def _reply(self, code: int, payload: dict | str) -> None:
         body = (json.dumps(payload) if isinstance(payload, dict) else payload).encode("utf-8")
@@ -99,7 +107,69 @@ class Handler(BaseHTTPRequestHandler):
                 "state_file": str(self.store.path) if self.store.path else "(memory)",
             })
             return
+
+        if path == "/rules":
+            self._reply(200, {
+                "rules": rules_to_dicts(load_rules()),
+                "source": rules_source(),
+            })
+            return
+
         self._reply(404, "not found")
+
+    def do_PUT(self) -> None:  # noqa: N802
+        """Save rules edited in the extension's options page."""
+        if self.path.split("?")[0].rstrip("/") != "/rules":
+            self._reply(404, "not found")
+            return
+        if not self._authorized():
+            self._reply(403, "forbidden")
+            return
+
+        body = self._read_body()
+        if body is None:
+            return
+        try:
+            rules = save_user_rules(json.loads(body.decode("utf-8")))
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            self._reply(400, {"error": str(exc)})
+            return
+        except OSError as exc:
+            log.exception("Could not save rules.")
+            self._reply(500, {"error": str(exc)})
+            return
+        self._reply(200, {"rules": rules_to_dicts(rules), "source": rules_source()})
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        """Discard UI-saved rules and go back to the bundled defaults."""
+        if self.path.split("?")[0].rstrip("/") != "/rules":
+            self._reply(404, "not found")
+            return
+        if not self._authorized():
+            self._reply(403, "forbidden")
+            return
+        try:
+            removed = clear_user_rules()
+        except OSError as exc:
+            self._reply(500, {"error": str(exc)})
+            return
+        self._reply(200, {
+            "removed": removed,
+            "rules": rules_to_dicts(load_rules()),
+            "source": rules_source(),
+        })
+
+    def _read_body(self) -> bytes | None:
+        """Read the request body, replying with an error and returning None."""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._reply(400, "bad content-length")
+            return None
+        if length > MAX_INGEST_BYTES:
+            self._reply(413, "payload too large")
+            return None
+        return self.rfile.read(length) if length else b""
 
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.split("?")[0].rstrip("/")
@@ -110,16 +180,9 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(403, "forbidden")
             return
 
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            self._reply(400, "bad content-length")
+        body = self._read_body()
+        if body is None:
             return
-        if length > MAX_INGEST_BYTES:
-            self._reply(413, "payload too large")
-            return
-
-        body = self.rfile.read(length) if length else b""
         try:
             items = parse_ingest_payload(body, source="extension")
         except Exception:

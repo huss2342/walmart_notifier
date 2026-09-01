@@ -16,12 +16,16 @@ const DEFAULT_PATH_PATTERN = '^/reviews/claim-product';
 // either of those instead gives the wrong figure for exactly the items most
 // worth alerting on.
 const VALUE_RE = /Valued\s*at\s*\$\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)/i;
-const VALUE_GLOBAL_RE = /Valued\s*at\s*\$/gi;
+// Deliberately does NOT require the dollar sign. Some listings render
+// `Free(Valued at )` with no figure at all; keying the card boundary on `$`
+// made those cards invisible, so the item was dropped outright instead of
+// being surfaced with an unknown value for `alert_on_unknown_value` to judge.
+const VALUE_GLOBAL_RE = /Valued\s*at/gi;
 const OUT_OF_STOCK_RE = /\bout of stock\b/i;
 const CLAIMS_RE = /Free items remaining\s*(\d+)\s*item/i;
 
 // Merchandising badges rendered inside the card link, ahead of the title.
-const BADGE_RE = /^(clearance|rollback|reduced price|new|best seller|popular pick)\b/i;
+const BADGE_RE = /^(clearance|rollback|reduced price|deal|new|best seller|popular pick)\b/i;
 const TRAILING_PRICE_RE = /\s*\$\s*[0-9][0-9,]*(?:\.[0-9]{1,2})?(?:\s*was\s*\$\s*[0-9][0-9,]*(?:\.[0-9]{1,2})?)?\s*$/i;
 
 // Order and returns pages are full of /ip/ links to things the user already

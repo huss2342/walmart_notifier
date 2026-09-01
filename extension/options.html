@@ -2,20 +2,28 @@
 <meta charset="utf-8">
 <title>Reviewer Item Relay - Settings</title>
 <style>
-  body { font: 14px/1.5 system-ui, sans-serif; max-width: 34rem; margin: 2rem auto; padding: 0 1rem; }
+  body { font: 14px/1.5 system-ui, sans-serif; max-width: 38rem; margin: 2rem auto; padding: 0 1rem; }
+  h2 { margin: 2.5rem 0 .25rem; font-size: 1.05em; border-bottom: 1px solid #e2e6ea; padding-bottom: .4rem; }
   label { display: block; margin-top: 1rem; font-weight: 600; }
-  input { width: 100%; padding: .5rem; margin-top: .25rem; font: inherit;
+  input, select { width: 100%; padding: .5rem; margin-top: .25rem; font: inherit;
           border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
+  input[type=checkbox] { width: auto; margin-right: .4rem; vertical-align: -2px; }
   button { margin-top: 1.25rem; padding: .5rem 1.25rem; font: inherit;
            background: #0071dc; color: #fff; border: 0; border-radius: 4px; cursor: pointer; }
+  button.secondary { background: #eef1f4; color: #2b3137; }
+  .row { display: flex; gap: .75rem; }
+  .row > label { flex: 1; }
   .hint { color: #666; font-weight: 400; font-size: .85em; }
-  #saved { margin-left: .75rem; color: #087443; }
-  #pathError { color: #b3261e; font-weight: 400; font-size: .85em; }
-  .status { margin-top: 2rem; padding: .75rem 1rem; border-radius: 6px;
+  .saved { margin-left: .75rem; color: #087443; font-weight: 600; }
+  .err { color: #b3261e; font-weight: 400; font-size: .85em; }
+  .status { margin-top: 1rem; padding: .75rem 1rem; border-radius: 6px;
             background: #f4f6f8; border: 1px solid #e2e6ea; }
-  .status h2 { margin: 0 0 .5rem; font-size: 1em; }
+  .status h2 { margin: 0 0 .5rem; font-size: 1em; border: 0; padding: 0; }
   .ok { color: #087443; } .warn { color: #a15c00; } .bad { color: #b3261e; }
+  .banner { margin-top: .75rem; padding: .6rem .8rem; border-radius: 5px;
+            background: #fff8e6; border: 1px solid #f0dca8; font-size: .9em; }
 </style>
+
 <h1>Reviewer Item Relay</h1>
 <p class="hint">
   Reads items from the reviewer page you already have open and signed in, and
@@ -24,8 +32,67 @@
   notification itself.
 </p>
 
+<h2>Alert filters</h2>
+<p class="hint">
+  These live on the notifier, not in the browser — it re-reads them on every
+  relay, so a save takes effect on the next refresh with no restart.
+</p>
+
+<div id="rulesBanner"></div>
+
+<div class="row">
+  <label>Minimum value ($)
+    <span class="hint">Alert only above this retail value. Listings run about $4–$45.</span>
+    <input id="minValue" type="number" min="0" step="0.01" placeholder="25">
+  </label>
+  <label>Maximum value ($)
+    <span class="hint">Optional upper bound.</span>
+    <input id="maxValue" type="number" min="0" step="0.01" placeholder="(none)">
+  </label>
+</div>
+
+<label>Item name must contain
+  <span class="hint">
+    Comma separated. Alerts only for items matching <strong>any</strong> of
+    these. <strong>Leave blank to allow every item</strong> that clears the
+    value filter.
+  </span>
+  <input id="keywords" type="text" placeholder="headphones, air fryer, tool">
+</label>
+
+<label>Never alert on
+  <span class="hint">Comma separated. Always wins over the list above.</span>
+  <input id="excludeKeywords" type="text" placeholder="toy, kids, baby, gift card">
+</label>
+
+<label>Priority
+  <span class="hint">How loudly your phone announces a match.</span>
+  <select id="priority">
+    <option value="low">Low — silent</option>
+    <option value="normal" selected>Normal</option>
+    <option value="high">High</option>
+    <option value="urgent">Urgent</option>
+  </select>
+</label>
+
+<label style="font-weight:400;">
+  <input id="alertUnknown" type="checkbox">
+  Also alert on items with no listed value
+  <span class="hint">
+    A few listings show <code>Valued at</code> with no figure. Off means you
+    never hear about those; on means you hear about all of them.
+  </span>
+</label>
+
+<button id="saveRules">Save filters</button>
+<button id="resetRules" class="secondary" type="button">Reset to defaults</button>
+<span id="rulesSaved" class="saved"></span>
+<div id="rulesError" class="err"></div>
+
+<h2>Connection</h2>
+
 <label>Ingest endpoint
-  <span class="hint">Where <code>python src/server.py</code> is listening. Leave the default unless you changed the port.</span>
+  <span class="hint">Where <code>run.ps1</code> is listening. Leave the default unless you changed the port.</span>
   <input id="endpoint" type="url" placeholder="http://127.0.0.1:8787/ingest">
 </label>
 
@@ -42,7 +109,7 @@
     purchases as new items.
   </span>
   <input id="pathPattern" type="text" placeholder="^/reviews/claim-product">
-  <span id="pathError"></span>
+  <span id="pathError" class="err"></span>
 </label>
 
 <label>Auto-refresh every (minutes)
@@ -56,7 +123,7 @@
   <input id="refreshMinutes" type="number" min="0" max="120" step="1" placeholder="0">
 </label>
 
-<button id="save">Save</button><span id="saved"></span>
+<button id="save">Save connection settings</button><span id="saved" class="saved"></span>
 
 <div class="status">
   <h2>Status</h2>

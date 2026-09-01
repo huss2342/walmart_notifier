@@ -53,8 +53,14 @@ sale price — wrong for exactly the discounted items most worth alerting on.
 **The grid is as close as the card.** Walking up the DOM looking for a price
 finds the enclosing grid soon after it finds the card, and the grid contains
 every item's value. So the walk stops at the first ancestor containing
-*exactly one* `Valued at $` — more than one means it has climbed too far, and
+*exactly one* `Valued at` — more than one means it has climbed too far, and
 the item yields no value rather than a neighbour's.
+
+That boundary test deliberately does not require the dollar sign. Some listings
+render `Free(Valued at )` with no figure at all; keying on `$` made those cards
+invisible to the walk, so it climbed into the grid, found many, and dropped the
+item outright. Matching the phrase instead surfaces them with a null value and
+lets `alert_on_unknown_value` decide.
 
 **Titles carry noise.** The card link's text is
 `Clearance <title> $5.99 Was $6.99`, and the `aria-label` often matches. The
@@ -107,6 +113,27 @@ needs `http://127.0.0.1/*` in `host_permissions`. Without it the fetch is
 subject to CORS and every relay fails silently. The server answers preflight for
 `chrome-extension://` origins anyway — belt and braces, because this exact
 mistake shipped once already.
+
+## Where the filters live
+
+The extension's options page edits filters, but it does not hold them. It reads
+and writes them over `GET`/`PUT`/`DELETE /rules` on the notifier.
+
+Filtering in the extension was the obvious alternative and is worse. The
+notifier applies rules on every relay regardless of which tab (or `curl`) sent
+the items, so browser-side rules would be a second filter that only some
+traffic passes through. Two places to look when something did not alert is the
+failure mode worth designing out.
+
+Saves go to `data/rules.json` rather than `src/rules.json`. The repo's defaults
+stay pristine, "Reset to defaults" is a file delete, and a user who has never
+opened the options page gets the shipped rules. `RULES_JSON` in the environment
+still outranks both, so a one-off override needs no file at all -- and the
+options page says so in a banner rather than letting someone edit a form that
+silently does nothing.
+
+Rules are re-read per request. At one relay every few minutes that cost is
+nothing, and it buys edits that apply without a restart.
 
 ## Identity and dedupe
 

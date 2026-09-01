@@ -131,12 +131,30 @@ Change `test-001` each time — dedupe means the same id only ever fires once.
 ## Filters
 
 Items in this program are **free**, so "minimum price" means minimum *retail
-value* — "only wake me for the good stuff". Real listings run roughly **$5–$30**,
+value* — "only wake me for the good stuff". Real listings run roughly **$4–$45**,
 so keep thresholds low; a $100 floor is silence forever.
 
-Rules live in `src/rules.json`, are evaluated top-down, and the first match sets
-the notification priority. They are re-read on every relay, so edits take effect
-within a refresh cycle — no restart.
+**The easy way: the extension's Options page.** Its *Alert filters* section
+edits minimum/maximum value, required keywords, excluded keywords and priority.
+Those save to the notifier over HTTP rather than being stored in the browser —
+the notifier is the only thing that applies them, and a second copy in the
+browser would be a second source of truth that silently disagrees.
+
+Rules are re-read on every relay, so a save takes effect within a refresh cycle
+with no restart.
+
+**The full way: JSON.** The Options form edits one combined rule. For several
+rules with different priorities, edit the file. Rules are evaluated top-down and
+the first match sets the priority. Precedence:
+
+| Layer | |
+|---|---|
+| `RULES_JSON` env var | Overrides everything; set in `notifier.env` |
+| `data/rules.json` | Written by the Options page. Delete to revert. |
+| `src/rules.json` | The defaults that ship with the repo |
+
+Saving from the Options page never touches `src/rules.json`, so **Reset to
+defaults** always has something clean to fall back to.
 
 | Field | Meaning |
 |---|---|
@@ -148,9 +166,9 @@ within a refresh cycle — no restart.
 | `alert_on_unknown_value` | Default `true`: alert when the value can't be parsed |
 | `priority` | `low`, `normal`, `high`, `urgent` (`urgent` bypasses DND on Pushover) |
 
-Not sure what to filter on yet? Put a rule with no clauses at the bottom and
-`"priority": "low"` — it matches everything, so you can watch for a day and see
-what actually drops. `src/rules.json` ships one commented out.
+Not sure what to filter on yet? In the Options page, clear the keyword box and
+set minimum value to `0` — that alerts on everything, so you can watch for a day
+and see what actually drops before narrowing it.
 
 ## Keeping it running
 
@@ -184,7 +202,7 @@ Per item card, from the page you already have open:
 ```
 
 ```powershell
-.venv\Scripts\python -m pytest        # 115 tests
+.venv\Scripts\python -m pytest        # 129 tests
 ```
 
 Tests use an in-memory store and a fake notifier — no network, and the HTTP
@@ -194,7 +212,7 @@ tests bind a real server to an ephemeral port.
 
 | Path | |
 |---|---|
-| `src/server.py` | Local HTTP server: `/ingest`, `/health` |
+| `src/server.py` | Local HTTP server: `/ingest`, `/health`, `/rules` |
 | `src/pipeline.py` | source → filter → dedupe → notify |
 | `src/filters.py` | Rule engine |
 | `src/state.py` | Dedupe file (`data/seen.json`), atomic writes |
@@ -202,5 +220,5 @@ tests bind a real server to an ephemeral port.
 | `src/notifiers/` | ntfy, Pushover, Telegram |
 | `extension/` | MV3 browser companion — reads the page, drives the refresh |
 | `run.ps1` / `notifier.example.env` | Launcher and settings template |
-| `tests/` | 115 tests |
+| `tests/` | 129 tests |
 | `docs/architecture.md` | Design notes and failure behaviour |

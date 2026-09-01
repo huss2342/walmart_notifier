@@ -167,3 +167,77 @@ def test_seed_mode_records_without_sending(live_server, monkeypatch):
     _, summary = post(live_server, {"items": [ITEM]})
     assert summary["seeded"] == 1 and summary["notified"] == 0
     assert not [s for n in RecordingNotifier.instances for s in n.sent]
+
+
+# --- rules API ---------------------------------------------------------------
+
+
+def request(base, method, path="/rules", payload=None, token=None):
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(f"{base}{path}", data=data, method=method)
+    if data:
+        req.add_header("Content-Type", "application/json")
+    if token is not None:
+        req.add_header("X-Ingest-Token", token)
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return resp.status, json.loads(resp.read())
+
+
+@pytest.fixture
+def isolated_rules(monkeypatch, tmp_path):
+    """Point the user-rules file somewhere disposable."""
+    monkeypatch.delenv("RULES_JSON", raising=False)
+    monkeypatch.setenv("USER_RULES_PATH", str(tmp_path / "rules.json"))
+    return tmp_path / "rules.json"
+
+
+def test_get_rules_reports_the_active_set(live_server, isolated_rules):
+    status, body = request(live_server, "GET")
+    assert status == 200
+    assert body["source"] == "bundled"
+    assert [r["name"] for r in body["rules"]] == ["expensive", "watched-keywords"]
+
+
+def test_saved_rules_take_effect_on_the_next_relay(live_server, isolated_rules):
+    """The whole point of server-side rules: no restart between save and use."""
+    cheap = {**ITEM, "item_id": "ip-999", "value_usd": 6.0}
+    _, before = post(live_server, {"items": [cheap]})
+    assert before["notified"] == 0          # $6 is under the bundled $25 floor
+
+    request(live_server, "PUT", payload={"rules": [
+        {"name": "my-filters", "min_value_usd": 5.0, "priority": "high"}
+    ]})
+
+    cheap2 = {**cheap, "item_id": "ip-998"}
+    _, after = post(live_server, {"items": [cheap2]})
+    assert after["notified"] == 1
+
+
+def test_delete_reverts_to_bundled_rules(live_server, isolated_rules):
+    request(live_server, "PUT", payload={"rules": [{"name": "mine"}]})
+    assert request(live_server, "GET")[1]["source"] == "user"
+
+    status, body = request(live_server, "DELETE")
+    assert status == 200 and body["removed"] is True
+    assert body["source"] == "bundled"
+
+
+def test_invalid_rules_are_rejected_with_400(live_server, isolated_rules):
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        request(live_server, "PUT", payload={"rules": []})
+    assert exc.value.code == 400
+    # The previous configuration is untouched.
+    assert request(live_server, "GET")[1]["source"] == "bundled"
+
+
+def test_rules_endpoint_honours_the_token(live_server, isolated_rules, monkeypatch):
+    monkeypatch.setattr(server.Handler, "token", "sekrit")
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        request(live_server, "PUT", payload={"rules": [{"name": "x"}]}, token="wrong")
+    assert exc.value.code == 403
+
+
+def test_put_to_an_unknown_path_is_404(live_server):
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        request(live_server, "PUT", path="/nope", payload={})
+    assert exc.value.code == 404
