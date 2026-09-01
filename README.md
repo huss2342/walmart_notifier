@@ -210,7 +210,7 @@ Per item card, from the page you already have open:
 ```
 
 ```powershell
-.venv\Scripts\python -m pytest        # 132 tests
+.venv\Scripts\python -m pytest        # 129 tests
 ```
 
 Tests use an in-memory store and a fake notifier — no network, and the HTTP
@@ -228,5 +228,5 @@ tests bind a real server to an ephemeral port.
 | `src/notifiers/` | ntfy, Pushover, Telegram |
 | `extension/` | MV3 browser companion — reads the page, drives the refresh |
 | `run.ps1` / `notifier.example.env` | Launcher and settings template |
-| `tests/` | 132 tests |
+| `tests/` | 129 tests |
 | `docs/architecture.md` | Design notes and failure behaviour |
