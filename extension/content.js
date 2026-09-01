@@ -57,7 +57,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   readSweep().then((sweep) => {
     sendResponse({
       busy: Date.now() - lastInteraction < INTERACTION_GRACE_MS,
-      sweeping: nextUnvisited(sweep) !== null
+      // A sweep with nothing visited yet is not running, and must not block
+      // the refresh -- nextUnvisited() answers "page 1" for a fresh record.
+      sweeping: (sweep.visited || []).length > 0 && nextUnvisited(sweep) !== null
     });
   });
   return true;   // response is asynchronous
@@ -236,10 +238,20 @@ async function readSweep() {
   return { total: null, visited: [] };
 }
 
-/** Lowest page in 1..total not yet visited, or null when the sweep is done. */
+/** Lowest page in 1..total not yet visited, or null when the sweep is done.
+ *
+ * An unknown total is NOT "done". The pager renders late, so a relay firing
+ * before it exists reads null -- and treating that as completion ended every
+ * sweep after a single page.
+ */
 function nextUnvisited(sweep) {
-  if (!sweep.total) return null;
-  const seen = new Set(sweep.visited);
+  const seen = new Set(sweep.visited || []);
+  if (!sweep.total) {
+    // Total still unknown: walk forward from the highest page seen so far and
+    // rely on the end-of-results panel to stop.
+    const highest = seen.size ? Math.max(...seen) : 0;
+    return highest >= HARD_PAGE_CAP ? null : highest + 1;
+  }
   for (let page = 1; page <= sweep.total; page += 1) {
     if (!seen.has(page)) return page;
   }
@@ -257,16 +269,18 @@ async function scheduleNextPage() {
   try {
     const page = currentPage();
     const sweep = await readSweep();
+    const ended = atEndOfResults();
 
     // A page that reports a total is authoritative; past the end there is no
     // pager at all, so fall back to what the sweep already knew.
     const total = totalPages() ?? sweep.total;
-    const visited = atEndOfResults() && !totalPages()
+    const visited = ended
       ? sweep.visited                       // nothing real here to record
       : [...new Set([...sweep.visited, page])];
 
     const updated = { total, visited };
-    const next = nextUnvisited(updated);
+    // The end-of-results panel is definitive whatever the counters say.
+    const next = ended ? null : nextUnvisited(updated);
 
     if (next === null) {
       // Sweep complete. Clear it so the next refresh starts a fresh pass.
