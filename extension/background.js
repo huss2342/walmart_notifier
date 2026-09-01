@@ -13,7 +13,7 @@ const DEFAULTS = {
   endpoint: 'http://127.0.0.1:8787/ingest',
   token: '',
   refreshMinutes: 0,
-  pagesToScan: 1,
+  pageDelaySeconds: 5,
   pathPattern: '^/reviews/claim-product'
 };
 

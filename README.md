@@ -107,17 +107,9 @@ Open <https://www.walmart.com/reviews/claim-product?q=> in a tab and leave it
 there. Add more tabs with `?q=headphones`, `?q=air+fryer`, and so on — each one
 relays independently, and the same item arriving twice still only buzzes once.
 
-**One open page is about 37 items out of ~25 pages**, so by default the relay
-sees roughly 4% of the catalogue and an item landing on page 9 is never
-noticed. **Pages to scan per sweep** in the Options page walks the pages in
-turn, ~9 seconds apart. It is the setting that decides how much of a crawl this
-is — 5 pages is five page loads per sweep, 25 is twenty-five — so keep it as low
-as you can live with and raise the refresh interval alongside it. A targeted
-`?q=` tab is usually cheaper than scanning everything.
-
-Back in the extension's Options, the **Status** panel should show
-"Last relayed just now — N items read". If it says "Nothing relayed yet", the
-server is not running or the endpoint is wrong.
+Every sweep walks page 1 to the last page (detected by the portal's "no search
+results" panel), pausing a configurable few seconds between each. Set **Delay
+between pages** and **Auto-refresh** in the Options page.
 
 ## Verifying it works
 

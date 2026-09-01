@@ -14,7 +14,7 @@ const tokenEl = $('token');
 const pathEl = $('pathPattern');
 const pathErrorEl = $('pathError');
 const refreshEl = $('refreshMinutes');
-const pagesEl = $('pagesToScan');
+const pageDelayEl = $('pageDelaySeconds');
 const savedEl = $('saved');
 const statusEl = $('status');
 
@@ -31,13 +31,13 @@ const rulesErrorEl = $('rulesError');
 // --- connection settings ----------------------------------------------------
 
 chrome.storage.local
-  .get(['endpoint', 'token', 'refreshMinutes', 'pagesToScan', 'pathPattern'])
+  .get(['endpoint', 'token', 'refreshMinutes', 'pageDelaySeconds', 'pathPattern'])
   .then(({ endpoint = DEFAULT_ENDPOINT, token = '', refreshMinutes = 0,
-           pagesToScan = 1, pathPattern = DEFAULT_PATH_PATTERN }) => {
+           pageDelaySeconds = 5, pathPattern = DEFAULT_PATH_PATTERN }) => {
     endpointEl.value = endpoint;
     tokenEl.value = token;
     refreshEl.value = refreshMinutes;
-    pagesEl.value = pagesToScan;
+    pageDelayEl.value = pageDelaySeconds;
     pathEl.value = pathPattern;
     loadRules();
   });
@@ -56,7 +56,7 @@ $('save').addEventListener('click', async () => {
     endpoint: endpointEl.value.trim() || DEFAULT_ENDPOINT,
     token: tokenEl.value.trim(),
     pathPattern: pattern,
-    pagesToScan: Math.min(25, Math.max(1, parseInt(pagesEl.value, 10) || 1)),
+    pageDelaySeconds: Math.min(60, Math.max(1, parseInt(pageDelayEl.value, 10) || 5)),
     refreshMinutes: Math.max(0, parseInt(refreshEl.value, 10) || 0)
   });
   flash(savedEl, 'Saved');
@@ -252,15 +252,7 @@ async function renderStatus() {
       `Last relayed ${ago(lastRelay)}`,
       `— ${lastSeen} item${lastSeen === 1 ? '' : 's'} on that page, ${lastNotified} alerted.`
     ));
-    // "37 items read" reads like total coverage when it is one page of ~25.
-    // Spell out the sweep width and the running total instead.
-    const { pagesToScan = 1 } = await chrome.storage.local.get(['pagesToScan']);
-    frag.appendChild(line(
-      'hint',
-      pagesToScan > 1
-        ? `Scanning ${pagesToScan} pages per sweep.`
-        : 'Scanning 1 page per sweep — about 4% of the catalogue.'
-    ));
+    // Per-page counts read like total coverage; show the running total too.
     const total = await knownItemCount();
     if (total !== null) {
       frag.appendChild(line('hint', `${total} distinct items recorded so far.`));

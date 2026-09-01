@@ -114,25 +114,23 @@ subject to CORS and every relay fails silently. The server answers preflight for
 `chrome-extension://` origins anyway — belt and braces, because this exact
 mistake shipped once already.
 
-## Pagination is opt-in
+## Pagination
 
-The portal paginates: ~37 items per page across ~25 pages. Reading only the
-open page covers about 4% of the catalogue, so an item that drops onto page 9
-is invisible.
+The portal paginates at ~37 items per page. A sweep walks page 1 upward via the
+`page` query parameter until a page comes back empty, then returns to page 1 and
+stops; the background refresh alarm starts the next sweep.
 
-Walking the pages closes that gap and is also, unambiguously, a crawl. One tab
-refreshing every few minutes is a person leaving a page open; twenty-five
-sequential page loads per sweep is not, and the Terms of Use clause quoted in
-the README reaches the second far more comfortably than the first. So the depth
-is a setting, it defaults to 1, it is capped at 25, and the options page states
-the trade-off in the control's own help text rather than burying it.
+The end is detected by the portal's "no search results" panel, not by an item
+count. Count alone is ambiguous: the MutationObserver also fires mid-render,
+before any card exists, so an empty page and a still-loading page look
+identical. `relay()` therefore returns early on zero items *unless* the end
+marker is present. A hard cap of 200 pages is a backstop in case that marker
+ever changes.
 
-The walk is paced ~9 seconds apart with jitter, defers while the user is
-interacting (same courtesy as the reload), stops early when a page returns no
-items, and guards against stacking navigations when the MutationObserver fires
-repeatedly. A refresh resets to page 1 by rewriting the URL rather than
-reloading wherever the walk stopped -- otherwise earlier pages would go unread
-every cycle.
+The step delay is a setting (default 5s, jittered) rather than a constant,
+because it is the dial that decides how hard this hits the site. The walk also
+defers while the user is mid-interaction, same as the reload, and guards against
+stacking navigations when the observer fires repeatedly.
 
 ## Where the filters live
 

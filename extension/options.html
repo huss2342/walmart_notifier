@@ -26,23 +26,20 @@
 
 <h1>Reviewer Item Relay</h1>
 <p class="hint">
-  Reads items from the reviewer page you already have open and signed in, and
-  posts them to the notifier running on this machine. No Walmart credentials
-  are stored here, and nothing leaves your computer except the push
-  notification itself.
+  Reads the reviewer page you have open and posts what it finds to the
+  notifier on this machine. No Walmart credentials stored.
 </p>
 
 <h2>Alert filters</h2>
 <p class="hint">
-  These live on the notifier, not in the browser — it re-reads them on every
-  relay, so a save takes effect on the next refresh with no restart.
+  Stored on the notifier. Applied on the next relay, no restart.
 </p>
 
 <div id="rulesBanner"></div>
 
 <div class="row">
   <label>Minimum value ($)
-    <span class="hint">Alert only above this retail value. Listings run about $4–$45.</span>
+    <span class="hint">Alert only at or above this retail value.</span>
     <input id="minValue" type="number" min="0" step="0.01" placeholder="25">
   </label>
   <label>Maximum value ($)
@@ -52,21 +49,17 @@
 </div>
 
 <label>Item name must contain
-  <span class="hint">
-    Comma separated. Alerts only for items matching <strong>any</strong> of
-    these. <strong>Leave blank to allow every item</strong> that clears the
-    value filter.
-  </span>
+  <span class="hint">Comma separated, matches any. Blank = allow everything.</span>
   <input id="keywords" type="text" placeholder="headphones, air fryer, tool">
 </label>
 
 <label>Never alert on
-  <span class="hint">Comma separated. Always wins over the list above.</span>
+  <span class="hint">Comma separated. Wins over the list above.</span>
   <input id="excludeKeywords" type="text" placeholder="toy, kids, baby, gift card">
 </label>
 
 <label>Priority
-  <span class="hint">How loudly your phone announces a match.</span>
+  <span class="hint">Notification priority.</span>
   <select id="priority">
     <option value="low">Low — silent</option>
     <option value="normal" selected>Normal</option>
@@ -78,10 +71,7 @@
 <label style="font-weight:400;">
   <input id="alertUnknown" type="checkbox">
   Also alert on items with no listed value
-  <span class="hint">
-    A few listings show <code>Valued at</code> with no figure. Off means you
-    never hear about those; on means you hear about all of them.
-  </span>
+  <span class="hint">Some listings show no figure at all.</span>
 </label>
 
 <button id="saveRules">Save filters</button>
@@ -92,46 +82,30 @@
 <h2>Connection</h2>
 
 <label>Ingest endpoint
-  <span class="hint">Where <code>run.ps1</code> is listening. Leave the default unless you changed the port.</span>
+  <span class="hint">Where <code>run.ps1</code> listens.</span>
   <input id="endpoint" type="url" placeholder="http://127.0.0.1:8787/ingest">
 </label>
 
 <label>Ingest token
-  <span class="hint">Matches the <code>INGEST_TOKEN</code> environment variable. Optional - the server only listens on loopback.</span>
+  <span class="hint">Optional. Matches <code>INGEST_TOKEN</code>.</span>
   <input id="token" type="password" placeholder="optional shared secret">
 </label>
 
 <label>Reviewer page path
-  <span class="hint">
-    A regular expression matched against the URL path of the page to read and
-    reload. The default matches <code>/reviews/claim-product</code>. Order and
-    returns pages are always excluded, so the relay never reports your own past
-    purchases as new items.
-  </span>
+  <span class="hint">Regex on the URL path. Order and returns pages always excluded.</span>
   <input id="pathPattern" type="text" placeholder="^/reviews/claim-product">
   <span id="pathError" class="err"></span>
 </label>
 
-<label>Pages to scan per sweep
-  <span class="hint">
-    The portal has about 37 items per page across ~25 pages, so
-    <strong>1 only ever sees about 4%</strong> of what is available — an item
-    landing on page 9 is never noticed. Raising this walks the pages in turn,
-    pausing about 9 seconds between each.
-    <strong>This is the setting that decides how much of a crawl this is:</strong>
-    5 pages is five page loads per sweep, 25 is twenty-five. Keep it as low as
-    you can live with, and raise the refresh interval if you raise this.
-  </span>
-  <input id="pagesToScan" type="number" min="1" max="25" step="1" placeholder="1">
+<label>Delay between pages (seconds)
+  <span class="hint">Every sweep walks page 1 to the end. This paces it.</span>
+  <input id="pageDelaySeconds" type="number" min="1" max="60" step="1" placeholder="5">
 </label>
 
 <label>Auto-refresh every (minutes)
   <span class="hint">
-    Reloads the reviewer tab on its own so you can leave it open and walk away.
-    <strong>0 disables it</strong> — the relay then only reads the page when you
-    load it yourself. A reload is deferred while you are actively clicking or
-    scrolling, so it will not interrupt a claim. Chrome will not schedule an
-    alarm below one minute.
+    Restarts the sweep at page 1. <strong>0 disables it.</strong> Deferred while
+    you are clicking or scrolling. Minimum 1.
   </span>
   <input id="refreshMinutes" type="number" min="0" max="120" step="1" placeholder="0">
 </label>

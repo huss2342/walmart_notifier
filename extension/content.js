@@ -158,25 +158,29 @@ function collect() {
 async function relay() {
   if (!(await isReviewerPage())) return;
   const items = collect();
-  if (!items.length) return;
-  // The background worker dedupes across reloads and the server dedupes again.
-  chrome.runtime.sendMessage({ type: 'items', items });
+  if (items.length) {
+    // The background worker dedupes across reloads and the server dedupes again.
+    chrome.runtime.sendMessage({ type: 'items', items });
+  } else if (!atEndOfResults()) {
+    // No cards and no end marker means the page is still rendering. Wait for
+    // the next mutation rather than calling this the end of the catalogue.
+    return;
+  }
   scheduleNextPage(items.length);
 }
 
 // --- pagination -------------------------------------------------------------
-// The portal shows ~37 items per page across ~25 pages. Reading only the open
-// page covers about 4% of the catalogue, so an item that drops onto page 9 is
-// never seen.
-//
-// Walking pages is a crawl, though, and a much bigger ToS footprint than one
-// tab refreshing: scanning N pages is N page loads per sweep. So it is off by
-// default, capped, and paced with a long jittered gap rather than firing
-// requests back to back.
+// Walks every page of the catalogue, page=1 upward, until one comes back with
+// no results. The background refresh restarts the sweep from page 1.
 
-const PAGE_STEP_MS = 9000;
-const PAGE_STEP_JITTER = 0.35;
-const MAX_PAGES = 25;
+const PAGE_JITTER = 0.25;
+const DEFAULT_PAGE_DELAY_S = 5;
+// The portal answers a past-the-end page with a "no search results" panel. It
+// is the only reliable end marker: item count alone is ambiguous because the
+// observer also fires mid-render, before any card exists.
+const END_OF_RESULTS_RE = /no search results/i;
+// Backstop only. If the end marker ever changes, this stops an endless walk.
+const HARD_PAGE_CAP = 200;
 
 function currentPage() {
   const raw = parseInt(new URLSearchParams(location.search).get('page') || '1', 10);
@@ -195,24 +199,29 @@ function pageUrl(page) {
 
 let advanceTimer = null;
 
+function atEndOfResults() {
+  return END_OF_RESULTS_RE.test(document.body.innerText || '');
+}
+
 async function scheduleNextPage(itemCount) {
-  const { pagesToScan = 1 } = await chrome.storage.local.get(['pagesToScan']);
-  const limit = Math.min(Math.max(parseInt(pagesToScan, 10) || 1, 1), MAX_PAGES);
-  if (limit <= 1) return;
-
   const page = currentPage();
-  // An empty page means the catalogue ran out before the configured limit.
-  const next = (page < limit && itemCount > 0) ? page + 1 : 1;
+  const done = itemCount === 0 || atEndOfResults() || page >= HARD_PAGE_CAP;
+  const next = done ? 1 : page + 1;
+  // Already home with nothing more to do.
   if (next === page) return;
-
-  // Only ever one pending navigation, however many times the observer fires.
+  // Only ever one pending navigation, however often the observer fires.
   if (advanceTimer) return;
-  const delay = PAGE_STEP_MS * (1 + (Math.random() * 2 - 1) * PAGE_STEP_JITTER);
+
+  const { pageDelaySeconds = DEFAULT_PAGE_DELAY_S } =
+    await chrome.storage.local.get(['pageDelaySeconds']);
+  const base = Math.max(1, parseInt(pageDelaySeconds, 10) || DEFAULT_PAGE_DELAY_S) * 1000;
+  const delay = base * (1 + (Math.random() * 2 - 1) * PAGE_JITTER);
+
   advanceTimer = setTimeout(() => {
-    // Same courtesy as the reload: never navigate out from under someone who
-    // is mid-claim. Re-check rather than cancelling, so the sweep resumes.
+    advanceTimer = null;
+    // Same courtesy as the reload: never navigate out from under someone
+    // mid-claim. Re-check rather than cancelling, so the sweep resumes.
     if (Date.now() - lastInteraction < INTERACTION_GRACE_MS) {
-      advanceTimer = null;
       scheduleNextPage(itemCount);
       return;
     }
