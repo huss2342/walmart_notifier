@@ -127,6 +127,14 @@ identical. `relay()` therefore returns early on zero items *unless* the end
 marker is present. A hard cap of 100 pages is a backstop in case that marker
 ever changes.
 
+Chrome throttles `setTimeout` in hidden tabs to roughly once a minute after a
+few minutes out of view, so a backgrounded sweep runs far slower than the
+configured delay -- 24 pages can take ~24 minutes instead of two. The refresh
+alarm therefore asks the content script whether a sweep is in progress
+(`page > 1`) and skips the reset if so. Without that check a 3-minute refresh
+would restart the walk at page 1 forever and the later pages would never be
+read at all.
+
 The step delay is a setting (default 5s, jittered) rather than a constant,
 because it is the dial that decides how hard this hits the site. The walk also
 defers while the user is mid-interaction, same as the reload, and guards against

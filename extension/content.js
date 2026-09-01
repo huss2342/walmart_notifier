@@ -47,10 +47,17 @@ for (const evt of ['click', 'keydown', 'scroll']) {
                             { passive: true, capture: true });
 }
 
-// Never yank the page out from under someone mid-claim.
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === 'busy?') {
-    sendResponse({ busy: Date.now() - lastInteraction < INTERACTION_GRACE_MS });
+    sendResponse({
+      // Never yank the page out from under someone mid-claim.
+      busy: Date.now() - lastInteraction < INTERACTION_GRACE_MS,
+      // Nor restart a sweep that is still walking. Chrome throttles timers in
+      // hidden tabs to about one per minute, so a backgrounded sweep can take
+      // far longer than the refresh interval; resetting it to page 1 on every
+      // alarm would mean the later pages are never reached at all.
+      sweeping: currentPage() > 1
+    });
   }
 });
 

@@ -123,14 +123,14 @@ async function reviewerTabs() {
   });
 }
 
-async function isBusy(tabId) {
+async function tabState(tabId) {
   try {
     const reply = await chrome.tabs.sendMessage(tabId, { type: 'busy?' });
-    return Boolean(reply?.busy);
+    return { busy: Boolean(reply?.busy), sweeping: Boolean(reply?.sweeping) };
   } catch {
     // No content script listening (interstitial, error page, still loading).
     // Reload anyway -- that is exactly the state the refresh needs to escape.
-    return false;
+    return { busy: false, sweeping: false };
   }
 }
 
@@ -142,7 +142,9 @@ async function refreshTick() {
   }
   let anyBusy = false;
   for (const tab of tabs) {
-    if (await isBusy(tab.id)) {
+    const { busy, sweeping } = await tabState(tab.id);
+    if (busy || sweeping) {
+      // Re-arm and check again shortly rather than cutting the sweep short.
       anyBusy = true;
       continue;
     }
