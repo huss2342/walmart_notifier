@@ -112,6 +112,19 @@
   <span id="pathError" class="err"></span>
 </label>
 
+<label>Pages to scan per sweep
+  <span class="hint">
+    The portal has about 37 items per page across ~25 pages, so
+    <strong>1 only ever sees about 4%</strong> of what is available — an item
+    landing on page 9 is never noticed. Raising this walks the pages in turn,
+    pausing about 9 seconds between each.
+    <strong>This is the setting that decides how much of a crawl this is:</strong>
+    5 pages is five page loads per sweep, 25 is twenty-five. Keep it as low as
+    you can live with, and raise the refresh interval if you raise this.
+  </span>
+  <input id="pagesToScan" type="number" min="1" max="25" step="1" placeholder="1">
+</label>
+
 <label>Auto-refresh every (minutes)
   <span class="hint">
     Reloads the reviewer tab on its own so you can leave it open and walk away.

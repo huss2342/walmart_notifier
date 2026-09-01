@@ -14,6 +14,7 @@ const tokenEl = $('token');
 const pathEl = $('pathPattern');
 const pathErrorEl = $('pathError');
 const refreshEl = $('refreshMinutes');
+const pagesEl = $('pagesToScan');
 const savedEl = $('saved');
 const statusEl = $('status');
 
@@ -30,12 +31,13 @@ const rulesErrorEl = $('rulesError');
 // --- connection settings ----------------------------------------------------
 
 chrome.storage.local
-  .get(['endpoint', 'token', 'refreshMinutes', 'pathPattern'])
+  .get(['endpoint', 'token', 'refreshMinutes', 'pagesToScan', 'pathPattern'])
   .then(({ endpoint = DEFAULT_ENDPOINT, token = '', refreshMinutes = 0,
-           pathPattern = DEFAULT_PATH_PATTERN }) => {
+           pagesToScan = 1, pathPattern = DEFAULT_PATH_PATTERN }) => {
     endpointEl.value = endpoint;
     tokenEl.value = token;
     refreshEl.value = refreshMinutes;
+    pagesEl.value = pagesToScan;
     pathEl.value = pathPattern;
     loadRules();
   });
@@ -54,6 +56,7 @@ $('save').addEventListener('click', async () => {
     endpoint: endpointEl.value.trim() || DEFAULT_ENDPOINT,
     token: tokenEl.value.trim(),
     pathPattern: pattern,
+    pagesToScan: Math.min(25, Math.max(1, parseInt(pagesEl.value, 10) || 1)),
     refreshMinutes: Math.max(0, parseInt(refreshEl.value, 10) || 0)
   });
   flash(savedEl, 'Saved');
@@ -214,6 +217,18 @@ function line(cls, strong, rest = '') {
   return div;
 }
 
+/** Total distinct items the notifier has ever recorded, or null if unreachable. */
+async function knownItemCount() {
+  try {
+    const url = new URL('/health', endpointEl.value.trim() || DEFAULT_ENDPOINT);
+    const resp = await fetch(url.toString());
+    if (!resp.ok) return null;
+    return (await resp.json()).seen_items ?? null;
+  } catch {
+    return null;
+  }
+}
+
 async function renderStatus() {
   const { endpoint = DEFAULT_ENDPOINT, lastRelay, lastSeen = 0, lastNotified = 0,
           lastError = '', lastErrorAt } = await chrome.storage.local.get(
@@ -235,8 +250,21 @@ async function renderStatus() {
     frag.appendChild(line(
       stale ? 'warn' : 'ok',
       `Last relayed ${ago(lastRelay)}`,
-      `— ${lastSeen} item${lastSeen === 1 ? '' : 's'} read, ${lastNotified} alerted.`
+      `— ${lastSeen} item${lastSeen === 1 ? '' : 's'} on that page, ${lastNotified} alerted.`
     ));
+    // "37 items read" reads like total coverage when it is one page of ~25.
+    // Spell out the sweep width and the running total instead.
+    const { pagesToScan = 1 } = await chrome.storage.local.get(['pagesToScan']);
+    frag.appendChild(line(
+      'hint',
+      pagesToScan > 1
+        ? `Scanning ${pagesToScan} pages per sweep.`
+        : 'Scanning 1 page per sweep — about 4% of the catalogue.'
+    ));
+    const total = await knownItemCount();
+    if (total !== null) {
+      frag.appendChild(line('hint', `${total} distinct items recorded so far.`));
+    }
     if (stale) {
       frag.appendChild(line('hint', 'Over an hour ago.', 'Is the reviewer tab still open?'));
     }

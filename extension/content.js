@@ -25,7 +25,10 @@ const OUT_OF_STOCK_RE = /\bout of stock\b/i;
 const CLAIMS_RE = /Free items remaining\s*(\d+)\s*item/i;
 
 // Merchandising badges rendered inside the card link, ahead of the title.
-const BADGE_RE = /^(clearance|rollback|reduced price|deal|new|best seller|popular pick)\b/i;
+// Longest first: "new arrival" must be tried before "new", or the badge strips
+// to "New" and leaves "arrival" glued to the front of the title.
+const BADGE_RE =
+  /^(new arrival|reduced price|best seller|popular pick|clearance|rollback|deal|new)\b/i;
 const TRAILING_PRICE_RE = /\s*\$\s*[0-9][0-9,]*(?:\.[0-9]{1,2})?(?:\s*was\s*\$\s*[0-9][0-9,]*(?:\.[0-9]{1,2})?)?\s*$/i;
 
 // Order and returns pages are full of /ip/ links to things the user already
@@ -158,6 +161,63 @@ async function relay() {
   if (!items.length) return;
   // The background worker dedupes across reloads and the server dedupes again.
   chrome.runtime.sendMessage({ type: 'items', items });
+  scheduleNextPage(items.length);
+}
+
+// --- pagination -------------------------------------------------------------
+// The portal shows ~37 items per page across ~25 pages. Reading only the open
+// page covers about 4% of the catalogue, so an item that drops onto page 9 is
+// never seen.
+//
+// Walking pages is a crawl, though, and a much bigger ToS footprint than one
+// tab refreshing: scanning N pages is N page loads per sweep. So it is off by
+// default, capped, and paced with a long jittered gap rather than firing
+// requests back to back.
+
+const PAGE_STEP_MS = 9000;
+const PAGE_STEP_JITTER = 0.35;
+const MAX_PAGES = 25;
+
+function currentPage() {
+  const raw = parseInt(new URLSearchParams(location.search).get('page') || '1', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 1;
+}
+
+function pageUrl(page) {
+  const url = new URL(location.href);
+  if (page <= 1) {
+    url.searchParams.delete('page');
+  } else {
+    url.searchParams.set('page', String(page));
+  }
+  return url.toString();
+}
+
+let advanceTimer = null;
+
+async function scheduleNextPage(itemCount) {
+  const { pagesToScan = 1 } = await chrome.storage.local.get(['pagesToScan']);
+  const limit = Math.min(Math.max(parseInt(pagesToScan, 10) || 1, 1), MAX_PAGES);
+  if (limit <= 1) return;
+
+  const page = currentPage();
+  // An empty page means the catalogue ran out before the configured limit.
+  const next = (page < limit && itemCount > 0) ? page + 1 : 1;
+  if (next === page) return;
+
+  // Only ever one pending navigation, however many times the observer fires.
+  if (advanceTimer) return;
+  const delay = PAGE_STEP_MS * (1 + (Math.random() * 2 - 1) * PAGE_STEP_JITTER);
+  advanceTimer = setTimeout(() => {
+    // Same courtesy as the reload: never navigate out from under someone who
+    // is mid-claim. Re-check rather than cancelling, so the sweep resumes.
+    if (Date.now() - lastInteraction < INTERACTION_GRACE_MS) {
+      advanceTimer = null;
+      scheduleNextPage(itemCount);
+      return;
+    }
+    location.assign(pageUrl(next));
+  }, delay);
 }
 
 let relayTimer;

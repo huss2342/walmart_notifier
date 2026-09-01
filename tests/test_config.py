@@ -13,9 +13,16 @@ from config import (
 
 
 @pytest.fixture(autouse=True)
-def clear_env(monkeypatch):
+def clear_env(monkeypatch, tmp_path):
+    """Isolate every rules source from the developer's real machine.
+
+    USER_RULES_PATH matters most: without it these tests read whatever the
+    running notifier last saved to data/rules.json, so they passed or failed
+    depending on what the user had typed into the options page.
+    """
     monkeypatch.delenv("RULES_JSON", raising=False)
     monkeypatch.delenv("RULES_PATH", raising=False)
+    monkeypatch.setenv("USER_RULES_PATH", str(tmp_path / "user-rules.json"))
 
 
 def test_inline_json_wins(monkeypatch, tmp_path):
@@ -81,7 +88,11 @@ def test_seed_mode_defaults_off(monkeypatch):
 
 @pytest.fixture
 def user_rules(monkeypatch, tmp_path):
-    """Isolate the UI-saved rules file from the developer's real one."""
+    """The UI-saved rules file for tests that write to it.
+
+    clear_env already redirects USER_RULES_PATH; this names a distinct file so
+    a test can assert on its existence.
+    """
     path = tmp_path / "rules.json"
     monkeypatch.setenv("USER_RULES_PATH", str(path))
     return path

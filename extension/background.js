@@ -13,6 +13,7 @@ const DEFAULTS = {
   endpoint: 'http://127.0.0.1:8787/ingest',
   token: '',
   refreshMinutes: 0,
+  pagesToScan: 1,
   pathPattern: '^/reviews/claim-product'
 };
 
@@ -146,7 +147,15 @@ async function refreshTick() {
       continue;
     }
     try {
-      await chrome.tabs.reload(tab.id, { bypassCache: false });
+      // Restart the sweep at page 1. Reloading whatever page the walk stopped
+      // on would leave earlier pages unread every cycle.
+      const url = new URL(tab.url);
+      if (url.searchParams.has('page')) {
+        url.searchParams.delete('page');
+        await chrome.tabs.update(tab.id, { url: url.toString() });
+      } else {
+        await chrome.tabs.reload(tab.id, { bypassCache: false });
+      }
     } catch (err) {
       console.warn('Reviewer Item Relay: could not reload tab', tab.id, err);
     }
