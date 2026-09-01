@@ -122,29 +122,29 @@ mistake shipped once already.
 
 ## Pagination
 
-The portal paginates at ~37 items per page. A sweep walks page 1 upward via the
-`page` query parameter until a page comes back empty, then returns to page 1 and
-stops; the background refresh alarm starts the next sweep.
+A sweep visits every page once. Progress is an explicit `{total, visited[]}`
+record in `chrome.storage.local`, not an inference from the current URL.
 
-The end is detected by the portal's "no search results" panel, not by an item
-count. Count alone is ambiguous: the MutationObserver also fires mid-render,
-before any card exists, so an empty page and a still-loading page look
-identical. `relay()` therefore returns early on zero items *unless* the end
-marker is present. A hard cap of 100 pages is a backstop in case that marker
-ever changes.
+Deriving the next page as "current + 1" failed in practice: Walmart rewrites
+the query string between loads (`page` appears before `affinityOverride` on one
+render and after it on another), and the walk was seen jumping 1 -> 7 -> 6 ->
+10. The explicit set also survives the content script dying, a reload landing
+somewhere unexpected, and the user clicking a page link mid-sweep -- the next
+relay just resumes at the lowest page not yet seen.
 
-Chrome throttles `setTimeout` in hidden tabs to roughly once a minute after a
-few minutes out of view, so a backgrounded sweep runs far slower than the
-configured delay -- 24 pages can take ~24 minutes instead of two. The refresh
-alarm therefore asks the content script whether a sweep is in progress
-(`page > 1`) and skips the reset if so. Without that check a 3-minute refresh
-would restart the walk at page 1 forever and the later pages would never be
-read at all.
+`total` comes from the pager: the highest number in the `<ul>` holding
+`[data-automation-id="page-number"]`. It is scraped from the whole list rather
+than the page-number anchors because the last page renders as a plain `<div>`,
+not a link.
 
-The step delay is a setting (default 5s, jittered) rather than a constant,
-because it is the dial that decides how hard this hits the site. The walk also
-defers while the user is mid-interaction, same as the reload, and guards against
-stacking navigations when the observer fires repeatedly.
+The advance guard is a plain boolean set synchronously. The previous version
+checked a timer handle before an `await` on storage, so two observer-driven
+calls both passed the check and both queued a navigation.
+
+The step delay (default 5s, jittered) is a setting because it is the dial that
+decides how hard this hits the site. The walk defers while the user is
+mid-interaction, and the refresh alarm clears the visited set to start a fresh
+pass -- but skips tabs whose sweep is still running.
 
 ## Where the filters live
 

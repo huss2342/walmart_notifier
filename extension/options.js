@@ -231,9 +231,10 @@ async function knownItemCount() {
 
 async function renderStatus() {
   const { endpoint = DEFAULT_ENDPOINT, lastRelay, lastSeen = 0, lastNotified = 0,
-          lastPage = 1, lastError = '', lastErrorAt } = await chrome.storage.local.get(
+          lastPage = 1, lastError = '', lastErrorAt, sweep, lastSweepPages,
+          lastSweepDone } = await chrome.storage.local.get(
     ['endpoint', 'lastRelay', 'lastSeen', 'lastNotified', 'lastPage',
-     'lastError', 'lastErrorAt']
+     'lastError', 'lastErrorAt', 'sweep', 'lastSweepPages', 'lastSweepDone']
   );
 
   // Built as nodes rather than an HTML string: lastError can contain a server
@@ -254,7 +255,19 @@ async function renderStatus() {
       `— page ${lastPage}, ${lastSeen} item${lastSeen === 1 ? '' : 's'}, ` +
       `${lastNotified} alerted.`
     ));
-    // Per-page counts read like total coverage; show the running total too.
+    // Per-page counts read like total coverage; show sweep progress too.
+    if (sweep && sweep.total) {
+      const done = (sweep.visited || []).length;
+      frag.appendChild(line(
+        'hint', `Sweep in progress: ${done} of ${sweep.total} pages done.`
+      ));
+    } else if (lastSweepPages) {
+      frag.appendChild(line(
+        'hint',
+        `Last sweep covered ${lastSweepPages} pages` +
+        (lastSweepDone ? `, finished ${ago(lastSweepDone)}.` : '.')
+      ));
+    }
     const total = await knownItemCount();
     if (total !== null) {
       frag.appendChild(line('hint', `${total} distinct items recorded so far.`));

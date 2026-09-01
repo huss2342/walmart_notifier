@@ -48,17 +48,19 @@ for (const evt of ['click', 'keydown', 'scroll']) {
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg?.type === 'busy?') {
+  if (msg?.type !== 'busy?') return undefined;
+  // Never yank the page out from under someone mid-claim, and never restart a
+  // sweep that is still walking. Chrome throttles timers in hidden tabs to
+  // about one per minute, so a backgrounded sweep can outlast the refresh
+  // interval; resetting it on every alarm would mean the later pages are never
+  // reached at all.
+  readSweep().then((sweep) => {
     sendResponse({
-      // Never yank the page out from under someone mid-claim.
       busy: Date.now() - lastInteraction < INTERACTION_GRACE_MS,
-      // Nor restart a sweep that is still walking. Chrome throttles timers in
-      // hidden tabs to about one per minute, so a backgrounded sweep can take
-      // far longer than the refresh interval; resetting it to page 1 on every
-      // alarm would mean the later pages are never reached at all.
-      sweeping: currentPage() > 1
+      sweeping: nextUnvisited(sweep) !== null
     });
-  }
+  });
+  return true;   // response is asynchronous
 });
 
 async function isReviewerPage() {
@@ -174,20 +176,25 @@ async function relay() {
     // the next mutation rather than calling this the end of the catalogue.
     return;
   }
-  scheduleNextPage(items.length);
+  scheduleNextPage();
 }
 
 // --- pagination -------------------------------------------------------------
-// Walks every page of the catalogue, page=1 upward, until one comes back with
-// no results. The background refresh restarts the sweep from page 1.
+// A sweep visits every page once. Which pages remain is tracked explicitly in
+// storage rather than inferred from the current URL: Walmart rewrites the
+// query string (parameter order differs between loads), so "whatever page I am
+// on, plus one" drifts and the walk visibly jumped 1 -> 7 -> 6 -> 10.
+//
+// The explicit set also survives the content script dying, a reload landing
+// somewhere unexpected, or the user clicking a page link mid-sweep -- the next
+// relay simply resumes with the lowest page not yet seen.
 
 const PAGE_JITTER = 0.25;
 const DEFAULT_PAGE_DELAY_S = 5;
-// The portal answers a past-the-end page with a "no search results" panel. It
-// is the only reliable end marker: item count alone is ambiguous because the
-// observer also fires mid-render, before any card exists.
+const SWEEP_KEY = 'sweep';
+// The portal answers a past-the-end page with a "no search results" panel.
 const END_OF_RESULTS_RE = /no search results/i;
-// Backstop only. If the end marker ever changes, this stops an endless walk.
+// Backstop for the case where the page count cannot be read at all.
 const HARD_PAGE_CAP = 100;
 
 function currentPage() {
@@ -205,36 +212,90 @@ function pageUrl(page) {
   return url.toString();
 }
 
-let advanceTimer = null;
-
 function atEndOfResults() {
   return END_OF_RESULTS_RE.test(document.body.innerText || '');
 }
 
-async function scheduleNextPage(itemCount) {
-  const page = currentPage();
-  const done = itemCount === 0 || atEndOfResults() || page >= HARD_PAGE_CAP;
-  const next = done ? 1 : page + 1;
-  // Already home with nothing more to do.
-  if (next === page) return;
-  // Only ever one pending navigation, however often the observer fires.
-  if (advanceTimer) return;
+/** Highest page number in the pager, or null if the pager is not on the page.
+ *
+ * The last page sits in a plain <div> rather than an <a>, so the whole list is
+ * scanned for numbers instead of just the page-number anchors.
+ */
+function totalPages() {
+  const list = document.querySelector('[data-automation-id="page-number"]')?.closest('ul');
+  if (!list) return null;
+  const numbers = (list.innerText.match(/\d+/g) || [])
+    .map(Number)
+    .filter((n) => n > 0 && n <= HARD_PAGE_CAP);
+  return numbers.length ? Math.max(...numbers) : null;
+}
 
-  const { pageDelaySeconds = DEFAULT_PAGE_DELAY_S } =
-    await chrome.storage.local.get(['pageDelaySeconds']);
-  const base = Math.max(1, parseInt(pageDelaySeconds, 10) || DEFAULT_PAGE_DELAY_S) * 1000;
-  const delay = base * (1 + (Math.random() * 2 - 1) * PAGE_JITTER);
+async function readSweep() {
+  const { [SWEEP_KEY]: sweep } = await chrome.storage.local.get([SWEEP_KEY]);
+  if (sweep && Array.isArray(sweep.visited)) return sweep;
+  return { total: null, visited: [] };
+}
 
-  advanceTimer = setTimeout(() => {
-    advanceTimer = null;
-    // Same courtesy as the reload: never navigate out from under someone
-    // mid-claim. Re-check rather than cancelling, so the sweep resumes.
-    if (Date.now() - lastInteraction < INTERACTION_GRACE_MS) {
-      scheduleNextPage(itemCount);
+/** Lowest page in 1..total not yet visited, or null when the sweep is done. */
+function nextUnvisited(sweep) {
+  if (!sweep.total) return null;
+  const seen = new Set(sweep.visited);
+  for (let page = 1; page <= sweep.total; page += 1) {
+    if (!seen.has(page)) return page;
+  }
+  return null;
+}
+
+// Set synchronously. The storage reads below are async, so a check that only
+// consulted a timer handle would let two observer-driven calls through and
+// queue two navigations.
+let advancing = false;
+
+async function scheduleNextPage() {
+  if (advancing) return;
+  advancing = true;
+  try {
+    const page = currentPage();
+    const sweep = await readSweep();
+
+    // A page that reports a total is authoritative; past the end there is no
+    // pager at all, so fall back to what the sweep already knew.
+    const total = totalPages() ?? sweep.total;
+    const visited = atEndOfResults() && !totalPages()
+      ? sweep.visited                       // nothing real here to record
+      : [...new Set([...sweep.visited, page])];
+
+    const updated = { total, visited };
+    const next = nextUnvisited(updated);
+
+    if (next === null) {
+      // Sweep complete. Clear it so the next refresh starts a fresh pass.
+      await chrome.storage.local.remove(SWEEP_KEY);
+      await chrome.storage.local.set({ lastSweepDone: Date.now(), lastSweepPages: visited.length });
       return;
     }
-    location.assign(pageUrl(next));
-  }, delay);
+
+    await chrome.storage.local.set({ [SWEEP_KEY]: updated });
+    if (next === page) return;   // already here; wait for this page to render
+
+    const { pageDelaySeconds = DEFAULT_PAGE_DELAY_S } =
+      await chrome.storage.local.get(['pageDelaySeconds']);
+    const base = Math.max(1, parseInt(pageDelaySeconds, 10) || DEFAULT_PAGE_DELAY_S) * 1000;
+    const delay = base * (1 + (Math.random() * 2 - 1) * PAGE_JITTER);
+
+    setTimeout(() => {
+      // Same courtesy as the reload: never navigate out from under someone
+      // mid-claim. Release the guard so a later relay can retry.
+      if (Date.now() - lastInteraction < INTERACTION_GRACE_MS) {
+        advancing = false;
+        return;
+      }
+      location.assign(pageUrl(next));
+    }, delay);
+  } catch (err) {
+    advancing = false;
+    console.warn('Reviewer Item Relay: could not advance the sweep', err);
+  }
 }
 
 let relayTimer;

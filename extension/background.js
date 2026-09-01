@@ -152,6 +152,8 @@ async function refreshTick() {
     try {
       // Restart the sweep at page 1. Reloading whatever page the walk stopped
       // on would leave earlier pages unread every cycle.
+      // Drop the previous sweep's visited set so this pass starts clean.
+      await chrome.storage.local.remove('sweep');
       const url = new URL(tab.url);
       if (url.searchParams.has('page')) {
         url.searchParams.delete('page');
