@@ -32,7 +32,7 @@ async function config() {
 
 // --- ingest -----------------------------------------------------------------
 
-async function post(items) {
+async function post(items, page) {
   const { endpoint, token } = await config();
   if (!endpoint) {
     console.warn('Reviewer Item Relay: no endpoint configured; open the options page.');
@@ -72,6 +72,7 @@ async function post(items) {
       lastRelay: Date.now(),
       lastSeen: summary.seen ?? items.length,
       lastNotified: summary.notified ?? 0,
+      lastPage: page ?? 1,
       lastError: ''
     });
     if (summary.notified) {
@@ -87,7 +88,7 @@ async function post(items) {
 
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg?.type === 'items' && Array.isArray(msg.items) && msg.items.length) {
-    post(msg.items);
+    post(msg.items, msg.page);
   }
 });
 

@@ -231,8 +231,9 @@ async function knownItemCount() {
 
 async function renderStatus() {
   const { endpoint = DEFAULT_ENDPOINT, lastRelay, lastSeen = 0, lastNotified = 0,
-          lastError = '', lastErrorAt } = await chrome.storage.local.get(
-    ['endpoint', 'lastRelay', 'lastSeen', 'lastNotified', 'lastError', 'lastErrorAt']
+          lastPage = 1, lastError = '', lastErrorAt } = await chrome.storage.local.get(
+    ['endpoint', 'lastRelay', 'lastSeen', 'lastNotified', 'lastPage',
+     'lastError', 'lastErrorAt']
   );
 
   // Built as nodes rather than an HTML string: lastError can contain a server
@@ -250,7 +251,8 @@ async function renderStatus() {
     frag.appendChild(line(
       stale ? 'warn' : 'ok',
       `Last relayed ${ago(lastRelay)}`,
-      `— ${lastSeen} item${lastSeen === 1 ? '' : 's'} on that page, ${lastNotified} alerted.`
+      `— page ${lastPage}, ${lastSeen} item${lastSeen === 1 ? '' : 's'}, ` +
+      `${lastNotified} alerted.`
     ));
     // Per-page counts read like total coverage; show the running total too.
     const total = await knownItemCount();

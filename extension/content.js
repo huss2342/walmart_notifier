@@ -136,18 +136,19 @@ function collect() {
     const id = idFromHref(anchor.getAttribute('href') || '');
     if (!id || byId.has(id)) continue;
 
+    // A card whose layout defeats the walk used to be dropped outright, which
+    // is the worst outcome: a $79.99 item vanished with nothing logged. Emit
+    // it with an unknown value instead and let `alert_on_unknown_value`
+    // decide -- a spurious buzz is far cheaper than a silent miss.
     const card = cardFor(anchor);
-    // No card means no stated retail value, which means no way to tell a $5
-    // sample from a $200 one. Alerting on it would defeat the whole filter.
-    if (!card) continue;
     // Claiming an out-of-stock item is not possible, so waking someone for one
     // is pure noise.
-    if (OUT_OF_STOCK_RE.test(card.text)) continue;
+    if (card && OUT_OF_STOCK_RE.test(card.text)) continue;
 
     const title = titleFor(anchor, card);
     if (!title) continue;
 
-    const value = card.text.match(VALUE_RE);
+    const value = card ? card.text.match(VALUE_RE) : null;
     byId.set(id, {
       item_id: `ip-${id}`,
       title,
@@ -167,7 +168,7 @@ async function relay() {
   const items = collect();
   if (items.length) {
     // The background worker dedupes across reloads and the server dedupes again.
-    chrome.runtime.sendMessage({ type: 'items', items });
+    chrome.runtime.sendMessage({ type: 'items', items, page: currentPage() });
   } else if (!atEndOfResults()) {
     // No cards and no end marker means the page is still rendering. Wait for
     // the next mutation rather than calling this the end of the catalogue.

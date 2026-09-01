@@ -67,6 +67,12 @@ lets `alert_on_unknown_value` decide.
 image `alt` is cleanest, so it is tried first, then the badge prefix and any
 trailing price are stripped from whatever is used.
 
+A card the walk cannot resolve is **not** dropped. It is emitted with a null
+value so `alert_on_unknown_value` decides. Dropping it was the original
+behaviour and it cost a real $79.99 item: fourteen of fifteen cards on that
+page were captured, the fifteenth vanished, and nothing anywhere recorded that
+it had happened. A spurious buzz is much cheaper than a silent miss.
+
 Out-of-stock items are dropped: a notification for something that cannot be
 claimed is pure noise. `Free items remaining: N` is read once per page and
 attached to each item, because zero claims left decides whether an alert is
