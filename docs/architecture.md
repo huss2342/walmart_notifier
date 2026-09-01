@@ -137,6 +137,19 @@ relay just resumes at the lowest page not yet seen.
 than the page-number anchors because the last page renders as a plain `<div>`,
 not a link.
 
+The pager is below the fold and lazily rendered, so a relay firing before it
+exists reads nothing. The walk scrolls to the foot of the page and back to
+force it in, restoring the scroll position so a visible tab does not jump. That
+scroll is flagged as programmatic -- the interaction detector listens for
+`scroll`, and counting our own would defer the next navigation by the full
+30-second grace period every time.
+
+An unknown total is explicitly *not* treated as a finished sweep. It once was,
+and since the pager renders late that ended every sweep after a single page.
+The fallback is to walk forward from the highest page seen and let the
+end-of-results panel stop the sweep; once any relay reads the pager, the total
+is persisted and the set-based walk takes over.
+
 The advance guard is a plain boolean set synchronously. The previous version
 checked a timer handle before an `await` on storage, so two observer-driven
 calls both passed the check and both queued a navigation.

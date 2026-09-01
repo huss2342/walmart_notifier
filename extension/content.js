@@ -42,9 +42,35 @@ const CARD_MAX_DEPTH = 8;
 const INTERACTION_GRACE_MS = 30_000;
 
 let lastInteraction = 0;
+// Our own scrolling must not register as the user being busy, or nudging the
+// pager into view would defer the next navigation by the full grace period.
+let programmaticScroll = false;
 for (const evt of ['click', 'keydown', 'scroll']) {
-  document.addEventListener(evt, () => { lastInteraction = Date.now(); },
-                            { passive: true, capture: true });
+  document.addEventListener(evt, () => {
+    if (evt === 'scroll' && programmaticScroll) return;
+    lastInteraction = Date.now();
+  }, { passive: true, capture: true });
+}
+
+/** Scroll to the foot of the page and back, to force a lazy pager to render.
+ *
+ * The pager sits below the fold and is not in the DOM until it is approached,
+ * so a relay that fires before then cannot read the page count. Position is
+ * restored so a tab the user happens to be looking at does not jump.
+ */
+async function revealPager() {
+  const from = window.scrollY;
+  programmaticScroll = true;
+  try {
+    window.scrollTo(0, document.body.scrollHeight);
+    // Two frames plus a beat: enough for an intersection observer to fire and
+    // the pager to commit.
+    await new Promise((done) => setTimeout(done, 400));
+    window.scrollTo(0, from);
+    await new Promise((done) => setTimeout(done, 50));
+  } finally {
+    programmaticScroll = false;
+  }
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -270,6 +296,13 @@ async function scheduleNextPage() {
     const page = currentPage();
     const sweep = await readSweep();
     const ended = atEndOfResults();
+
+    // Knowing the real page count is what makes the walk deterministic, so it
+    // is worth one scroll to the foot of the page to make the pager appear.
+    if (!ended && totalPages() === null &&
+        Date.now() - lastInteraction >= INTERACTION_GRACE_MS) {
+      await revealPager();
+    }
 
     // A page that reports a total is authoritative; past the end there is no
     // pager at all, so fall back to what the sweep already knew.
