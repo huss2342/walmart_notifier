@@ -304,16 +304,29 @@ async function scheduleNextPage() {
       await revealPager();
     }
 
-    // A page that reports a total is authoritative; past the end there is no
-    // pager at all, so fall back to what the sweep already knew.
-    const total = totalPages() ?? sweep.total;
-    const visited = ended
+    // The total only ever grows. The pager renders progressively, so a read
+    // caught mid-render on page 19 can see "1 ... 18 19" and report 19 -- which
+    // ended the sweep five pages early. Taking the max of every reading makes a
+    // partial render harmless.
+    const detected = totalPages();
+    const total = Math.max(detected ?? 0, sweep.total ?? 0) || null;
+    const visited = ended && !detected
       ? sweep.visited                       // nothing real here to record
       : [...new Set([...sweep.visited, page])];
 
     const updated = { total, visited };
-    // The end-of-results panel is definitive whatever the counters say.
-    const next = ended ? null : nextUnvisited(updated);
+
+    // The end-of-results panel is only trusted when the page count is unknown
+    // or we are at/past it. Walmart shows that panel transiently on a slow or
+    // failed load, and believing it mid-catalogue truncates the sweep.
+    const trustEnded = ended && (!total || page >= total);
+    if (ended && !trustEnded) {
+      console.warn(
+        `Reviewer Item Relay: page ${page} of ${total} reported no results; ` +
+        'treating as a transient failure and continuing.'
+      );
+    }
+    const next = trustEnded ? null : nextUnvisited(updated);
 
     if (next === null) {
       // Sweep complete. Clear it so the next refresh starts a fresh pass.

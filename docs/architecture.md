@@ -144,6 +144,15 @@ scroll is flagged as programmatic -- the interaction detector listens for
 `scroll`, and counting our own would defer the next navigation by the full
 30-second grace period every time.
 
+The total only ever grows, across every reading in a sweep. The pager renders
+progressively, so a read caught mid-render on page 19 saw `1 ... 18 19`,
+reported 19, and the sweep declared itself complete five pages early. Taking
+the maximum of every reading makes a partial render harmless.
+
+The end-of-results panel is only believed when the page count is unknown or the
+current page is at/past it. Walmart shows that panel transiently on a slow or
+failed load, and trusting it mid-catalogue truncates the sweep the same way.
+
 An unknown total is explicitly *not* treated as a finished sweep. It once was,
 and since the pager renders late that ended every sweep after a single page.
 The fallback is to walk forward from the highest page seen and let the

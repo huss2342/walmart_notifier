@@ -110,7 +110,13 @@
   <input id="refreshMinutes" type="number" min="0" max="120" step="1" placeholder="0">
 </label>
 
-<button id="save">Save connection settings</button><span id="saved" class="saved"></span>
+<button id="save">Save connection settings</button>
+<button id="resetSweep" class="secondary" type="button">Restart sweep</button>
+<span id="saved" class="saved"></span>
+<div class="hint">
+  Restart sweep clears the page-progress record and sends the reviewer tab back
+  to page 1. It does not touch what has already been alerted on.
+</div>
 
 <div class="status">
   <h2>Status</h2>

@@ -191,6 +191,24 @@ $('resetRules').addEventListener('click', async () => {
   }
 });
 
+$('resetSweep').addEventListener('click', async () => {
+  // Clears progress only. The dedupe store lives on the notifier and is
+  // deliberately untouched -- wiping it would re-alert on the whole catalogue.
+  await chrome.storage.local.remove(['sweep', 'lastSweepPages', 'lastSweepDone']);
+  try {
+    const tabs = await chrome.tabs.query({ url: 'https://www.walmart.com/reviews/*' });
+    for (const tab of tabs) {
+      const url = new URL(tab.url);
+      url.searchParams.delete('page');
+      await chrome.tabs.update(tab.id, { url: url.toString() });
+    }
+    flash(savedEl, tabs.length ? 'Sweep restarted' : 'Cleared (no reviewer tab open)');
+  } catch (err) {
+    flash(savedEl, `Cleared, but could not reload the tab: ${err.message}`);
+  }
+  renderStatus();
+});
+
 function flash(el, message) {
   el.textContent = message;
   setTimeout(() => { el.textContent = ''; }, 2500);
