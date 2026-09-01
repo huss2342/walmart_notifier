@@ -1,7 +1,8 @@
-// Everything lives in chrome.storage.local: the endpoint carries the function
-// key and the token is a shared secret, so neither belongs in synced storage.
+// Everything lives in chrome.storage.local. Nothing here needs syncing: the
+// endpoint points at this machine, and the token is a local shared secret.
 
-const DEFAULT_PATH_PATTERN = '^/(reviewer|reviews)';
+const DEFAULT_PATH_PATTERN = '^/reviews/claim-product';
+const DEFAULT_ENDPOINT = 'http://127.0.0.1:8787/ingest';
 
 const endpointEl = document.getElementById('endpoint');
 const tokenEl = document.getElementById('token');
@@ -13,7 +14,7 @@ const statusEl = document.getElementById('status');
 
 chrome.storage.local
   .get(['endpoint', 'token', 'refreshMinutes', 'pathPattern'])
-  .then(({ endpoint = '', token = '', refreshMinutes = 0,
+  .then(({ endpoint = DEFAULT_ENDPOINT, token = '', refreshMinutes = 0,
            pathPattern = DEFAULT_PATH_PATTERN }) => {
     endpointEl.value = endpoint;
     tokenEl.value = token;
@@ -32,7 +33,7 @@ document.getElementById('save').addEventListener('click', async () => {
   pathErrorEl.textContent = '';
 
   await chrome.storage.local.set({
-    endpoint: endpointEl.value.trim(),
+    endpoint: endpointEl.value.trim() || DEFAULT_ENDPOINT,
     token: tokenEl.value.trim(),
     pathPattern: pattern,
     refreshMinutes: Math.max(0, parseInt(refreshEl.value, 10) || 0)
@@ -61,7 +62,7 @@ function line(cls, strong, rest = '') {
 }
 
 async function renderStatus() {
-  const { endpoint = '', lastRelay, lastSeen = 0, lastNotified = 0,
+  const { endpoint = DEFAULT_ENDPOINT, lastRelay, lastSeen = 0, lastNotified = 0,
           lastError = '', lastErrorAt } = await chrome.storage.local.get(
     ['endpoint', 'lastRelay', 'lastSeen', 'lastNotified', 'lastError', 'lastErrorAt']
   );
@@ -70,11 +71,11 @@ async function renderStatus() {
   // response, and that must never be parsed as markup.
   const frag = document.createDocumentFragment();
   if (!endpoint) {
-    frag.appendChild(line('bad', 'No endpoint configured.', 'Paste your ingest URL above.'));
+    frag.appendChild(line('bad', 'No endpoint configured.', 'Set it above.'));
   } else if (!lastRelay) {
     frag.appendChild(line(
       'warn', 'Nothing relayed yet.',
-      'Open your reviewer page in a tab — status updates once it sends.'
+      'Is python src/server.py running? Open your reviewer page in a tab — status updates once it sends.'
     ));
   } else {
     const stale = Date.now() - lastRelay > 60 * 60 * 1000;

@@ -1,5 +1,5 @@
-// Forwards collected items to the Azure Function ingest endpoint, and owns the
-// self-refresh schedule.
+// Forwards collected items to the notifier running on this machine, and owns
+// the self-refresh schedule.
 //
 // The refresh lives here rather than in the content script because a content
 // script dies with its page: one reload landing on a sign-in redirect or a
@@ -7,7 +7,14 @@
 // An alarm in the service worker keeps running regardless of what the tab is
 // currently showing.
 
-const DEFAULTS = { endpoint: '', token: '', refreshMinutes: 0, pathPattern: '^/(reviewer|reviews)' };
+// The notifier runs on this machine, so the endpoint has a real default and
+// most people never need to touch it.
+const DEFAULTS = {
+  endpoint: 'http://127.0.0.1:8787/ingest',
+  token: '',
+  refreshMinutes: 0,
+  pathPattern: '^/reviews/claim-product'
+};
 
 const REFRESH_ALARM = 'refresh';
 const BADGE_ALARM = 'clearBadge';
@@ -98,7 +105,7 @@ async function scheduleRefresh(busy = false) {
 }
 
 async function reviewerTabs() {
-  const tabs = await chrome.tabs.query({ url: 'https://www.walmart.com/*' });
+  const tabs = await chrome.tabs.query({ url: 'https://www.walmart.com/reviews/*' });
   const { pathPattern } = await config();
   let re;
   try {
@@ -164,14 +171,18 @@ chrome.storage.onChanged.addListener((changes, area) => {
   }
 });
 
-// 1.0.x kept the endpoint and token in chrome.storage.sync, which ships them to
-// Google's servers and to every signed-in copy of Chrome. Both are credentials
-// (the endpoint carries the ?code= function key), so they belong in local
-// storage only.
+// 1.0.x kept settings in chrome.storage.sync, which ships them to Google's
+// servers and to every signed-in copy of Chrome. Nothing here needs syncing --
+// the endpoint points at this machine.
 async function migrateFromSync() {
   const synced = await chrome.storage.sync.get(['endpoint', 'token', 'refreshMinutes']);
-  if (!Object.keys(synced).length) return;
-  const existing = await chrome.storage.local.get(['endpoint']);
-  if (!existing.endpoint) await chrome.storage.local.set(synced);
   await chrome.storage.sync.remove(['endpoint', 'token', 'refreshMinutes']);
+  if (!Object.keys(synced).length) return;
+  // An endpoint carried over from the Azure build points at a function app that
+  // no longer exists, so it is deliberately not migrated.
+  const { refreshMinutes } = synced;
+  const existing = await chrome.storage.local.get(['refreshMinutes']);
+  if (refreshMinutes && !existing.refreshMinutes) {
+    await chrome.storage.local.set({ refreshMinutes });
+  }
 }

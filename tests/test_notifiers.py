@@ -54,3 +54,60 @@ class TestConstruction:
 
     def test_null_notifier_reports_failure(self):
         assert NullNotifier().send(Item(title="X")) is False
+
+
+def test_message_reports_claims_remaining():
+    item = Item(title="Air fryer tray", value_usd=24.59,
+                raw={"claims_remaining": 3, "query": "air fryer"})
+    _, body = format_message(item)
+    assert "Claims remaining: 3" in body
+    assert "Search: air fryer" in body
+
+
+def test_message_calls_out_having_no_claims_left():
+    """Zero claims changes whether the alert is actionable, so it must be said."""
+    item = Item(title="Air fryer tray", value_usd=24.59, raw={"claims_remaining": 0})
+    _, body = format_message(item)
+    assert "No claims left this cycle" in body
+
+
+def test_message_omits_claims_when_unknown():
+    _, body = format_message(Item(title="Air fryer tray", value_usd=24.59))
+    assert "claims" not in body.lower()
+
+
+def test_ntfy_adds_an_email_header_when_configured(monkeypatch):
+    monkeypatch.setenv("NTFY_TOPIC", "topic")
+    monkeypatch.setenv("NTFY_EMAIL", "you@example.com")
+    captured = {}
+
+    def fake_post(url, data=None, headers=None, timeout=None):
+        captured.update(headers)
+
+        class Resp:
+            def raise_for_status(self):
+                pass
+        return Resp()
+
+    import notifiers.ntfy as ntfy_module
+    monkeypatch.setattr(ntfy_module.requests, "post", fake_post)
+
+    assert NtfyNotifier.from_env().send(Item(title="TV", value_usd=25.0)) is True
+    assert captured["Email"] == "you@example.com"
+
+
+def test_ntfy_omits_the_email_header_by_default(monkeypatch):
+    monkeypatch.setenv("NTFY_TOPIC", "topic")
+    monkeypatch.delenv("NTFY_EMAIL", raising=False)
+    assert NtfyNotifier.from_env().email is None
+
+
+def test_title_keeps_cents_so_thresholds_are_not_misread():
+    """$24.59 must not render as "$25" beside a $25 rule."""
+    title, _ = format_message(Item(title="Air fryer tray", value_usd=24.59))
+    assert title.startswith("$24.59 - ")
+
+
+def test_title_drops_pointless_trailing_zeros():
+    title, _ = format_message(Item(title="Apron", value_usd=15.00))
+    assert title.startswith("$15 - ")

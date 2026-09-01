@@ -1,17 +1,36 @@
 {
-  "_comment": "Items in the Recognized Reviewer program are free to claim, so min_value_usd filters on RETAIL value - 'only wake me for the expensive stuff'. Rules are evaluated top-down; the first match wins and sets the notification priority.",
+  "_comment": "Items in the Recognized Reviewer program are free to claim, so min_value_usd filters on RETAIL value - 'only wake me for the good stuff'. Real listings run roughly $5-$30, so keep the thresholds low: a $100 floor is silence forever. Rules are evaluated top-down; the first match wins and sets the notification priority.",
   "rules": [
     {
-      "name": "big-ticket",
-      "min_value_usd": 100.0,
+      "name": "expensive",
+      "min_value_usd": 25.0,
       "priority": "high",
       "exclude_keywords": ["gift card", "protection plan", "warranty"]
     },
     {
       "name": "watched-keywords",
-      "keywords": ["laptop", "headphones", "monitor", "vacuum", "espresso", "air fryer"],
-      "min_value_usd": 40.0,
-      "priority": "normal"
+      "keywords": [
+        "headphones", "earbuds", "speaker", "monitor", "keyboard", "mouse",
+        "air fryer", "vacuum", "espresso", "blender", "cookware", "knife set",
+        "backpack", "watch", "flashlight", "tool", "drill", "battery"
+      ],
+      "min_value_usd": 10.0,
+      "priority": "normal",
+      "exclude_keywords": ["toy", "kids", "toddler", "baby"]
     }
-  ]
+  ],
+  "_unused_examples": {
+    "_note": "Move any of these into rules above to use them.",
+    "everything": {
+      "name": "everything",
+      "priority": "low",
+      "_why": "No clauses = matches every item. Useful for a day or two to see what actually drops before you tune the real rules."
+    },
+    "cheap-but-wanted": {
+      "name": "cheap-but-wanted",
+      "keywords": ["coffee", "tea"],
+      "alert_on_unknown_value": false,
+      "priority": "low"
+    }
+  }
 }

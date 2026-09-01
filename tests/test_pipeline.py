@@ -18,8 +18,8 @@ class FakeNotifier:
 
 @pytest.fixture
 def store():
-    # No connection string -> in-memory dedupe, no Azure dependency.
-    return SeenStore(connection_string="")
+    # Empty path -> in-memory only, nothing written to disk.
+    return SeenStore("")
 
 
 @pytest.fixture

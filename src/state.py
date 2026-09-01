@@ -1,146 +1,152 @@
 """Dedupe store so a given item only ever alerts once.
 
-Backed by Azure Table Storage (pennies per month). Falls back to an in-memory
-set when no connection string is configured, which keeps local runs and tests
-free of any Azure dependency.
+A JSON file on disk. The whole point of this project is that it runs on a
+machine that is already on all the time, so there is nothing to gain from a
+hosted database -- and a file you can open in a text editor is much easier to
+inspect and reset than a cloud table.
 
-Also stores small opaque markers (the IMAP UID high-water mark) so the poller
-does not re-download the same mail on every run.
+Writes go through a temp file and an atomic replace, so killing the process
+mid-write leaves the previous good file rather than a truncated one.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import threading
 from datetime import UTC, datetime
+from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-_PARTITION = "seen"
-_MARKERS = "markers"
+DEFAULT_PATH = Path(__file__).parent.parent / "data" / "seen.json"
+
+# Keep the file from growing without bound. 971 items are visible in the
+# portal today across 25 pages; this leaves generous headroom for churn.
+MAX_ENTRIES = 20_000
 
 
-def _is(exc: BaseException, name: str) -> bool:
-    """Match an azure-core error by name without importing azure at module level."""
-    return type(exc).__name__ == name
+def default_path() -> Path:
+    return Path(os.environ.get("STATE_PATH", DEFAULT_PATH)).expanduser()
 
 
 class SeenStore:
-    def __init__(self, connection_string: str | None = None, table_name: str = "seenitems"):
-        self._table = None
-        self._memory: set[str] = set()
-        self._marker_memory: dict[str, str] = {}
-        conn = connection_string or os.environ.get("AzureWebJobsStorage")
-        if not conn:
-            log.warning("No storage connection string; dedupe is in-memory only.")
+    def __init__(self, path: Path | str | None = None, autosave: bool = True):
+        # `path=""` (or ":memory:") keeps everything in RAM, which is what the
+        # tests use.
+        self.path: Path | None
+        if path == "" or path == ":memory:":
+            self.path = None
+        else:
+            self.path = Path(path) if path is not None else default_path()
+
+        self.autosave = autosave
+        self._lock = threading.RLock()
+        self._seen: dict[str, dict] = {}
+        self._markers: dict[str, str] = {}
+        self._load()
+
+    # --- persistence --------------------------------------------------------
+
+    def _load(self) -> None:
+        if self.path is None or not self.path.is_file():
             return
         try:
-            from azure.data.tables import TableServiceClient
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            log.exception("Could not read %s; starting with an empty store.", self.path)
+            return
+        if not isinstance(data, dict):
+            log.error("%s is not a JSON object; starting with an empty store.", self.path)
+            return
+        seen = data.get("seen")
+        markers = data.get("markers")
+        self._seen = seen if isinstance(seen, dict) else {}
+        self._markers = markers if isinstance(markers, dict) else {}
+        log.info("Loaded %d seen items from %s", len(self._seen), self.path)
 
-            service = TableServiceClient.from_connection_string(conn)
-            service.create_table_if_not_exists(table_name)
-            self._table = service.get_table_client(table_name)
-        except Exception:
-            log.exception("Table Storage unavailable; falling back to in-memory dedupe.")
+    def save(self) -> None:
+        if self.path is None:
+            return
+        with self._lock:
+            self._trim()
+            payload = json.dumps(
+                {"seen": self._seen, "markers": self._markers},
+                indent=1, sort_keys=True,
+            )
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                # Atomic replace: a crash mid-write must not destroy the file
+                # that stops the next run re-alerting on everything.
+                tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+                tmp.write_text(payload, encoding="utf-8")
+                tmp.replace(self.path)
+            except OSError:
+                log.exception("Could not write %s; dedupe will not survive a restart.", self.path)
+
+    def _trim(self) -> None:
+        if len(self._seen) <= MAX_ENTRIES:
+            return
+        # Oldest first by seen_at; entries without one are treated as oldest.
+        ordered = sorted(self._seen.items(), key=lambda kv: kv[1].get("seen_at", ""))
+        for item_id, _ in ordered[: len(self._seen) - MAX_ENTRIES]:
+            del self._seen[item_id]
+
+    def _touch(self) -> None:
+        if self.autosave:
+            self.save()
 
     # --- dedupe -------------------------------------------------------------
 
     def is_new(self, item_id: str) -> bool:
-        """Cheap pre-filter. `claim` is the authoritative check."""
-        if self._table is None:
-            return item_id not in self._memory
-        try:
-            self._table.get_entity(partition_key=_PARTITION, row_key=item_id)
-            return False
-        except Exception as exc:  # ResourceNotFoundError and transient failures
-            if _is(exc, "ResourceNotFoundError"):
-                return True
-            log.exception("Dedupe lookup failed for %s; treating as seen.", item_id)
-            # Fail closed: a storage blip should not spam the phone with repeats.
-            return False
+        with self._lock:
+            return item_id not in self._seen
 
     def claim(self, item_id: str, title: str = "") -> bool:
         """Atomically take ownership of an item. True only for the first caller.
 
-        The timer and the ingest endpoint can run concurrently, so a
-        read-then-write dedupe would let the same item alert twice. Table
-        Storage rejects a create for an existing row key, which makes the claim
-        a single atomic operation instead.
+        Two browser tabs can relay the same item at the same moment, and the
+        server handles each request on its own thread, so the check and the
+        write have to happen under one lock.
         """
-        if self._table is None:
-            if item_id in self._memory:
+        with self._lock:
+            if item_id in self._seen:
                 return False
-            self._memory.add(item_id)
+            self._record(item_id, title)
+            self._touch()
             return True
-        try:
-            self._table.create_entity(
-                {
-                    "PartitionKey": _PARTITION,
-                    "RowKey": item_id,
-                    "title": title[:512],
-                    "seen_at": datetime.now(UTC).isoformat(timespec="seconds"),
-                }
-            )
-            return True
-        except Exception as exc:
-            if _is(exc, "ResourceExistsError"):
-                return False  # someone else got there first
-            log.exception("Could not claim %s; treating as already claimed.", item_id)
-            return False
 
     def release(self, item_id: str) -> None:
-        """Undo a claim so the next run retries.
-
-        Used when delivery fails: an item the user wanted should not be lost
-        just because ntfy was briefly unreachable.
-        """
-        if self._table is None:
-            self._memory.discard(item_id)
-            return
-        try:
-            self._table.delete_entity(partition_key=_PARTITION, row_key=item_id)
-        except Exception as exc:
-            if not _is(exc, "ResourceNotFoundError"):
-                log.exception("Could not release claim on %s.", item_id)
+        """Undo a claim so a later run retries. Used when delivery fails."""
+        with self._lock:
+            if self._seen.pop(item_id, None) is not None:
+                self._touch()
 
     def mark_seen(self, item_id: str, title: str = "") -> None:
-        """Record an item as seen regardless of who saw it first."""
-        if self._table is None:
-            self._memory.add(item_id)
-            return
-        try:
-            self._table.upsert_entity(
-                {
-                    "PartitionKey": _PARTITION,
-                    "RowKey": item_id,
-                    "title": title[:512],
-                    "seen_at": datetime.now(UTC).isoformat(timespec="seconds"),
-                }
-            )
-        except Exception:
-            log.exception("Failed to record %s as seen.", item_id)
+        with self._lock:
+            self._record(item_id, title)
+            self._touch()
+
+    def _record(self, item_id: str, title: str) -> None:
+        self._seen[item_id] = {
+            "title": title[:300],
+            "seen_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        }
 
     # --- markers ------------------------------------------------------------
 
     def get_marker(self, key: str) -> str | None:
-        if self._table is None:
-            return self._marker_memory.get(key)
-        try:
-            entity = self._table.get_entity(partition_key=_MARKERS, row_key=key)
-            value = entity.get("value")
-            return str(value) if value is not None else None
-        except Exception as exc:
-            if not _is(exc, "ResourceNotFoundError"):
-                log.exception("Could not read marker %s.", key)
-            return None
+        with self._lock:
+            return self._markers.get(key)
 
     def set_marker(self, key: str, value: str) -> None:
-        if self._table is None:
-            self._marker_memory[key] = value
-            return
-        try:
-            self._table.upsert_entity(
-                {"PartitionKey": _MARKERS, "RowKey": key, "value": value}
-            )
-        except Exception:
-            log.exception("Could not write marker %s.", key)
+        with self._lock:
+            self._markers[key] = value
+            self._touch()
+
+    # --- introspection ------------------------------------------------------
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._seen)

@@ -2,7 +2,8 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-src/local.settings.json
-infra/main.parameters.json
-.azure/
-*.zip
+.ruff_cache/
+
+# Local runtime state and secrets
+notifier.env
+data/

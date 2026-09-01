@@ -28,6 +28,11 @@ def build_notifier(provider: str | None = None) -> Notifier:
         return NullNotifier()
     try:
         return cls.from_env()
+    except ValueError as exc:
+        # Missing settings are the normal first-run state, not a defect. A
+        # stack trace here just buries the one line that says what to set.
+        log.error("%s is not configured (%s); notifications disabled.", name, exc)
+        return NullNotifier()
     except Exception:
         log.exception("Could not configure %s; notifications disabled.", name)
         return NullNotifier()

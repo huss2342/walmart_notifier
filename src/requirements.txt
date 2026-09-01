@@ -1,3 +1,2 @@
-azure-functions>=1.21.0
-azure-data-tables>=12.5.0
+# The server itself is stdlib only. requests is here for the push notifiers.
 requests>=2.32.0

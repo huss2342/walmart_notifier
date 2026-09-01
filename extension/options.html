@@ -19,29 +19,29 @@
 <h1>Reviewer Item Relay</h1>
 <p class="hint">
   Reads items from the reviewer page you already have open and signed in, and
-  posts them to your own notifier. No Walmart credentials are stored here.
-  Settings are kept in this browser only — they are never synced to your Google
-  account, because the endpoint URL contains a key.
+  posts them to the notifier running on this machine. No Walmart credentials
+  are stored here, and nothing leaves your computer except the push
+  notification itself.
 </p>
 
 <label>Ingest endpoint
-  <span class="hint">The <code>ingest</code> URL printed by <code>infra/deploy.sh</code>, including its <code>?code=</code> function key.</span>
-  <input id="endpoint" type="url" placeholder="https://wmrev-func-abc123.azurewebsites.net/api/ingest?code=...">
+  <span class="hint">Where <code>python src/server.py</code> is listening. Leave the default unless you changed the port.</span>
+  <input id="endpoint" type="url" placeholder="http://127.0.0.1:8787/ingest">
 </label>
 
 <label>Ingest token
-  <span class="hint">Matches the <code>INGEST_TOKEN</code> app setting. Optional.</span>
+  <span class="hint">Matches the <code>INGEST_TOKEN</code> environment variable. Optional - the server only listens on loopback.</span>
   <input id="token" type="password" placeholder="optional shared secret">
 </label>
 
 <label>Reviewer page path
   <span class="hint">
     A regular expression matched against the URL path of the page to read and
-    reload. Set this to whatever your reviewer portal actually lives at — the
-    default is a guess. Order and returns pages are always excluded, so the
-    relay never reports your own past purchases as new items.
+    reload. The default matches <code>/reviews/claim-product</code>. Order and
+    returns pages are always excluded, so the relay never reports your own past
+    purchases as new items.
   </span>
-  <input id="pathPattern" type="text" placeholder="^/(reviewer|reviews)">
+  <input id="pathPattern" type="text" placeholder="^/reviews/claim-product">
   <span id="pathError"></span>
 </label>
 

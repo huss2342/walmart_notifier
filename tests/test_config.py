@@ -37,14 +37,16 @@ def test_unknown_keys_are_ignored(monkeypatch):
 
 def test_bad_json_falls_back_to_bundled_defaults(monkeypatch):
     monkeypatch.setenv("RULES_JSON", "{not json")
-    # Falls through to src/rules.json, which ships a big-ticket rule.
-    assert any(r.min_value_usd == 100.0 for r in load_rules())
+    # Falls through to the bundled src/rules.json rather than the hardcoded
+    # single-rule default.
+    names = [r.name for r in load_rules()]
+    assert names == ["expensive", "watched-keywords"]
 
 
 def test_missing_everything_uses_hardcoded_default(monkeypatch, tmp_path):
     monkeypatch.setenv("RULES_PATH", str(tmp_path / "nope.json"))
     rules = load_rules()
-    assert len(rules) == 1 and rules[0].min_value_usd == 100.0
+    assert len(rules) == 1 and rules[0].min_value_usd == 20.0
 
 
 @pytest.mark.parametrize("value,expected", [

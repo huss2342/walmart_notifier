@@ -17,12 +17,14 @@ _PRIORITY = {"low": "2", "normal": "3", "high": "4", "urgent": "5"}
 
 
 class NtfyNotifier:
-    def __init__(self, topic: str, server: str = "https://ntfy.sh", token: str | None = None):
+    def __init__(self, topic: str, server: str = "https://ntfy.sh",
+                 token: str | None = None, email: str | None = None):
         if not topic:
             raise ValueError("NTFY_TOPIC is required")
         self.topic = topic
         self.server = server.rstrip("/")
         self.token = token
+        self.email = email
 
     @classmethod
     def from_env(cls) -> NtfyNotifier:
@@ -30,6 +32,7 @@ class NtfyNotifier:
             topic=os.environ.get("NTFY_TOPIC", ""),
             server=os.environ.get("NTFY_SERVER", "https://ntfy.sh"),
             token=os.environ.get("NTFY_TOKEN") or None,
+            email=os.environ.get("NTFY_EMAIL") or None,
         )
 
     def send(self, item: Item, priority: str = "normal") -> bool:
@@ -43,6 +46,10 @@ class NtfyNotifier:
             headers["Click"] = item.url
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
+        if self.email:
+            # ntfy forwards the message to this address as well as to any
+            # subscribed app, for people who would rather get mail than a push.
+            headers["Email"] = self.email
         try:
             resp = requests.post(
                 f"{self.server}/{self.topic}",

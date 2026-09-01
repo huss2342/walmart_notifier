@@ -1,57 +1,76 @@
 # Architecture notes
 
+## Why this runs locally and not in the cloud
+
+An earlier version of this ran on Azure Functions with Table Storage and Key
+Vault. That was the wrong shape for the problem.
+
+The reviewer portal can only be read from a signed-in browser session, so a
+machine here has to be awake and running Chrome for anything to be read at all.
+Once that is true, a cloud function is not buying availability — it is buying a
+second place for the same work to happen, plus a deployment step, plus a bill.
+The dedupe table was the only thing that genuinely lived there, and it is a few
+hundred kilobytes of JSON.
+
+What the move actually removed: a Bicep template, a deploy script, a function
+key, a Key Vault round trip, a CORS failure mode, and the monthly cost. What it
+gave up: alerting while this machine is off — which was never real anyway, since
+the browser tab has to be open for items to be read.
+
 ## Why there is no credential-login source
 
 The obvious design — store the Walmart password, sign in on a schedule, scrape
-the reviewer page — is missing on purpose. The reasoning is in the README; this
-is the engineering summary.
+the reviewer page — is missing on purpose.
 
-| | Credential login | Email source | Browser extension |
-|---|---|---|---|
-| Walmart credentials stored | yes | none | none |
-| Requires disabling 2FA | yes | no | no |
-| Contacts Walmart servers | yes, from a datacenter | never | only pages you opened |
-| Survives bot detection | no | n/a | n/a — real browser, real session |
-| Breaks when markup changes | yes | degrades | degrades |
+| | Credential login | Browser extension |
+|---|---|---|
+| Walmart credentials stored | yes | none |
+| Requires disabling 2FA | yes | no |
+| Contacts Walmart servers | yes, from a datacenter | only pages you opened |
+| Survives bot detection | no | n/a — real browser, real session |
+| Breaks when markup changes | yes | degrades |
 
-The email and extension paths reach the same outcome without the failure modes,
-so the credential path has no upside left to justify its cost.
+Walmart runs PerimeterX/HUMAN and Akamai bot management, which fingerprint the
+browser before the page renders. A headless-Chromium login loop from a
+datacenter IP on a perfect cadence is close to a worst-case signature. Getting
+past that needs residential proxies and fingerprint spoofing — expensive,
+fragile, and squarely the kind of evasion that turns a gray-area ToS issue into
+a deliberate one.
 
-## Sources are pluggable
+Disabling 2FA is the costliest step and buys nothing: the account holds saved
+payment methods and addresses, and every path here works with 2FA left on.
 
-`sources/base.py` defines a one-method protocol:
+## Reading the page
 
-```python
-class ItemSource(Protocol):
-    name: str
-    def fetch(self) -> Iterable[Item]: ...
-```
+The extension's content script is the primary extractor, and the page fights it
+in three specific ways.
 
-Sources do not deduplicate *items*; `pipeline.process` does that against
-`SeenStore`. Returning the same items on every poll is expected and correct.
-Adding a source means implementing `fetch()` and appending it in
-`function_app.poll`.
+**Two prices per card.** A clearance item renders `$5.99 Was $6.99` inside the
+card's own link text and `Free (Valued at $5.99)` below it. Only the second is
+the retail value the rules mean. Reading the nearest dollar amount gives the
+sale price — wrong for exactly the discounted items most worth alerting on.
 
-Sources may still avoid redundant *transport*, which is a different concern.
-`ImapSource` keeps a `uidvalidity:uid` high-water marker in the same table and
-asks the server only for newer messages. Two details make that safe:
+**The grid is as close as the card.** Walking up the DOM looking for a price
+finds the enclosing grid soon after it finds the card, and the grid contains
+every item's value. So the walk stops at the first ancestor containing
+*exactly one* `Valued at $` — more than one means it has climbed too far, and
+the item yields no value rather than a neighbour's.
 
-- `UID n:*` returns the newest message even when `n` is past the end of the
-  mailbox, so the server's answer is always filtered against the marker rather
-  than trusted.
-- UIDs are only comparable within one `UIDVALIDITY` generation. The generation
-  is stored alongside the marker, and a change resets to a dated backfill
-  window instead of trusting a UID that now means something else.
+**Titles carry noise.** The card link's text is
+`Clearance <title> $5.99 Was $6.99`, and the `aria-label` often matches. The
+image `alt` is cleanest, so it is tried first, then the badge prefix and any
+trailing price are stripped from whatever is used.
 
-The marker is *pending* until `commit_marker()`, and `function_app.poll` calls
-that only when no delivery failed. Advancing it on a failed push would mean the
-mail is never read again and the alert is simply lost.
+Out-of-stock items are dropped: a notification for something that cannot be
+claimed is pure noise. `Free items remaining: N` is read once per page and
+attached to each item, because zero claims left decides whether an alert is
+actionable.
 
-## Price extraction
+`src/sources/parsing.py` is a separate, server-side extractor for raw HTML
+posted to `/ingest`. It is the fallback path, kept because it is well tested and
+costs nothing; the structured JSON the extension sends does not go through it.
 
-`sources/parsing.py` is the fiddliest part, because item titles and prices are
-positional — there is no markup contract to rely on, and the templates change
-without notice.
+## Price association in the markup fallback
 
 Two failure modes it is built to avoid, both covered by regression tests in
 `tests/test_parsing.py::TestPriceAssociation`:
@@ -70,59 +89,60 @@ Two failure modes it is built to avoid, both covered by regression tests in
    for more items wins — and applied uniformly, with the other side as a
    per-item fallback.
 
-An item whose price cannot be located is still emitted with `value_usd=None`
-rather than dropped; `Rule.alert_on_unknown_value` decides what happens next.
-
-## Failure behaviour
-
-Deliberate choices about what happens when something breaks:
-
-- **Delivery failure releases the item's claim**, so the next run retries
-  instead of silently swallowing an item you wanted. It also holds the IMAP
-  marker back, so the source re-reads the mail that mentioned it.
-- **Notifying requires winning an atomic claim.** The timer and the ingest
-  endpoint can be holding the same item at the same moment; both will have read
-  the store before either writes. `SeenStore.claim` is a Table Storage entity
-  *create*, which the service rejects for an existing row key, so exactly one
-  of them buzzes the phone.
-- **Dedupe lookup failure fails closed** (treats the item as seen). A storage
-  blip should not machine-gun your phone with repeats.
-- **Non-matching items are still marked seen**, so loosening a rule later does
-  not replay every old listing at once.
-- **A misconfigured notifier degrades to `NullNotifier`** and logs, rather than
-  crashing the polling run.
-- **A failing source is caught per-source**, so email trouble does not take the
-  ingest endpoint down with it.
-
-## Identity and dedupe
-
-`Item.fingerprint()` prefers the numeric Walmart item id from a `/ip/<id>` URL,
-so a retitled listing does not re-alert. Without a URL it falls back to a hash
-of the normalised title. Ids live in Table Storage under a single partition —
-point lookups by `RowKey`, which is the cheapest access pattern Table Storage
-has.
-
 ## The extension's refresh loop
 
 The reload schedule lives in `background.js`, not in the content script. A
 content script dies with its page, so a reload landing on a sign-in redirect or
-a bot-check interstitial would end the loop permanently and silently -- exactly
+a bot-check interstitial would end the loop permanently and silently — exactly
 the state the refresh exists to escape. A `chrome.alarms` alarm in the service
 worker keeps firing regardless of what the tab currently shows, and asks the
 content script whether the user is mid-interaction before reloading. A tab with
 no content script answering is reloaded anyway.
 
 Change detection also lives in the background worker. In the content script it
-was re-initialised on every reload, so each refresh re-POSTed the whole page.
+was reinitialised on every reload, so each refresh re-POSTed the whole page.
 
 The worker posts to a different origin than the pages it reads, so the manifest
-needs `https://*.azurewebsites.net/*` in `host_permissions`. Without it the
-fetch is subject to CORS, Azure Functions answers no preflight, and every relay
-fails silently. A custom domain on the Function App means editing that entry.
+needs `http://127.0.0.1/*` in `host_permissions`. Without it the fetch is
+subject to CORS and every relay fails silently. The server answers preflight for
+`chrome-extension://` origins anyway — belt and braces, because this exact
+mistake shipped once already.
+
+## Identity and dedupe
+
+`Item.fingerprint()` prefers the numeric Walmart item id from a `/ip/<id>` URL,
+so a retitled listing does not re-alert. Without a URL it falls back to a hash
+of the normalised title.
+
+State is `data/seen.json`. Writes go to a temp file and are then renamed over
+the target, so a crash mid-write leaves the previous good file rather than a
+truncated one — losing that file means re-alerting on everything. The file is
+trimmed to the newest 20,000 entries; the portal shows around 971 items today,
+so that is generous headroom.
+
+`SeenStore.claim` is check-and-insert under one lock. The server handles each
+request on its own thread and several tabs can relay the same item at the same
+moment, so a separate read-then-write would let one item buzz twice.
+
+## Failure behaviour
+
+Deliberate choices about what happens when something breaks:
+
+- **Delivery failure releases the item's claim**, so the next relay retries
+  instead of silently swallowing an item you wanted.
+- **Non-matching items are still marked seen**, so loosening a rule later does
+  not replay every old listing at once.
+- **A misconfigured notifier degrades to `NullNotifier`** and logs, rather than
+  crashing the server.
+- **An unparseable payload yields zero items, not an error.** The relay posting
+  something odd must never take the notifier down.
+- **A corrupt state file starts empty and is rewritten.** The cost is one round
+  of duplicate alerts; the alternative is a server that will not start.
 
 ## Latency
 
-The 2-minute timer is the default because it is comfortably inside the free
-grant and fast enough for a queue that refreshes irregularly. The floor for a
-timer trigger is about one minute. For genuine push latency, forward mail to
-`/api/ingest` — that path is bounded by your mail provider, not by the poll.
+Bounded by the extension's refresh interval, not by anything server-side — the
+POST is handled in milliseconds. Three minutes is the suggested default. See the
+Terms of Use discussion in the README before lowering it: the interval is the
+main dial controlling how much this looks like a person and how much it looks
+like a bot.

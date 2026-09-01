@@ -12,10 +12,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"   # matches linuxFxVersion in infra/main.bicep
+          python-version: "3.11"
       - run: pip install -r src/requirements.txt pytest ruff
       - run: ruff check .
       - run: python -m pytest -q
+      # The server must actually start. A syntax-clean module that dies on
+      # import is still a broken deliverable.
+      - run: python src/server.py --help
 
   extension:
     runs-on: ubuntu-latest
@@ -27,12 +30,4 @@ jobs:
       # Cheap syntax gate: a typo in the service worker is otherwise only
       # visible as a silently dead relay.
       - run: for f in extension/*.js; do node --check "$f"; done
-      - run: python3 -c "import json,sys; json.load(open('extension/manifest.json'))"
-
-  infra:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      # azure-cli is preinstalled on GitHub's ubuntu runners.
-      - run: az bicep build --file infra/main.bicep --stdout > /dev/null
-      - run: bash -n infra/deploy.sh
+      - run: python3 -c "import json; json.load(open('extension/manifest.json'))"
