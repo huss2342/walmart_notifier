@@ -123,7 +123,15 @@ mistake shipped once already.
 ## Pagination
 
 A sweep visits every page once. Progress is an explicit `{total, visited[]}`
-record in `chrome.storage.local`, not an inference from the current URL.
+record in `chrome.storage.local`, keyed **per tab** (`sweep:<tabId>`), not an
+inference from the current URL.
+
+The per-tab key matters: several reviewer tabs sharing one record stomped each
+other. Each read the other's visited pages, so both walks jumped around, and
+the "unknown total" fallback -- highest visited page plus one -- climbed far
+past the real page count, reaching page 120 of a 24-page catalogue. The options
+page now also warns when more than one reviewer tab is open, since two tabs
+cover the same pages twice for no benefit.
 
 Deriving the next page as "current + 1" failed in practice: Walmart rewrites
 the query string between loads (`page` appears before `affinityOverride` on one

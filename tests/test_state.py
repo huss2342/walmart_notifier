@@ -126,3 +126,22 @@ def test_memory_mode_writes_nothing(tmp_path, monkeypatch):
     store.claim("ip-1", "TV")
     assert store.path is None
     assert list(tmp_path.iterdir()) == []
+
+
+def test_value_is_recorded_alongside_the_item():
+    """Without it, "never arrived" and "arrived but filtered" look identical."""
+    store = make_store()
+    store.mark_seen("ip-1", "PVC reamer", 79.99)
+    assert store._seen["ip-1"]["value_usd"] == 79.99
+
+
+def test_claim_records_the_value_too():
+    store = make_store()
+    store.claim("ip-1", "ADT doorbell", 149.5)
+    assert store._seen["ip-1"]["value_usd"] == 149.5
+
+
+def test_value_defaults_to_none_when_unknown():
+    store = make_store()
+    store.mark_seen("ip-1", "Mystery item")
+    assert store._seen["ip-1"]["value_usd"] is None

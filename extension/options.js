@@ -194,7 +194,9 @@ $('resetRules').addEventListener('click', async () => {
 $('resetSweep').addEventListener('click', async () => {
   // Clears progress only. The dedupe store lives on the notifier and is
   // deliberately untouched -- wiping it would re-alert on the whole catalogue.
-  await chrome.storage.local.remove(['sweep', 'lastSweepPages', 'lastSweepDone']);
+  const all = await chrome.storage.local.get(null);
+  const sweepKeys = Object.keys(all).filter((k) => k === 'sweep' || k.startsWith('sweep:'));
+  await chrome.storage.local.remove([...sweepKeys, 'lastSweepPages', 'lastSweepDone']);
   try {
     const tabs = await chrome.tabs.query({ url: 'https://www.walmart.com/reviews/*' });
     for (const tab of tabs) {
@@ -247,13 +249,27 @@ async function knownItemCount() {
   }
 }
 
+/** The sweep record of the reviewer tab, plus how many such tabs exist. */
+async function activeSweep() {
+  try {
+    const tabs = await chrome.tabs.query({ url: 'https://www.walmart.com/reviews/*' });
+    if (!tabs.length) return { sweep: null, tabCount: 0 };
+    const stored = await chrome.storage.local.get(tabs.map((t) => `sweep:${t.id}`));
+    const sweep = tabs.map((t) => stored[`sweep:${t.id}`]).find(Boolean) || null;
+    return { sweep, tabCount: tabs.length };
+  } catch {
+    return { sweep: null, tabCount: 0 };
+  }
+}
+
 async function renderStatus() {
   const { endpoint = DEFAULT_ENDPOINT, lastRelay, lastSeen = 0, lastNotified = 0,
-          lastPage = 1, lastError = '', lastErrorAt, sweep, lastSweepPages,
+          lastPage = 1, lastError = '', lastErrorAt, lastSweepPages,
           lastSweepDone } = await chrome.storage.local.get(
     ['endpoint', 'lastRelay', 'lastSeen', 'lastNotified', 'lastPage',
-     'lastError', 'lastErrorAt', 'sweep', 'lastSweepPages', 'lastSweepDone']
+     'lastError', 'lastErrorAt', 'lastSweepPages', 'lastSweepDone']
   );
+  const { sweep, tabCount } = await activeSweep();
 
   // Built as nodes rather than an HTML string: lastError can contain a server
   // response, and that must never be parsed as markup.
@@ -274,6 +290,13 @@ async function renderStatus() {
       `${lastNotified} alerted.`
     ));
     // Per-page counts read like total coverage; show sweep progress too.
+    if (tabCount > 1) {
+      frag.appendChild(line(
+        'warn', `${tabCount} reviewer tabs open.`,
+        'Each runs its own sweep and they will cover the same pages twice. ' +
+        'Close all but one.'
+      ));
+    }
     if (sweep && sweep.total) {
       const done = (sweep.visited || []).length;
       frag.appendChild(line(

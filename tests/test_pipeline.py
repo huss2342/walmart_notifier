@@ -118,7 +118,7 @@ def test_concurrent_claim_only_notifies_once(store, rules):
     # someone else got there first.
     store.is_new = lambda item_id: True
     real_claim = store.claim
-    store.claim = lambda item_id, title="": False
+    store.claim = lambda item_id, title="", value=None: False
 
     notifier = FakeNotifier()
     summary = process([item], rules, store, notifier)

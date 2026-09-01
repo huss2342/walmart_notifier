@@ -86,10 +86,20 @@ async function post(items, page) {
   }
 }
 
-chrome.runtime.onMessage.addListener((msg) => {
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === 'items' && Array.isArray(msg.items) && msg.items.length) {
     post(msg.items, msg.page);
+    return undefined;
   }
+  // Sweep progress is keyed per tab. Several reviewer tabs sharing one record
+  // stomped each other: each read the other's visited pages, so the walk
+  // jumped around and the "unknown total" fallback (highest visited + 1) ran
+  // far past the real page count.
+  if (msg?.type === 'whoami') {
+    sendResponse({ tabId: sender?.tab?.id ?? null });
+    return undefined;
+  }
+  return undefined;
 });
 
 // --- self-refresh -----------------------------------------------------------
@@ -152,8 +162,8 @@ async function refreshTick() {
     try {
       // Restart the sweep at page 1. Reloading whatever page the walk stopped
       // on would leave earlier pages unread every cycle.
-      // Drop the previous sweep's visited set so this pass starts clean.
-      await chrome.storage.local.remove('sweep');
+      // Drop this tab's previous visited set so the pass starts clean.
+      await chrome.storage.local.remove(`sweep:${tab.id}`);
       const url = new URL(tab.url);
       if (url.searchParams.has('page')) {
         url.searchParams.delete('page');

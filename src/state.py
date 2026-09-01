@@ -103,7 +103,7 @@ class SeenStore:
         with self._lock:
             return item_id not in self._seen
 
-    def claim(self, item_id: str, title: str = "") -> bool:
+    def claim(self, item_id: str, title: str = "", value: float | None = None) -> bool:
         """Atomically take ownership of an item. True only for the first caller.
 
         Two browser tabs can relay the same item at the same moment, and the
@@ -113,7 +113,7 @@ class SeenStore:
         with self._lock:
             if item_id in self._seen:
                 return False
-            self._record(item_id, title)
+            self._record(item_id, title, value)
             self._touch()
             return True
 
@@ -123,14 +123,18 @@ class SeenStore:
             if self._seen.pop(item_id, None) is not None:
                 self._touch()
 
-    def mark_seen(self, item_id: str, title: str = "") -> None:
+    def mark_seen(self, item_id: str, title: str = "", value: float | None = None) -> None:
         with self._lock:
-            self._record(item_id, title)
+            self._record(item_id, title, value)
             self._touch()
 
-    def _record(self, item_id: str, title: str) -> None:
+    def _record(self, item_id: str, title: str, value: float | None = None) -> None:
+        # The value is recorded purely so "has a $50 item ever actually been
+        # relayed?" is answerable. Without it, an item that never arrives and
+        # an item that arrived and was filtered look identical after the fact.
         self._seen[item_id] = {
             "title": title[:300],
+            "value_usd": value,
             "seen_at": datetime.now(UTC).isoformat(timespec="seconds"),
         }
 

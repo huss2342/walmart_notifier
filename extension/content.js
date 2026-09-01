@@ -219,7 +219,18 @@ async function relay() {
 
 const PAGE_JITTER = 0.25;
 const DEFAULT_PAGE_DELAY_S = 5;
-const SWEEP_KEY = 'sweep';
+// Resolved once from the background worker. Sweep progress is stored per tab
+// so that two reviewer tabs do not overwrite each other's page list.
+let sweepKeyPromise = null;
+function sweepKey() {
+  if (!sweepKeyPromise) {
+    sweepKeyPromise = chrome.runtime
+      .sendMessage({ type: 'whoami' })
+      .then((reply) => (reply?.tabId != null ? `sweep:${reply.tabId}` : 'sweep'))
+      .catch(() => 'sweep');
+  }
+  return sweepKeyPromise;
+}
 // The portal answers a past-the-end page with a "no search results" panel.
 const END_OF_RESULTS_RE = /no search results/i;
 // Backstop for the case where the page count cannot be read at all.
@@ -259,7 +270,9 @@ function totalPages() {
 }
 
 async function readSweep() {
-  const { [SWEEP_KEY]: sweep } = await chrome.storage.local.get([SWEEP_KEY]);
+  const key = await sweepKey();
+  const stored = await chrome.storage.local.get([key]);
+  const sweep = stored[key];
   if (sweep && Array.isArray(sweep.visited)) return sweep;
   return { total: null, visited: [] };
 }
@@ -330,12 +343,14 @@ async function scheduleNextPage() {
 
     if (next === null) {
       // Sweep complete. Clear it so the next refresh starts a fresh pass.
-      await chrome.storage.local.remove(SWEEP_KEY);
-      await chrome.storage.local.set({ lastSweepDone: Date.now(), lastSweepPages: visited.length });
+      await chrome.storage.local.remove(await sweepKey());
+      await chrome.storage.local.set({
+        lastSweepDone: Date.now(), lastSweepPages: visited.length
+      });
       return;
     }
 
-    await chrome.storage.local.set({ [SWEEP_KEY]: updated });
+    await chrome.storage.local.set({ [await sweepKey()]: updated });
     if (next === page) return;   // already here; wait for this page to render
 
     const { pageDelaySeconds = DEFAULT_PAGE_DELAY_S } =

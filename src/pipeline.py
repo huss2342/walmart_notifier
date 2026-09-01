@@ -51,7 +51,7 @@ def process(
         summary.new += 1
 
         if seed_only:
-            store.mark_seen(item.item_id, item.title)
+            store.mark_seen(item.item_id, item.title, item.value_usd)
             summary.seeded += 1
             continue
 
@@ -59,7 +59,7 @@ def process(
         if rule is None:
             # Record non-matching items too: if a rule is loosened later we do
             # not want a backlog of old listings to fire all at once.
-            store.mark_seen(item.item_id, item.title)
+            store.mark_seen(item.item_id, item.title, item.value_usd)
             continue
 
         summary.matched += 1
@@ -67,7 +67,7 @@ def process(
         # Claim before notifying: the timer and the ingest endpoint can be in
         # this loop for the same item at the same time, and only one of them
         # should buzz the phone.
-        if not store.claim(item.item_id, item.title):
+        if not store.claim(item.item_id, item.title, item.value_usd):
             log.info("Item %s claimed by a concurrent run; skipping.", item.item_id)
             summary.matched -= 1
             continue
