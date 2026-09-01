@@ -180,7 +180,7 @@ const DEFAULT_PAGE_DELAY_S = 5;
 // observer also fires mid-render, before any card exists.
 const END_OF_RESULTS_RE = /no search results/i;
 // Backstop only. If the end marker ever changes, this stops an endless walk.
-const HARD_PAGE_CAP = 200;
+const HARD_PAGE_CAP = 100;
 
 function currentPage() {
   const raw = parseInt(new URLSearchParams(location.search).get('page') || '1', 10);

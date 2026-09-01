@@ -124,7 +124,7 @@ The end is detected by the portal's "no search results" panel, not by an item
 count. Count alone is ambiguous: the MutationObserver also fires mid-render,
 before any card exists, so an empty page and a still-loading page look
 identical. `relay()` therefore returns early on zero items *unless* the end
-marker is present. A hard cap of 200 pages is a backstop in case that marker
+marker is present. A hard cap of 100 pages is a backstop in case that marker
 ever changes.
 
 The step delay is a setting (default 5s, jittered) rather than a constant,
