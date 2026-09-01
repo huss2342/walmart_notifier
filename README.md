@@ -44,16 +44,18 @@ often; twenty seconds is not. Your account, your call.
 
 ## Setup
 
-Windows with Git Bash or PowerShell. You need Python 3.11+ and Chrome.
+Windows, Python 3.11+, Chrome. Commands below are for **PowerShell** — the
+paths use backslashes, so they will not work in Git Bash as written (and
+forward-slash paths will not work in `cmd.exe`).
 
 ### 1. Install
 
-```bash
+```powershell
 python -m venv .venv
 ```
 
-```bash
-.venv/Scripts/pip install -r src/requirements.txt
+```powershell
+.venv\Scripts\pip install -r src\requirements.txt
 ```
 
 The server itself is standard library only — `requests` is just for the push
@@ -64,7 +66,7 @@ notifiers.
 ntfy is free and needs no account. Install the **ntfy** app on your phone, then
 generate a topic name:
 
-```bash
+```powershell
 python -c "import secrets; print(secrets.token_hex(16))"
 ```
 
@@ -111,8 +113,8 @@ server is not running or the endpoint is wrong.
 
 ## Verifying it works
 
-```bash
-curl -s http://127.0.0.1:8787/health
+```powershell
+curl.exe -s http://127.0.0.1:8787/health
 ```
 
 Shows the loaded rules, whether a push channel is configured, and how many items
@@ -120,8 +122,8 @@ are in the dedupe file.
 
 To prove the whole chain end to end, post a fake item — your phone should buzz:
 
-```bash
-curl -X POST http://127.0.0.1:8787/ingest -H "Content-Type: application/json" -d '{"items":[{"item_id":"test-001","title":"Smoke test","value_usd":99.0,"url":"https://www.walmart.com/ip/Test/123456789"}]}'
+```powershell
+curl.exe -X POST http://127.0.0.1:8787/ingest -H "Content-Type: application/json" -d '{\"items\":[{\"item_id\":\"test-001\",\"title\":\"Smoke test\",\"value_usd\":99.0}]}'
 ```
 
 Change `test-001` each time — dedupe means the same id only ever fires once.
@@ -177,12 +179,12 @@ Per item card, from the page you already have open:
 
 ## Development
 
-```bash
-.venv/Scripts/pip install pytest ruff
+```powershell
+.venv\Scripts\pip install pytest ruff
 ```
 
-```bash
-.venv/Scripts/python -m pytest        # 115 tests
+```powershell
+.venv\Scripts\python -m pytest        # 115 tests
 ```
 
 Tests use an in-memory store and a fake notifier — no network, and the HTTP
