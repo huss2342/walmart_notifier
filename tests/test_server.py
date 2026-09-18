@@ -616,3 +616,56 @@ def test_put_to_an_unknown_path_is_404(live_server):
     with pytest.raises(urllib.error.HTTPError) as exc:
         request(live_server, "PUT", path="/nope", payload={})
     assert exc.value.code == 404
+
+
+# --- Walmart bot-check alert -------------------------------------------------
+
+
+def _sent_items():
+    return [item for notifier in RecordingNotifier.instances for item in notifier.items]
+
+
+def test_bot_check_alert_uses_fixed_text_and_urgent_priority(live_server):
+    before = len(server.Handler.store)
+    status, body = request(
+        live_server, "POST", path="/bot-check", payload={"paused_minutes": 60}
+    )
+    assert status == 200 and body == {"ok": True}
+
+    item = _sent_items()[-1]
+    assert item.title.startswith("Walmart bot check: solve it by hand")
+    assert "paused for 60 min" in item.title
+    sent = [s for n in RecordingNotifier.instances for s in n.sent]
+    assert sent[-1][1] == "urgent"
+    # A system alert is not a catalogue item and must not touch dedupe state.
+    assert len(server.Handler.store) == before
+
+
+def test_bot_check_ignores_anything_but_a_clamped_pause_length(live_server):
+    request(
+        live_server, "POST", path="/bot-check",
+        payload={"paused_minutes": 10**9, "title": "injected text"},
+    )
+    title = _sent_items()[-1].title
+    assert "injected" not in title
+    assert "paused for 10080 min" in title   # one week cap
+
+    request(live_server, "POST", path="/bot-check", payload={"paused_minutes": "junk"})
+    assert _sent_items()[-1].title.endswith("Automation paused.")
+
+
+def test_bot_check_honours_ingest_token(live_server, monkeypatch):
+    monkeypatch.setattr(server.Handler, "token", "sekrit")
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        request(live_server, "POST", path="/bot-check", payload={}, token="wrong")
+    assert exc.value.code == 403
+
+
+def test_bot_check_rejects_a_web_origin(live_server):
+    req = urllib.request.Request(
+        f"{live_server}/bot-check", data=b"{}", method="POST",
+        headers={"Content-Type": "application/json", "Origin": "https://evil.example"},
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=5)
+    assert exc.value.code == 403

@@ -367,16 +367,20 @@ async function serverHealth() {
 async function activeSweep() {
   try {
     const status = await chrome.runtime.sendMessage({ type: 'reviewer:status' });
-    if (!status?.ok) return { sweep: null, tabCount: 0 };
+    if (!status?.ok) return { sweep: null, tabCount: 0, pausedUntil: 0 };
     // A tab failover can leave an old per-tab sweep record around until the
     // newly selected content script writes its first progress update. Never
     // combine that stale record with the latest page result.
     const sweep = status.sweep?.generation === status.generation
       ? status.sweep
       : null;
-    return { sweep, tabCount: status.tabCount || 0 };
+    return {
+      sweep,
+      tabCount: status.tabCount || 0,
+      pausedUntil: Number(status.pausedUntil) || 0
+    };
   } catch {
-    return { sweep: null, tabCount: 0 };
+    return { sweep: null, tabCount: 0, pausedUntil: 0 };
   }
 }
 
@@ -424,12 +428,20 @@ async function renderStatus() {
      'lastPending', 'lastSeeded', 'lastValueKnown', 'lastValueUnknown', 'lastMinValue',
      'lastMaxValue', 'lastError', 'lastErrorAt', 'lastSweepPages', 'lastSweepDone']
   );
-  const { sweep, tabCount } = await activeSweep();
+  const { sweep, tabCount, pausedUntil } = await activeSweep();
   const health = await serverHealth();
 
   // Built as nodes rather than an HTML string: lastError can contain a server
   // response, and that must never be parsed as markup.
   const frag = document.createDocumentFragment();
+  if (pausedUntil > Date.now()) {
+    const minutes = Math.ceil((pausedUntil - Date.now()) / 60_000);
+    frag.appendChild(line(
+      'bad', `Paused after a Walmart bot check (${minutes} min left).`,
+      'Solve the Press & Hold check by hand in the tab, then click Restart sweep ' +
+      'to resume early. Consider a longer auto-refresh interval.'
+    ));
+  }
   if (!endpoint) {
     frag.appendChild(line('bad', 'No endpoint configured.', 'Set it above.'));
   } else if (!lastRelay) {

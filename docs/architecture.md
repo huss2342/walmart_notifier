@@ -256,6 +256,39 @@ accepts a notification but before `commit()`: the next run may send a duplicate.
 The design intentionally prefers that possible duplicate to silently losing an
 alert. Once committed, matching and non-matching items deduplicate identically.
 
+## Walmart bot checks
+
+Walmart answers suspected automation by redirecting to `/blocked`, a
+"Robot or human? Press & Hold" page. That is the site asking this traffic to
+stop, and the extension treats it that way. It does not try to get past the
+check: the user solves it by hand.
+
+Detection is in the background worker's `tabs.onUpdated`. That page is outside
+the content script's `/reviews/*` match, so the content script never runs there
+and could not report it. Any Walmart tab landing on it pauses everything,
+because the check applies to the browser session, not to one tab.
+
+Before this, the block silently stalled the sweep. Worse, solving the check
+redirects back to the reviewer page mid-catalogue. The coordinator would
+promote that tab and resume the walk at full speed, straight into another
+check. Now a check:
+
+- stands every tab down (the coordinator primary goes to null and a new
+  generation starts), and discards all sweep progress;
+- pauses until a backoff expires: 1 hour, doubling on each repeat within
+  24 hours, capped at 24 hours. Several `onUpdated` events from one block
+  count once;
+- moves the refresh alarm to the end of the pause. `scheduleRefresh`,
+  `refreshTick` (including its repair reload), and non-manual
+  `restartPrimary` all check the pause, so nothing can reload a tab early;
+- posts `/bot-check` to the notifier, which sends a fixed-text urgent alert.
+  The text is fixed server-side so the route cannot be used to push arbitrary
+  content. Only the clamped pause length is read from the body.
+
+**Restart sweep** is the manual override: the user saying they solved the
+check. It clears the pause but keeps the count, so an immediate repeat still
+backs off longer.
+
 ## Failure behaviour
 
 Deliberate choices about what happens when something breaks:

@@ -27,6 +27,20 @@ const STALE_SWEEP_MS = 2 * 60_000;
 // contract rejects larger arrays instead of silently truncating them.
 const MAX_INGEST_ITEMS = 200;
 
+// Walmart answers suspected automation by redirecting to /blocked, a "Robot or
+// human? Press & Hold" page. That page is Walmart asking this traffic to stop,
+// so the extension stops: no sweeps, no reloads, no retries until a backoff
+// expires or the user explicitly restarts. Nothing here tries to get past the
+// check -- the user solves it by hand.
+const BOT_CHECK_KEY = 'botCheck';
+const BOT_CHECK_PATH = /^\/blocked(\/|$)/i;
+const BOT_BACKOFF_BASE_MIN = 60;
+const BOT_BACKOFF_MAX_MIN = 24 * 60;
+// Checks further apart than this are treated as unrelated; the backoff resets.
+const BOT_COUNT_RESET_MS = 24 * 60 * 60_000;
+// One block produces several onUpdated events; count them as a single check.
+const BOT_DEBOUNCE_MS = 5 * 60_000;
+
 async function config() {
   return { ...DEFAULTS, ...(await chrome.storage.local.get(Object.keys(DEFAULTS))) };
 }
@@ -45,6 +59,107 @@ async function withTimeout(promise, ms, message) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+// --- bot-check pause ------------------------------------------------------
+
+function isBotCheckUrl(raw) {
+  try {
+    const url = new URL(raw);
+    return url.hostname === 'www.walmart.com' && BOT_CHECK_PATH.test(url.pathname);
+  } catch {
+    return false;
+  }
+}
+
+async function readBotCheck() {
+  const { [BOT_CHECK_KEY]: value } = await chrome.storage.local.get([BOT_CHECK_KEY]);
+  return {
+    pausedUntil: Number(value?.pausedUntil) || 0,
+    count: Number.isInteger(value?.count) ? value.count : 0,
+    lastAt: Number(value?.lastAt) || 0
+  };
+}
+
+/** Epoch ms the pause ends, or 0 when automation may run. */
+async function pausedUntil() {
+  const { pausedUntil: until } = await readBotCheck();
+  return until > Date.now() ? until : 0;
+}
+
+async function clearBotPause() {
+  const current = await readBotCheck();
+  // Keep count/lastAt so a check shortly after a manual resume still backs off
+  // longer than the first one did.
+  await chrome.storage.local.set({ [BOT_CHECK_KEY]: { ...current, pausedUntil: 0 } });
+}
+
+async function notifyBotCheck(minutes) {
+  try {
+    const { endpoint: raw, token } = await config();
+    const url = new URL('/bot-check', checkedEndpoint(raw)).toString();
+    const headers = { 'Content-Type': 'application/json' };
+    if (token) headers['X-Ingest-Token'] = token;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    try {
+      await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ paused_minutes: minutes }),
+        signal: controller.signal
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch (err) {
+    // The pause itself is what matters; the phone alert is a courtesy.
+    console.warn('Reviewer Item Relay: could not send the bot-check alert', err);
+  }
+}
+
+let botCheckTail = Promise.resolve();
+function handleBotCheck(tabId) {
+  const run = botCheckTail.then(() => handleBotCheckUnlocked(tabId),
+                                () => handleBotCheckUnlocked(tabId));
+  botCheckTail = run.catch(() => undefined);
+  return run;
+}
+
+async function handleBotCheckUnlocked(tabId) {
+  const now = Date.now();
+  const previous = await readBotCheck();
+  if (previous.pausedUntil > now && now - previous.lastAt < BOT_DEBOUNCE_MS) {
+    return { ok: true, duplicate: true, pausedUntil: previous.pausedUntil };
+  }
+
+  const count = now - previous.lastAt > BOT_COUNT_RESET_MS ? 1 : previous.count + 1;
+  const minutes = Math.min(BOT_BACKOFF_BASE_MIN * 2 ** (count - 1), BOT_BACKOFF_MAX_MIN);
+  const until = now + minutes * 60_000;
+  await chrome.storage.local.set({
+    [BOT_CHECK_KEY]: { pausedUntil: until, count, lastAt: now, tabId },
+    lastError:
+      `Walmart showed a bot check (${count} in the last 24h). Solve it by hand in ` +
+      `the tab. Automation is paused for ${minutes} min; Restart sweep resumes early.`,
+    lastErrorAt: now
+  });
+
+  // Stand every tab down and discard sweep progress. Without this, solving the
+  // check redirects back to the reviewer page mid-catalogue, that tab is
+  // promoted, and the walk resumes at full speed -- straight into another check.
+  const state = await readCoordinator();
+  const stood = await writeCoordinator({
+    tabId: null, generation: state.generation + 1, selectedAt: 0
+  });
+  const stored = await chrome.storage.local.get(null);
+  const sweepKeys = Object.keys(stored)
+    .filter((key) => key === 'sweep' || key.startsWith(SWEEP_PREFIX));
+  if (sweepKeys.length) await chrome.storage.local.remove(sweepKeys);
+  await broadcastRoles(await reviewerTabs(), stood);
+
+  await chrome.alarms.create(REFRESH_ALARM, { when: until });
+  await notifyBotCheck(minutes);
+  return { ok: true, count, minutes, pausedUntil: until };
 }
 
 // --- ingest -----------------------------------------------------------------
@@ -411,13 +526,18 @@ function selectPrimary(options = {}) {
 }
 
 async function selectPrimaryUnlocked({ excludeTabId = null, keepCurrentOnNoMatch = false } = {}) {
-  const [tabs, current] = await Promise.all([reviewerTabs(), readCoordinator()]);
+  const [tabs, current, paused] =
+    await Promise.all([reviewerTabs(), readCoordinator(), pausedUntil()]);
   const currentTab = tabs.find((tab) => tab.id === current.tabId) || null;
   const candidates = [];
-  if (currentTab && currentTab.id !== excludeTabId) candidates.push(currentTab);
-  for (const tab of tabs) {
-    if (tab.id !== currentTab?.id && tab.id !== excludeTabId) candidates.push(tab);
+  // While paused no tab may be primary, so every content script stays passive.
+  if (!paused) {
+    if (currentTab && currentTab.id !== excludeTabId) candidates.push(currentTab);
+    for (const tab of tabs) {
+      if (tab.id !== currentTab?.id && tab.id !== excludeTabId) candidates.push(tab);
+    }
   }
+  if (paused) keepCurrentOnNoMatch = false;
 
   let chosen = null;
   let probe = null;
@@ -533,6 +653,13 @@ async function navigateToPageOne(tabId) {
 }
 
 async function restartPrimary(reason = 'manual') {
+  if (await pausedUntil()) {
+    if (reason !== 'manual') {
+      return { ok: false, paused: true, error: 'Paused after a Walmart bot check.' };
+    }
+    // An explicit Restart sweep is the user saying they solved the check.
+    await clearBotPause();
+  }
   const selected = await selectPrimary();
   // A manual restart is also the repair path after an unpacked-extension
   // reload, when the tab exists but has no listening content script yet.
@@ -630,7 +757,9 @@ async function coordinatorStatus() {
       index: tab.index,
       active: tab.id === selected.state.tabId
     })),
-    sweep
+    sweep,
+    pausedUntil: await pausedUntil(),
+    botCheck: await readBotCheck()
   };
 }
 
@@ -685,6 +814,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // --- self-refresh -----------------------------------------------------------
 
 async function scheduleRefresh(busy = false) {
+  const until = await pausedUntil();
+  if (until) {
+    // Fire once when the pause ends, whatever the refresh interval says.
+    await chrome.alarms.create(REFRESH_ALARM, { when: until });
+    return;
+  }
   const { refreshMinutes } = await config();
   if (!refreshMinutes || refreshMinutes <= 0) {
     await chrome.alarms.clear(REFRESH_ALARM);
@@ -700,6 +835,12 @@ async function refreshTick() {
   if (refreshInFlight) return;
   refreshInFlight = true;
   try {
+    if (await pausedUntil()) {
+      // No reloads, not even the repair reload below, while Walmart has asked
+      // this traffic to stop.
+      await scheduleRefresh();
+      return;
+    }
     const selected = await selectPrimary();
     if (!selected.tab) {
       // If no content script answered, repair the deterministic first candidate.
@@ -797,6 +938,12 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (!changeInfo.url && !changeInfo.status) return;
+  // Any Walmart tab landing on the bot check pauses everything: the check is
+  // about this browser session, not about one tab.
+  if (isBotCheckUrl(changeInfo.url || tab?.url)) {
+    handleBotCheck(tabId).catch(console.error);
+    return;
+  }
   Promise.all([readCoordinator(), pathRegex()]).then(async ([state, re]) => {
     if (state.tabId !== tabId) return;
     if (changeInfo.url && !eligibleUrl(tab.url, re)) {

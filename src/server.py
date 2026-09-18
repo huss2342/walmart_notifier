@@ -413,7 +413,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.split("?")[0].rstrip("/")
-        if path not in ("/ingest", "/test-notification"):
+        if path not in ("/ingest", "/test-notification", "/bot-check"):
             self._reply(404, "not found")
             return
         if not self._authorized():
@@ -425,6 +425,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/test-notification":
             self._send_test_notification()
+            return
+        if path == "/bot-check":
+            self._send_bot_check_alert()
             return
 
         if not self._require_json():
@@ -468,6 +471,41 @@ class Handler(BaseHTTPRequestHandler):
         """A notifier-owned message guaranteed not to contain its secrets."""
         diagnostic = getattr(self.notifier, "last_diagnostic", "")
         return diagnostic[:500] if isinstance(diagnostic, str) else ""
+
+    def _send_bot_check_alert(self) -> None:
+        """Tell the user Walmart showed a bot check and automation has paused.
+
+        The message text is fixed here rather than taken from the request, so
+        this route cannot be used to push arbitrary content. Only the pause
+        length is read from the body, and it is clamped.
+        """
+        paused_minutes = 0
+        body = self._read_body()
+        if body is None:
+            return
+        if body:
+            try:
+                data = json.loads(body.decode("utf-8"))
+                paused_minutes = int(data.get("paused_minutes", 0))
+            except (AttributeError, TypeError, ValueError):
+                paused_minutes = 0
+        paused_minutes = max(0, min(paused_minutes, 7 * 24 * 60))
+        pause = (f"Automation paused for {paused_minutes} min." if paused_minutes
+                 else "Automation paused.")
+        item = Item(
+            item_id="bot-check",
+            title=f"Walmart bot check: solve it by hand in the reviewer tab. {pause}",
+            url="https://www.walmart.com/reviews/claim-product?q=",
+            source="diagnostic",
+        )
+        try:
+            delivered = self.notifier.send(item, priority="urgent")
+        except Exception as exc:
+            log.exception("Bot-check alert raised an unexpected error.")
+            self._reply(503, {"ok": False, "error_type": type(exc).__name__})
+            return
+        log.warning("Walmart bot check reported by the extension; %s", pause)
+        self._reply(200 if delivered else 503, {"ok": bool(delivered)})
 
     def _send_test_notification(self) -> None:
         """Exercise the configured notifier without filters or dedupe state."""

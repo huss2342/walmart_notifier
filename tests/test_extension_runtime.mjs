@@ -58,12 +58,13 @@ function loadBackground({
   const fetchCalls = [];
   const roleMessages = [];
   const tabActions = [];
+  const alarmCalls = [];
   const chrome = {
     storage: { local, session, sync, onChanged: event() },
     runtime: { onMessage: event(), onStartup: event(), onInstalled: event() },
     alarms: {
       onAlarm: event(),
-      async create() {},
+      async create(name, info) { alarmCalls.push({ name, info }); },
       async clear() { return true; }
     },
     action: {
@@ -106,10 +107,13 @@ function loadBackground({
   });
   vm.runInContext(
     `${backgroundSource}\n;globalThis.__test = {` +
-      'selectPrimary, readCoordinator, handlePageReport, restartPrimary, post, checkedEndpoint};',
+      'selectPrimary, readCoordinator, handlePageReport, restartPrimary, post, checkedEndpoint,' +
+      'isBotCheckUrl, handleBotCheck, pausedUntil, refreshTick, scheduleRefresh};',
     context
   );
-  return { api: context.__test, chrome, local, session, fetchCalls, roleMessages, tabActions };
+  return {
+    api: context.__test, chrome, local, session, fetchCalls, roleMessages, tabActions, alarmCalls
+  };
 }
 
 function loadOptions({ initial = {}, sweepStatus = { ok: true, tabCount: 1 } } = {}) {
@@ -708,4 +712,109 @@ test('page mutations cannot wake a completed sweep', () => {
 
   assert.equal(timerCallbacks.size, 0);
   assert.equal(api.getPhase(), 'complete');
+});
+
+
+// --- Walmart bot check -------------------------------------------------------
+
+const REVIEW_TAB = {
+  id: 11, windowId: 1, index: 0, status: 'complete',
+  url: 'https://www.walmart.com/reviews/claim-product?q=&page=20'
+};
+
+function pausedBackground() {
+  const probes = new Map([[11, { ready: true, active: true, generation: 0 }]]);
+  return loadBackground({ tabs: [REVIEW_TAB], probes, summary: { ok: true } });
+}
+
+test('only the Walmart /blocked page counts as a bot check', ({ assert: _ }) => {
+  const { api } = pausedBackground();
+  assert.equal(api.isBotCheckUrl(
+    'https://www.walmart.com/blocked?url=L3Jldmlld3M&uuid=x'), true);
+  assert.equal(api.isBotCheckUrl('https://www.walmart.com/blocked'), true);
+  assert.equal(api.isBotCheckUrl('https://www.walmart.com/reviews/claim-product'), false);
+  assert.equal(api.isBotCheckUrl('https://www.walmart.com/blocked-items'), false);
+  assert.equal(api.isBotCheckUrl('https://evil.example/blocked'), false);
+  assert.equal(api.isBotCheckUrl('not a url'), false);
+});
+
+test('a bot check pauses for an hour, stands tabs down and alerts once', async () => {
+  const bg = pausedBackground();
+  await bg.api.selectPrimary();
+  await bg.local.set({ 'sweep:11': { total: 24, visited: [1, 2, 3] } });
+
+  const before = Date.now();
+  const result = await bg.api.handleBotCheck(11);
+  assert.equal(result.minutes, 60);
+  assert.ok(result.pausedUntil >= before + 60 * 60_000);
+
+  // No tab may sweep, and the half-finished walk is discarded so solving the
+  // check does not resume it at page 20.
+  assert.equal((await bg.api.readCoordinator()).tabId, null);
+  assert.equal(bg.local.data['sweep:11'], undefined);
+  assert.ok(bg.roleMessages.some((m) => m.id === 11 && m.message.active === false));
+
+  // The next alarm fires when the pause ends, not on the refresh interval.
+  // Compared field by field: objects built inside the vm context have a
+  // different Object prototype, which deepStrictEqual treats as unequal.
+  const alarm = bg.alarmCalls.at(-1);
+  assert.equal(alarm.name, 'refresh');
+  assert.equal(alarm.info.when, result.pausedUntil);
+
+  // One alert to the notifier.
+  const alerts = bg.fetchCalls.filter((init) => init.body?.includes('paused_minutes'));
+  assert.equal(alerts.length, 1);
+  assert.equal(JSON.parse(alerts[0].body).paused_minutes, 60);
+
+  // The same block fires several onUpdated events; they count once.
+  const again = await bg.api.handleBotCheck(11);
+  assert.equal(again.duplicate, true);
+  assert.equal(bg.fetchCalls.filter((i) => i.body?.includes('paused_minutes')).length, 1);
+});
+
+test('repeat checks within a day double the pause, capped at a day', async () => {
+  const bg = pausedBackground();
+  const now = Date.now();
+  // A previous check 10 minutes ago whose pause has already been cleared.
+  await bg.local.set({ botCheck: { pausedUntil: 0, count: 1, lastAt: now - 10 * 60_000 } });
+  assert.equal((await bg.api.handleBotCheck(11)).minutes, 120);
+
+  await bg.local.set({ botCheck: { pausedUntil: 0, count: 9, lastAt: now - 10 * 60_000 } });
+  assert.equal((await bg.api.handleBotCheck(11)).minutes, 24 * 60);
+
+  // More than a day since the last one: start over at an hour.
+  await bg.local.set({ botCheck: { pausedUntil: 0, count: 5, lastAt: now - 25 * 3600_000 } });
+  assert.equal((await bg.api.handleBotCheck(11)).minutes, 60);
+});
+
+test('while paused nothing is selected, restarted or reloaded', async () => {
+  const bg = pausedBackground();
+  await bg.local.set({
+    refreshMinutes: 3,
+    botCheck: { pausedUntil: Date.now() + 3600_000, count: 1, lastAt: Date.now() }
+  });
+
+  assert.equal((await bg.api.selectPrimary()).tab, null);
+  const scheduled = await bg.api.restartPrimary('scheduled');
+  assert.equal(scheduled.paused, true);
+  await bg.api.refreshTick();
+  assert.deepEqual(bg.tabActions, []);
+
+  // Changing the refresh interval cannot pull the next alarm inside the pause.
+  await bg.api.scheduleRefresh();
+  assert.ok(bg.alarmCalls.at(-1).info.when > Date.now());
+});
+
+test('Restart sweep is the user saying the check is solved', async () => {
+  const bg = pausedBackground();
+  await bg.local.set({
+    botCheck: { pausedUntil: Date.now() + 3600_000, count: 2, lastAt: Date.now() }
+  });
+
+  const result = await bg.api.restartPrimary('manual');
+  assert.equal(result.ok, true);
+  assert.equal(await bg.api.pausedUntil(), 0);
+  assert.equal(bg.tabActions.at(-1).type, 'update');
+  // The count survives, so an immediate repeat still backs off longer.
+  assert.equal(bg.local.data.botCheck.count, 2);
 });

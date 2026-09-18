@@ -40,8 +40,10 @@ credentials, no headless browser, and 2FA left on. But leaving a tab on a
 self-refresh timer is still automated retrieval on a schedule, and the clause
 above is broad enough to reach it. **Lower exposure than a bot, not zero.**
 
-The tuning knob is the refresh interval. Three minutes is a person checking
-often; twenty seconds is not. Your account, your call.
+The tuning knob is the refresh interval. Each refresh is a full sweep of about
+24 pages, so every 3 minutes is roughly 480 page loads an hour, far past
+anything a person does, and it has triggered Walmart's bot check in practice.
+Every 30 to 60 minutes is far gentler. Your account, your call.
 
 ## Setup
 
@@ -113,7 +115,7 @@ Do not run `run.ps1` at the same time because both would need port 8787.
 
 1. `chrome://extensions` → Developer mode → **Load unpacked** → pick
    `extension/`. If it was already installed, click **Reload** on its card and
-   verify that the displayed version is **2.1.3**.
+   verify that the displayed version is **2.2.0**.
 2. Open its **Options**. The defaults are already correct for a local server —
    endpoint `http://127.0.0.1:8787/ingest`, path `^/reviews/claim-product`.
 3. With **reviewer-item-notifier** running, click **Check connection**. This
@@ -121,7 +123,9 @@ Do not run `run.ps1` at the same time because both would need port 8787.
    Chrome build or policy shows a permission prompt.
 4. Click **Send test alert** and confirm that the labeled test reaches your
    phone. This bypasses filters and dedupe.
-5. Set **auto-refresh** to `3` minutes (`0` disables it), then save.
+5. Set **auto-refresh** to `30` minutes (`0` disables it), then save. Each
+   refresh is a full ~24-page sweep, so shorter intervals multiply load fast;
+   see *If Walmart shows "Robot or human?"* below.
 
 ### 5. Open the portal and leave it
 
@@ -256,6 +260,24 @@ nothing; moving the computer to a different internet network is fine.
 The bind mount `./data:/app/data` means rebuilding or replacing the container
 does not reset saved rules or dedupe history. Do not run multiple notifier
 containers against that directory at once.
+
+## If Walmart shows "Robot or human?"
+
+That page (`walmart.com/blocked`) means Walmart has flagged the traffic as
+automated. The extension notices it and:
+
+- stops sweeping and discards the half-finished sweep,
+- sends an urgent alert to your phone,
+- pauses for 1 hour, doubling on each repeat within 24 hours (max 24 hours).
+
+**Solve the Press & Hold by hand.** The extension never tries to get past it.
+To resume before the pause ends, click **Restart sweep**.
+
+The main thing that triggers it is page loads per hour, and that's mostly set
+by **Auto-refresh**. A full sweep is ~24 page loads. Refreshing every 3 minutes
+works out to roughly 480 loads an hour. Every 30 minutes is about 48, and
+every 60 minutes about 24. If checks keep coming back, raise the interval.
+Repeated checks put the account at risk.
 
 ## What the extension actually reads
 
