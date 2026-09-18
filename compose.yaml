@@ -1,0 +1,55 @@
+name: reviewer-notifier
+
+services:
+  notifier:
+    container_name: reviewer-item-notifier
+    image: reviewer-notifier:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - ./notifier.env
+    environment:
+      BIND_HOST: 0.0.0.0
+      CONTAINER_LOOPBACK_ONLY: "true"
+      PORT: 8787
+      STATE_PATH: /app/data/seen.json
+      USER_RULES_PATH: /app/data/rules.json
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - type: bind
+        source: ./data
+        target: /app/data
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    stop_grace_period: 15s
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import json, os, urllib.request;
+          request = urllib.request.Request(
+          'http://127.0.0.1:8787/health',
+          headers={'X-Ingest-Token': os.getenv('INGEST_TOKEN', '')});
+          response = json.load(urllib.request.urlopen(request, timeout=3));
+          assert response.get('notifier_configured'), 'notification provider is not configured'
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+      start_interval: 2s

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 from datetime import UTC, datetime
@@ -44,6 +45,11 @@ class SeenStore:
         self.autosave = autosave
         self._lock = threading.RLock()
         self._seen: dict[str, dict] = {}
+        # Claims are deliberately process-local and are not written to disk.
+        # Persisting a claim before the notification succeeds turns a power
+        # loss (or a killed request thread) into a permanently missed alert.
+        # On restart we prefer a possible duplicate notification to silence.
+        self._pending: dict[str, dict] = {}
         self._markers: dict[str, str] = {}
         self._load()
 
@@ -89,7 +95,10 @@ class SeenStore:
         if len(self._seen) <= MAX_ENTRIES:
             return
         # Oldest first by seen_at; entries without one are treated as oldest.
-        ordered = sorted(self._seen.items(), key=lambda kv: kv[1].get("seen_at", ""))
+        ordered = sorted(
+            self._seen.items(),
+            key=lambda kv: kv[1].get("seen_at", "") if isinstance(kv[1], dict) else "",
+        )
         for item_id, _ in ordered[: len(self._seen) - MAX_ENTRIES]:
             del self._seen[item_id]
 
@@ -100,39 +109,69 @@ class SeenStore:
     # --- dedupe -------------------------------------------------------------
 
     def is_new(self, item_id: str) -> bool:
+        """Whether an item has been durably recorded as handled.
+
+        An in-flight claim remains "new" here so a concurrent request reaches
+        ``claim()`` and can report a retryable pending result instead of
+        acknowledging the page as an ordinary, completed duplicate.
+        """
         with self._lock:
             return item_id not in self._seen
+
+    def is_pending(self, item_id: str) -> bool:
+        """Whether another request currently owns this item's delivery."""
+        with self._lock:
+            return item_id in self._pending
 
     def claim(self, item_id: str, title: str = "", value: float | None = None) -> bool:
         """Atomically take ownership of an item. True only for the first caller.
 
-        Two browser tabs can relay the same item at the same moment, and the
-        server handles each request on its own thread, so the check and the
-        write have to happen under one lock.
+        Two requests can relay the same item at the same moment, so the check
+        and reservation have to happen under one lock. The reservation stays
+        in memory until ``commit()`` records a successful delivery.
         """
         with self._lock:
-            if item_id in self._seen:
+            if item_id in self._seen or item_id in self._pending:
                 return False
-            self._record(item_id, title, value)
+            self._pending[item_id] = self._record_payload(title, value)
+            return True
+
+    def commit(self, item_id: str) -> bool:
+        """Persist a successfully delivered claim.
+
+        Returns false only when the caller no longer owns an in-flight claim.
+        """
+        with self._lock:
+            record = self._pending.pop(item_id, None)
+            if record is None:
+                return False
+            self._seen[item_id] = record
             self._touch()
             return True
 
     def release(self, item_id: str) -> None:
         """Undo a claim so a later run retries. Used when delivery fails."""
         with self._lock:
-            if self._seen.pop(item_id, None) is not None:
-                self._touch()
+            self._pending.pop(item_id, None)
 
-    def mark_seen(self, item_id: str, title: str = "", value: float | None = None) -> None:
+    def mark_seen(self, item_id: str, title: str = "", value: float | None = None) -> bool:
+        """Record a filtered/seeded item unless its delivery is in flight."""
         with self._lock:
+            if item_id in self._pending:
+                return False
             self._record(item_id, title, value)
             self._touch()
+            return True
 
     def _record(self, item_id: str, title: str, value: float | None = None) -> None:
         # The value is recorded purely so "has a $50 item ever actually been
         # relayed?" is answerable. Without it, an item that never arrives and
         # an item that arrived and was filtered look identical after the fact.
-        self._seen[item_id] = {
+        self._seen[item_id] = self._record_payload(title, value)
+
+    @staticmethod
+    def _record_payload(title: str, value: float | None = None) -> dict:
+        return {
             "title": title[:300],
             "value_usd": value,
             "seen_at": datetime.now(UTC).isoformat(timespec="seconds"),
@@ -154,3 +193,30 @@ class SeenStore:
     def __len__(self) -> int:
         with self._lock:
             return len(self._seen)
+
+    def observed_value_stats(self) -> dict[str, int | float | None]:
+        """Return aggregate value diagnostics without exposing item details."""
+        with self._lock:
+            values: list[float] = []
+            unknown = 0
+            for record in self._seen.values():
+                value = record.get("value_usd") if isinstance(record, dict) else None
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    unknown += 1
+                    continue
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError, OverflowError):
+                    unknown += 1
+                    continue
+                if not math.isfinite(numeric):
+                    unknown += 1
+                    continue
+                values.append(numeric)
+
+            return {
+                "value_known": len(values),
+                "value_unknown": unknown,
+                "min_value_usd": min(values) if values else None,
+                "max_value_usd": max(values) if values else None,
+            }

@@ -10,6 +10,7 @@
   input[type=checkbox] { width: auto; margin-right: .4rem; vertical-align: -2px; }
   button { margin-top: 1.25rem; padding: .5rem 1.25rem; font: inherit;
            background: #0071dc; color: #fff; border: 0; border-radius: 4px; cursor: pointer; }
+  button:disabled { opacity: .6; cursor: wait; }
   button.secondary { background: #eef1f4; color: #2b3137; }
   .row { display: flex; gap: .75rem; }
   .row > label { flex: 1; }
@@ -32,7 +33,8 @@
 
 <h2>Alert filters</h2>
 <p class="hint">
-  Stored on the notifier. Applied on the next relay, no restart.
+  Stored on the notifier. Applied to newly observed items on the next relay,
+  no restart. Items already recorded stay deduplicated.
 </p>
 
 <div id="rulesBanner"></div>
@@ -82,8 +84,9 @@
 <h2>Connection</h2>
 
 <label>Ingest endpoint
-  <span class="hint">Where <code>run.ps1</code> listens.</span>
+  <span class="hint">Where the <code>reviewer-item-notifier</code> container listens; <code>run.ps1</code> uses the same address.</span>
   <input id="endpoint" type="url" placeholder="http://127.0.0.1:8787/ingest">
+  <span id="endpointError" class="err"></span>
 </label>
 
 <label>Ingest token
@@ -111,11 +114,21 @@
 </label>
 
 <button id="save">Save connection settings</button>
+<button id="checkConnection" class="secondary" type="button">Check connection</button>
 <button id="resetSweep" class="secondary" type="button">Restart sweep</button>
 <span id="saved" class="saved"></span>
 <div class="hint">
-  Restart sweep clears the page-progress record and sends the reviewer tab back
-  to page 1. It does not touch what has already been alerted on.
+  Restart sweep clears the active tab's page-progress record and sends it back
+  to page 1. Other reviewer tabs remain passive fallbacks. This does not touch
+  items already recorded by the notifier.
+</div>
+
+<button id="testNotification" class="secondary" type="button">Send test alert</button>
+<span id="testResult"></span>
+<div class="hint">
+  Sends one clearly labeled alert directly through the configured notification
+  provider. It bypasses item filters and dedupe, so it is the quickest way to
+  distinguish a delivery problem from a filter that matched nothing.
 </div>
 
 <div class="status">

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from pathlib import Path
 
 from filters import Rule
@@ -20,6 +21,7 @@ BUNDLED_RULES_PATH = Path(__file__).parent / "rules.json"
 USER_RULES_PATH = Path(__file__).parent.parent / "data" / "rules.json"
 
 _TRUTHY = {"1", "true", "yes", "on"}
+_RULES_LOCK = threading.RLock()
 
 
 def seed_mode() -> bool:
@@ -44,15 +46,8 @@ def user_rules_path() -> Path:
 
 def rules_source() -> str:
     """Which layer load_rules() will actually use. For the options page."""
-    if os.environ.get("RULES_JSON", "").strip():
-        return "env"
-    if os.environ.get("RULES_PATH", "").strip():
-        return "env-path"
-    if user_rules_path().is_file():
-        return "user"
-    if BUNDLED_RULES_PATH.is_file():
-        return "bundled"
-    return "default"
+    with _RULES_LOCK:
+        return _rules_snapshot_unlocked()[1]
 
 
 def load_rules() -> list[Rule]:
@@ -64,30 +59,44 @@ def load_rules() -> list[Rule]:
     any file. data/rules.json sits above the bundled file so the options page
     can save without overwriting what the repo ships.
     """
+    with _RULES_LOCK:
+        return _rules_snapshot_unlocked()[0]
+
+
+def _rules_snapshot_unlocked() -> tuple[list[Rule], str]:
+    """Resolve the first valid rules layer and its exact source together."""
     raw = os.environ.get("RULES_JSON", "").strip()
     if raw:
         try:
-            return _parse(json.loads(raw))
+            return _parse(json.loads(raw)), "env"
         except (json.JSONDecodeError, TypeError, ValueError):
             log.exception("RULES_JSON is not valid; falling back.")
 
-    candidates = []
+    candidates: list[tuple[Path, str]] = []
     override = os.environ.get("RULES_PATH", "").strip()
     if override:
-        candidates.append(Path(override))
-    candidates.append(user_rules_path())
-    candidates.append(BUNDLED_RULES_PATH)
+        candidates.append((Path(override), "env-path"))
+    candidates.append((user_rules_path(), "user"))
+    candidates.append((BUNDLED_RULES_PATH, "bundled"))
 
-    for path in candidates:
+    for path, source in candidates:
         if not path.is_file():
             continue
         try:
-            return _parse(json.loads(path.read_text(encoding="utf-8")))
+            rules = _parse(json.loads(path.read_text(encoding="utf-8")))
         except (json.JSONDecodeError, OSError, TypeError, ValueError):
             log.exception("Could not read rules from %s; falling back.", path)
+            continue
+        return rules, source
 
     log.warning("No rules configured; defaulting to items valued over $20.")
-    return list(DEFAULT_RULES)
+    return list(DEFAULT_RULES), "default"
+
+
+def rules_snapshot() -> tuple[list[Rule], str]:
+    """Return rules and their source from one consistent filesystem snapshot."""
+    with _RULES_LOCK:
+        return _rules_snapshot_unlocked()
 
 
 def save_user_rules(data: object) -> list[Rule]:
@@ -96,25 +105,27 @@ def save_user_rules(data: object) -> list[Rule]:
     Parsed before writing so a malformed payload is rejected outright rather
     than leaving a file that makes the server fall back on every relay.
     """
-    rules = _parse(data)
-    payload = {"rules": [_rule_to_dict(r) for r in rules]}
-    path = user_rules_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    tmp.replace(path)
-    log.info("Saved %d rule(s) to %s", len(rules), path)
-    return rules
+    with _RULES_LOCK:
+        rules = _parse(data)
+        payload = {"rules": [_rule_to_dict(r) for r in rules]}
+        path = user_rules_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(path)
+        log.info("Saved %d rule(s) to %s", len(rules), path)
+        return rules
 
 
 def clear_user_rules() -> bool:
     """Drop the UI-saved rules, reverting to the bundled defaults."""
-    path = user_rules_path()
-    if not path.is_file():
-        return False
-    path.unlink()
-    log.info("Removed %s; reverted to bundled rules.", path)
-    return True
+    with _RULES_LOCK:
+        path = user_rules_path()
+        if not path.is_file():
+            return False
+        path.unlink()
+        log.info("Removed %s; reverted to bundled rules.", path)
+        return True
 
 
 def rules_to_dicts(rules: list[Rule]) -> list[dict]:
@@ -140,7 +151,6 @@ def _parse(data: object) -> list[Rule]:
         data = data.get("rules", [])
     if not isinstance(data, list) or not data:
         raise ValueError("rules must be a non-empty list")
-    rules = [Rule.from_dict(d) for d in data if isinstance(d, dict)]
-    if not rules:
-        raise ValueError("no usable rules found")
-    return rules
+    if not all(isinstance(entry, dict) for entry in data):
+        raise ValueError("every rule must be an object")
+    return [Rule.from_dict(entry) for entry in data]

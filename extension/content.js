@@ -1,95 +1,123 @@
-// Runs inside the reviewer page the user already has open and signed into. It
-// reads what is on screen and hands it to the background worker -- it does not
-// log in, does not fetch anything on its own, and does nothing on pages the
-// user has not navigated to.
-//
-// The reload schedule lives in background.js, not here: a content script dies
-// with its page, so a reload landing on a sign-in redirect would silently end
-// the loop. This script only reports whether the user is mid-interaction.
+// Reads the signed-in reviewer page. Every matching tab loads this script, but
+// only the background-selected primary is allowed to observe, relay, or page.
 
 const ITEM_LINK = 'a[href*="/ip/"]';
 const DEFAULT_PATH_PATTERN = '^/reviews/claim-product';
-
-// The portal states retail value as `Free(Valued at $5.99)`. That is the number
-// the rules care about. The price inside the card's own link text is the item's
-// sale price, and for a clearance item it is followed by `Was $6.99` -- reading
-// either of those instead gives the wrong figure for exactly the items most
-// worth alerting on.
 const VALUE_RE = /Valued\s*at\s*\$\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)/i;
-// Deliberately does NOT require the dollar sign. Some listings render
-// `Free(Valued at )` with no figure at all; keying the card boundary on `$`
-// made those cards invisible, so the item was dropped outright instead of
-// being surfaced with an unknown value for `alert_on_unknown_value` to judge.
 const VALUE_GLOBAL_RE = /Valued\s*at/gi;
 const OUT_OF_STOCK_RE = /\bout of stock\b/i;
 const CLAIMS_RE = /Free items remaining\s*(\d+)\s*item/i;
-
-// Merchandising badges rendered inside the card link, ahead of the title.
-// Longest first: "new arrival" must be tried before "new", or the badge strips
-// to "New" and leaves "arrival" glued to the front of the title.
 const BADGE_RE =
   /^(new arrival|reduced price|best seller|popular pick|clearance|rollback|deal|new)\b/i;
 const TRAILING_PRICE_RE = /\s*\$\s*[0-9][0-9,]*(?:\.[0-9]{1,2})?(?:\s*was\s*\$\s*[0-9][0-9,]*(?:\.[0-9]{1,2})?)?\s*$/i;
-
-// Order and returns pages are full of /ip/ links to things the user already
-// bought. Relaying those would alert on their own past purchases as if they
-// were new offers.
 const EXCLUDE_PATH = /\/(orders?|purchase-history|track|returns)\b/i;
-
-// How far up from the link to look for the enclosing item card.
 const CARD_MAX_DEPTH = 8;
 
 const INTERACTION_GRACE_MS = 30_000;
+const ROLE_POLL_MS = 30_000;
+const EMPTY_PAGE_TIMEOUT_MS = 30_000;
+const EMPTY_POLL_MS = 2_000;
+const PAGE_JITTER = 0.25;
+const DEFAULT_PAGE_DELAY_S = 5;
+const END_OF_RESULTS_RE = /no search results/i;
+const HARD_PAGE_CAP = 100;
+const TRANSIENT_END_MAX_RELOADS = 3;
+const INGEST_RETRY_DELAYS_MS = [2_000, 5_000, 15_000, 30_000, 60_000];
 
 let lastInteraction = 0;
-// Our own scrolling must not register as the user being busy, or nudging the
-// pager into view would defer the next navigation by the full grace period.
 let programmaticScroll = false;
+let programmaticScrollUntil = 0;
 for (const evt of ['click', 'keydown', 'scroll']) {
   document.addEventListener(evt, () => {
-    if (evt === 'scroll' && programmaticScroll) return;
+    if (evt === 'scroll' &&
+        (programmaticScroll || Date.now() < programmaticScrollUntil)) return;
     lastInteraction = Date.now();
   }, { passive: true, capture: true });
 }
 
-/** Scroll to the foot of the page and back, to force a lazy pager to render.
- *
- * The pager sits below the fold and is not in the DOM until it is approached,
- * so a relay that fires before then cannot read the page count. Position is
- * restored so a tab the user happens to be looking at does not jump.
- */
+const role = {
+  active: false,
+  tabId: null,
+  primaryTabId: null,
+  generation: 0
+};
+let phase = 'passive';
+let lastActivityAt = 0;
+let relayTimer = null;
+let actionTimer = null;
+let observer = null;
+let relaying = false;
+let emptySince = 0;
+let ingestRetryAttempt = 0;
+let roleRequestInFlight = false;
+
+function isCurrent(generation = role.generation) {
+  return role.active && role.generation === generation;
+}
+
+function sweepingNow() {
+  return role.active && phase !== 'idle' && phase !== 'complete' && phase !== 'passive';
+}
+
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg?.type === 'reviewer:probe') {
+    sendResponse({
+      ready: true,
+      active: role.active,
+      generation: role.generation,
+      phase,
+      busy: Date.now() - lastInteraction < INTERACTION_GRACE_MS,
+      sweeping: sweepingNow(),
+      lastActivityAt
+    });
+    return undefined;
+  }
+  if (msg?.type === 'reviewer:set-role') {
+    applyRole(msg);
+    sendResponse({ ok: true });
+    return undefined;
+  }
+  if (msg?.type === 'reviewer:recover') {
+    if (msg.generation === role.generation && role.active && !relaying) {
+      if (phase !== 'waiting-user') {
+        clearTimeout(actionTimer);
+        actionTimer = null;
+        scheduleRelay(0, true);
+      }
+      lastActivityAt = Date.now();
+      sendResponse({ ok: true });
+    } else {
+      sendResponse({ ok: false });
+    }
+    return undefined;
+  }
+  // Compatibility with the previous background worker during an unpacked
+  // extension reload.
+  if (msg?.type === 'busy?') {
+    sendResponse({
+      busy: Date.now() - lastInteraction < INTERACTION_GRACE_MS,
+      sweeping: sweepingNow()
+    });
+    return undefined;
+  }
+  return undefined;
+});
+
+/** Force the lazy pager into the DOM, then restore the user's scroll position. */
 async function revealPager() {
   const from = window.scrollY;
   programmaticScroll = true;
   try {
     window.scrollTo(0, document.body.scrollHeight);
-    // Two frames plus a beat: enough for an intersection observer to fire and
-    // the pager to commit.
     await new Promise((done) => setTimeout(done, 400));
     window.scrollTo(0, from);
     await new Promise((done) => setTimeout(done, 50));
   } finally {
+    // Some browsers dispatch the final scroll event after scrollTo returns.
+    programmaticScrollUntil = Date.now() + 250;
     programmaticScroll = false;
   }
 }
-
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg?.type !== 'busy?') return undefined;
-  // Never yank the page out from under someone mid-claim, and never restart a
-  // sweep that is still walking. Chrome throttles timers in hidden tabs to
-  // about one per minute, so a backgrounded sweep can outlast the refresh
-  // interval; resetting it on every alarm would mean the later pages are never
-  // reached at all.
-  readSweep().then((sweep) => {
-    sendResponse({
-      busy: Date.now() - lastInteraction < INTERACTION_GRACE_MS,
-      // A sweep with nothing visited yet is not running, and must not block
-      // the refresh -- nextUnvisited() answers "page 1" for a fresh record.
-      sweeping: (sweep.visited || []).length > 0 && nextUnvisited(sweep) !== null
-    });
-  });
-  return true;   // response is asynchronous
-});
 
 async function isReviewerPage() {
   if (EXCLUDE_PATH.test(location.pathname)) return false;
@@ -103,8 +131,8 @@ async function isReviewerPage() {
 }
 
 function idFromHref(href) {
-  const m = href.match(/\/ip\/(?:[^/?#]+\/)?(\d{6,})/);
-  return m ? m[1] : null;
+  const match = href.match(/\/ip\/(?:[^/?#]+\/)?(\d{6,})/);
+  return match ? match[1] : null;
 }
 
 /** The nearest ancestor holding exactly one item's worth of card text. */
@@ -113,11 +141,7 @@ function cardFor(anchor) {
   for (let depth = 0; node && depth < CARD_MAX_DEPTH; depth += 1) {
     const text = node.innerText || '';
     const hits = text.match(VALUE_GLOBAL_RE);
-    if (hits) {
-      // More than one means we have climbed past the card into the grid, where
-      // the next item's value sits as close to this link as its own does.
-      return hits.length === 1 ? { node, text } : null;
-    }
+    if (hits) return hits.length === 1 ? { node, text } : null;
     node = node.parentElement;
   }
   return null;
@@ -132,13 +156,11 @@ function cleanTitle(raw) {
 }
 
 function titleFor(anchor, card) {
-  // The image alt is the cleanest source; the link text carries the badge
-  // prefix and the sale price, and the aria-label often carries both.
   const candidates = [
     anchor.querySelector('img')?.getAttribute('alt'),
     anchor.getAttribute('aria-label'),
     anchor.innerText,
-    card?.text.split('\n').find((line) => line.length > 20 && !VALUE_RE.test(line)),
+    card?.text.split('\n').find((line) => line.length > 20 && !VALUE_RE.test(line))
   ];
   for (const candidate of candidates) {
     const title = cleanTitle(candidate);
@@ -166,15 +188,8 @@ function collect() {
     const id = idFromHref(anchor.getAttribute('href') || '');
     if (!id || byId.has(id)) continue;
 
-    // A card whose layout defeats the walk used to be dropped outright, which
-    // is the worst outcome: a $79.99 item vanished with nothing logged. Emit
-    // it with an unknown value instead and let `alert_on_unknown_value`
-    // decide -- a spurious buzz is far cheaper than a silent miss.
     const card = cardFor(anchor);
-    // Claiming an out-of-stock item is not possible, so waking someone for one
-    // is pure noise.
     if (card && OUT_OF_STOCK_RE.test(card.text)) continue;
-
     const title = titleFor(anchor, card);
     if (!title) continue;
 
@@ -193,48 +208,7 @@ function collect() {
   return [...byId.values()];
 }
 
-async function relay() {
-  if (!(await isReviewerPage())) return;
-  const items = collect();
-  if (items.length) {
-    // The background worker dedupes across reloads and the server dedupes again.
-    chrome.runtime.sendMessage({ type: 'items', items, page: currentPage() });
-  } else if (!atEndOfResults()) {
-    // No cards and no end marker means the page is still rendering. Wait for
-    // the next mutation rather than calling this the end of the catalogue.
-    return;
-  }
-  scheduleNextPage();
-}
-
 // --- pagination -------------------------------------------------------------
-// A sweep visits every page once. Which pages remain is tracked explicitly in
-// storage rather than inferred from the current URL: Walmart rewrites the
-// query string (parameter order differs between loads), so "whatever page I am
-// on, plus one" drifts and the walk visibly jumped 1 -> 7 -> 6 -> 10.
-//
-// The explicit set also survives the content script dying, a reload landing
-// somewhere unexpected, or the user clicking a page link mid-sweep -- the next
-// relay simply resumes with the lowest page not yet seen.
-
-const PAGE_JITTER = 0.25;
-const DEFAULT_PAGE_DELAY_S = 5;
-// Resolved once from the background worker. Sweep progress is stored per tab
-// so that two reviewer tabs do not overwrite each other's page list.
-let sweepKeyPromise = null;
-function sweepKey() {
-  if (!sweepKeyPromise) {
-    sweepKeyPromise = chrome.runtime
-      .sendMessage({ type: 'whoami' })
-      .then((reply) => (reply?.tabId != null ? `sweep:${reply.tabId}` : 'sweep'))
-      .catch(() => 'sweep');
-  }
-  return sweepKeyPromise;
-}
-// The portal answers a past-the-end page with a "no search results" panel.
-const END_OF_RESULTS_RE = /no search results/i;
-// Backstop for the case where the page count cannot be read at all.
-const HARD_PAGE_CAP = 100;
 
 function currentPage() {
   const raw = parseInt(new URLSearchParams(location.search).get('page') || '1', 10);
@@ -243,11 +217,8 @@ function currentPage() {
 
 function pageUrl(page) {
   const url = new URL(location.href);
-  if (page <= 1) {
-    url.searchParams.delete('page');
-  } else {
-    url.searchParams.set('page', String(page));
-  }
+  if (page <= 1) url.searchParams.delete('page');
+  else url.searchParams.set('page', String(page));
   return url.toString();
 }
 
@@ -255,39 +226,65 @@ function atEndOfResults() {
   return END_OF_RESULTS_RE.test(document.body.innerText || '');
 }
 
-/** Highest page number in the pager, or null if the pager is not on the page.
- *
- * The last page sits in a plain <div> rather than an <a>, so the whole list is
- * scanned for numbers instead of just the page-number anchors.
- */
 function totalPages() {
   const list = document.querySelector('[data-automation-id="page-number"]')?.closest('ul');
   if (!list) return null;
   const numbers = (list.innerText.match(/\d+/g) || [])
     .map(Number)
-    .filter((n) => n > 0 && n <= HARD_PAGE_CAP);
+    .filter((number) => number > 0 && number <= HARD_PAGE_CAP);
   return numbers.length ? Math.max(...numbers) : null;
 }
 
-async function readSweep() {
-  const key = await sweepKey();
-  const stored = await chrome.storage.local.get([key]);
-  const sweep = stored[key];
-  if (sweep && Array.isArray(sweep.visited)) return sweep;
-  return { total: null, visited: [] };
+function sweepStorageKey() {
+  return Number.isInteger(role.tabId) ? `sweep:${role.tabId}` : null;
 }
 
-/** Lowest page in 1..total not yet visited, or null when the sweep is done.
- *
- * An unknown total is NOT "done". The pager renders late, so a relay firing
- * before it exists reads null -- and treating that as completion ended every
- * sweep after a single page.
- */
+function freshSweep(generation = role.generation) {
+  return {
+    generation,
+    total: null,
+    visited: [],
+    endRetries: {},
+    startedAt: Date.now(),
+    lastProgressAt: 0
+  };
+}
+
+async function readSweep(generation = role.generation) {
+  const key = sweepStorageKey();
+  if (!key) return freshSweep(generation);
+  const stored = await chrome.storage.local.get([key]);
+  const sweep = stored[key];
+  if (sweep && sweep.generation === generation && Array.isArray(sweep.visited)) {
+    return { ...freshSweep(generation), ...sweep };
+  }
+  return freshSweep(generation);
+}
+
+async function writeSweep(sweep, generation = role.generation) {
+  if (!isCurrent(generation)) return false;
+  const key = sweepStorageKey();
+  if (!key) return false;
+  await chrome.storage.local.set({ [key]: { ...sweep, generation } });
+  return isCurrent(generation);
+}
+
+async function removeCurrentSweep(generation, pages) {
+  if (!isCurrent(generation)) return;
+  const key = sweepStorageKey();
+  if (!key) return;
+  const stored = await chrome.storage.local.get([key]);
+  if (stored[key]?.generation === generation) await chrome.storage.local.remove(key);
+  if (!isCurrent(generation)) return;
+  await chrome.storage.local.set({
+    lastSweepDone: Date.now(),
+    lastSweepPages: pages
+  });
+}
+
 function nextUnvisited(sweep) {
-  const seen = new Set(sweep.visited || []);
+  const seen = new Set((sweep.visited || []).filter((page) => Number.isInteger(page) && page > 0));
   if (!sweep.total) {
-    // Total still unknown: walk forward from the highest page seen so far and
-    // rely on the end-of-results panel to stop.
     const highest = seen.size ? Math.max(...seen) : 0;
     return highest >= HARD_PAGE_CAP ? null : highest + 1;
   }
@@ -297,86 +294,330 @@ function nextUnvisited(sweep) {
   return null;
 }
 
-// Set synchronously. The storage reads below are async, so a check that only
-// consulted a timer handle would let two observer-driven calls through and
-// queue two navigations.
-let advancing = false;
+function cancelPageWork() {
+  clearTimeout(relayTimer);
+  clearTimeout(actionTimer);
+  relayTimer = null;
+  actionTimer = null;
+}
 
-async function scheduleNextPage() {
-  if (advancing) return;
-  advancing = true;
-  try {
-    const page = currentPage();
-    const sweep = await readSweep();
-    const ended = atEndOfResults();
+function scheduleRelay(delayMs = 0, replace = false) {
+  // A completed sweep stays quiescent until the coordinator starts the next
+  // one. Walmart's continuously mutating widgets must not wake an endless
+  // duplicate sweep after progress has been cleared.
+  if (!role.active || actionTimer || phase === 'complete') return;
+  if (relayTimer && !replace) return;
+  clearTimeout(relayTimer);
+  relayTimer = setTimeout(() => {
+    relayTimer = null;
+    relay().catch((err) => {
+      console.warn('Reviewer Item Relay: relay failed', err);
+      phase = 'relay-retry';
+      lastActivityAt = Date.now();
+      scheduleRelay(5_000, true);
+    });
+  }, Math.max(0, delayMs));
+}
 
-    // Knowing the real page count is what makes the walk deterministic, so it
-    // is worth one scroll to the foot of the page to make the pager appear.
-    if (!ended && totalPages() === null &&
-        Date.now() - lastInteraction >= INTERACTION_GRACE_MS) {
-      await revealPager();
-    }
+function queueWhenIdle(action, delayMs, waitingPhase = 'waiting-navigation') {
+  clearTimeout(actionTimer);
+  const generation = role.generation;
+  phase = waitingPhase;
+  lastActivityAt = Date.now();
 
-    // The total only ever grows. The pager renders progressively, so a read
-    // caught mid-render on page 19 can see "1 ... 18 19" and report 19 -- which
-    // ended the sweep five pages early. Taking the max of every reading makes a
-    // partial render harmless.
-    const detected = totalPages();
-    const total = Math.max(detected ?? 0, sweep.total ?? 0) || null;
-    const visited = ended && !detected
-      ? sweep.visited                       // nothing real here to record
-      : [...new Set([...sweep.visited, page])];
-
-    const updated = { total, visited };
-
-    // The end-of-results panel is only trusted when the page count is unknown
-    // or we are at/past it. Walmart shows that panel transiently on a slow or
-    // failed load, and believing it mid-catalogue truncates the sweep.
-    const trustEnded = ended && (!total || page >= total);
-    if (ended && !trustEnded) {
-      console.warn(
-        `Reviewer Item Relay: page ${page} of ${total} reported no results; ` +
-        'treating as a transient failure and continuing.'
-      );
-    }
-    const next = trustEnded ? null : nextUnvisited(updated);
-
-    if (next === null) {
-      // Sweep complete. Clear it so the next refresh starts a fresh pass.
-      await chrome.storage.local.remove(await sweepKey());
-      await chrome.storage.local.set({
-        lastSweepDone: Date.now(), lastSweepPages: visited.length
-      });
+  const attempt = () => {
+    if (!isCurrent(generation)) {
+      actionTimer = null;
       return;
     }
+    const idleIn = INTERACTION_GRACE_MS - (Date.now() - lastInteraction);
+    if (idleIn > 0) {
+      // Keep the pending action alive instead of dropping it and leaving a
+      // persisted sweep record that blocks every later refresh.
+      phase = 'waiting-user';
+      lastActivityAt = Date.now();
+      actionTimer = setTimeout(attempt, idleIn + 100);
+      return;
+    }
+    actionTimer = null;
+    phase = 'navigating';
+    lastActivityAt = Date.now();
+    action();
+  };
+  actionTimer = setTimeout(attempt, Math.max(0, delayMs));
+}
 
-    await chrome.storage.local.set({ [await sweepKey()]: updated });
-    if (next === page) return;   // already here; wait for this page to render
+async function pageDelayMs() {
+  const { pageDelaySeconds = DEFAULT_PAGE_DELAY_S } =
+    await chrome.storage.local.get(['pageDelaySeconds']);
+  const base = Math.max(1, parseInt(pageDelaySeconds, 10) || DEFAULT_PAGE_DELAY_S) * 1000;
+  return base * (1 + (Math.random() * 2 - 1) * PAGE_JITTER);
+}
 
-    const { pageDelaySeconds = DEFAULT_PAGE_DELAY_S } =
-      await chrome.storage.local.get(['pageDelaySeconds']);
-    const base = Math.max(1, parseInt(pageDelaySeconds, 10) || DEFAULT_PAGE_DELAY_S) * 1000;
-    const delay = base * (1 + (Math.random() * 2 - 1) * PAGE_JITTER);
+async function finishSweep(sweep, generation) {
+  await removeCurrentSweep(generation, new Set(sweep.visited || []).size);
+  if (!isCurrent(generation)) return;
+  phase = 'complete';
+  lastActivityAt = Date.now();
+}
 
-    setTimeout(() => {
-      // Same courtesy as the reload: never navigate out from under someone
-      // mid-claim. Release the guard so a later relay can retry.
-      if (Date.now() - lastInteraction < INTERACTION_GRACE_MS) {
-        advancing = false;
+async function advanceDeliveredPage(generation) {
+  if (!isCurrent(generation)) return;
+  const page = currentPage();
+  const sweep = await readSweep(generation);
+  if (!isCurrent(generation)) return;
+
+  if (totalPages() === null &&
+      Date.now() - lastInteraction >= INTERACTION_GRACE_MS) {
+    await revealPager();
+  }
+  if (!isCurrent(generation)) return;
+
+  const detected = totalPages();
+  const total = Math.max(detected ?? 0, sweep.total ?? 0) || null;
+  const visited = [...new Set([...(sweep.visited || []), page])];
+  const endRetries = { ...(sweep.endRetries || {}) };
+  delete endRetries[page];
+  const updated = {
+    ...sweep,
+    generation,
+    total,
+    visited,
+    endRetries,
+    lastProgressAt: Date.now()
+  };
+  const next = nextUnvisited(updated);
+
+  if (next === null) {
+    await finishSweep(updated, generation);
+    return;
+  }
+  if (!(await writeSweep(updated, generation)) || !isCurrent(generation)) return;
+
+  phase = 'waiting-navigation';
+  lastActivityAt = Date.now();
+  const wait = await pageDelayMs();
+  if (!isCurrent(generation)) return;
+  queueWhenIdle(() => location.assign(pageUrl(next)), wait);
+}
+
+async function handleEndPage(generation) {
+  if (!isCurrent(generation)) return;
+  const page = currentPage();
+  const sweep = await readSweep(generation);
+  if (!isCurrent(generation)) return;
+
+  const detected = totalPages();
+  const total = Math.max(detected ?? 0, sweep.total ?? 0) || null;
+  const noConfirmedPages = !(sweep.visited || []).length;
+  const inconsistent = Boolean(total && page < total);
+
+  // Walmart briefly renders the no-results panel on slow/failed loads. Confirm
+  // it instead of either truncating the sweep or returning with a stuck guard.
+  if (inconsistent || noConfirmedPages) {
+    const attempts = ((sweep.endRetries || {})[page] || 0) + 1;
+    const updated = {
+      ...sweep,
+      generation,
+      total,
+      endRetries: { ...(sweep.endRetries || {}), [page]: attempts }
+    };
+    await writeSweep(updated, generation);
+    if (!isCurrent(generation)) return;
+
+    if (attempts >= TRANSIENT_END_MAX_RELOADS) {
+      if (!inconsistent) {
+        // A genuinely empty catalogue has no delivered page to mark. Three
+        // identical renders are enough confirmation to finish quietly.
+        await finishSweep(sweep, generation);
         return;
       }
-      location.assign(pageUrl(next));
-    }, delay);
-  } catch (err) {
-    advancing = false;
-    console.warn('Reviewer Item Relay: could not advance the sweep', err);
+      await reportUnusable(
+        `Reviewer page ${page} still showed no results after ${attempts} reloads`,
+        generation
+      );
+      return;
+    }
+    phase = 'transient-end-retry';
+    const wait = await pageDelayMs();
+    if (!isCurrent(generation)) return;
+    queueWhenIdle(() => location.reload(), wait, 'transient-end-retry');
+    return;
+  }
+
+  await finishSweep({ ...sweep, total }, generation);
+}
+
+// --- role and relay lifecycle ------------------------------------------------
+
+function startObserver() {
+  if (observer) return;
+  observer = new MutationObserver(() => {
+    // Schedule once on the first mutation; continuously changing widgets must
+    // not postpone extraction forever by repeatedly resetting a debounce.
+    if (!relaying && !actionTimer) scheduleRelay(1_000, false);
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
+}
+
+function stopObserver() {
+  observer?.disconnect();
+  observer = null;
+}
+
+function applyRole(message) {
+  const next = {
+    active: Boolean(message?.active),
+    tabId: Number.isInteger(message?.tabId) ? message.tabId : role.tabId,
+    primaryTabId: Number.isInteger(message?.primaryTabId) ? message.primaryTabId : null,
+    generation: Number.isInteger(message?.generation) ? message.generation : role.generation
+  };
+  const changed = next.active !== role.active || next.generation !== role.generation ||
+    next.tabId !== role.tabId;
+  Object.assign(role, next);
+  if (!changed) return;
+
+  cancelPageWork();
+  emptySince = 0;
+  ingestRetryAttempt = 0;
+  if (!role.active) {
+    stopObserver();
+    phase = 'passive';
+    lastActivityAt = 0;
+    return;
+  }
+
+  phase = 'starting';
+  lastActivityAt = Date.now();
+  startObserver();
+  scheduleRelay(0, true);
+}
+
+async function requestRole() {
+  if (roleRequestInFlight) return;
+  roleRequestInFlight = true;
+  try {
+    const reply = await chrome.runtime.sendMessage({ type: 'reviewer:role' });
+    if (reply) applyRole(reply);
+  } catch {
+    if (!role.active) setTimeout(requestRole, 2_000);
+  } finally {
+    roleRequestInFlight = false;
   }
 }
 
-let relayTimer;
-const observer = new MutationObserver(() => {
-  clearTimeout(relayTimer);
-  relayTimer = setTimeout(relay, 1500);
-});
-observer.observe(document.body, { childList: true, subtree: true });
-relay();
+function applyAckRole(ack) {
+  if (!ack || !Number.isInteger(ack.generation)) return;
+  if (ack.generation !== role.generation || Boolean(ack.active) !== role.active ||
+      ack.primaryTabId !== role.primaryTabId) {
+    applyRole(ack);
+  }
+}
+
+async function reportUnusable(reason, generation) {
+  if (!isCurrent(generation)) return;
+  phase = 'empty-timeout';
+  lastActivityAt = Date.now();
+  let reply;
+  try {
+    reply = await chrome.runtime.sendMessage({
+      type: 'reviewer:unusable', generation, reason
+    });
+  } catch {
+    scheduleRelay(15_000, true);
+    return;
+  }
+  applyAckRole(reply);
+  if (!isCurrent(reply?.generation ?? generation)) return;
+
+  if (reply?.recover === 'reload') {
+    queueWhenIdle(
+      () => location.reload(),
+      Math.max(1_000, Number(reply.retryAfterMs) || 5_000),
+      'recovering'
+    );
+  } else if (role.active) {
+    scheduleRelay(15_000, true);
+  }
+}
+
+function retryDelay(retryable) {
+  if (!retryable) return INGEST_RETRY_DELAYS_MS.at(-1);
+  const base = INGEST_RETRY_DELAYS_MS[
+    Math.min(Math.max(0, ingestRetryAttempt - 1), INGEST_RETRY_DELAYS_MS.length - 1)
+  ];
+  return base * (0.8 + Math.random() * 0.4);
+}
+
+async function relay() {
+  if (!role.active || relaying || actionTimer) return;
+  const generation = role.generation;
+  relaying = true;
+  phase = 'collecting';
+  lastActivityAt = Date.now();
+  try {
+    if (!(await isReviewerPage())) {
+      await reportUnusable('The selected tab is no longer on the configured reviewer page', generation);
+      return;
+    }
+    if (!isCurrent(generation)) return;
+
+    const items = collect();
+    if (items.length) {
+      emptySince = 0;
+      phase = 'ingesting';
+      lastActivityAt = Date.now();
+      let ack;
+      try {
+        ack = await chrome.runtime.sendMessage({
+          type: 'reviewer:page',
+          generation,
+          page: currentPage(),
+          items
+        });
+      } catch (err) {
+        ack = { ok: false, retryable: true, error: err?.message || String(err) };
+      }
+
+      applyAckRole(ack);
+      if (!isCurrent(generation)) return;
+      if (!ack?.ok) {
+        ingestRetryAttempt += 1;
+        phase = 'ingest-retry';
+        lastActivityAt = Date.now();
+        scheduleRelay(retryDelay(ack?.retryable), true);
+        return;
+      }
+
+      ingestRetryAttempt = 0;
+      await advanceDeliveredPage(generation);
+      return;
+    }
+
+    if (atEndOfResults()) {
+      emptySince = 0;
+      await handleEndPage(generation);
+      return;
+    }
+
+    if (!emptySince) emptySince = Date.now();
+    if (Date.now() - emptySince >= EMPTY_PAGE_TIMEOUT_MS) {
+      emptySince = Date.now();
+      await reportUnusable(
+        `Reviewer page ${currentPage()} did not render any item cards within ` +
+        `${EMPTY_PAGE_TIMEOUT_MS / 1000} seconds`,
+        generation
+      );
+      return;
+    }
+
+    phase = 'waiting-content';
+    lastActivityAt = Date.now();
+    scheduleRelay(EMPTY_POLL_MS, true);
+  } finally {
+    relaying = false;
+  }
+}
+
+requestRole();
+setInterval(requestRole, ROLE_POLL_MS);

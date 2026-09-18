@@ -51,7 +51,8 @@ def test_non_matching_item_is_marked_seen_but_not_sent(store):
     items = [Item(title="Towel", value_usd=9.0)]
 
     summary = process(items, rules, store, notifier)
-    assert summary.new == 1 and summary.matched == 0 and summary.notified == 0
+    assert summary.new == 1 and summary.filtered == 1
+    assert summary.matched == 0 and summary.notified == 0
     assert notifier.sent == []
 
     # Marked seen so that loosening the rule later does not replay old listings.
@@ -78,14 +79,66 @@ def test_summary_counts_across_mixed_batch(store, rules):
         Item(title="Laptop", value_usd=899.0),
     ]
     summary = process(items, rules, store, notifier)
-    assert summary.as_dict() == {"seen": 3, "new": 3, "matched": 2, "notified": 2,
-                                 "failed": 0, "seeded": 0}
+    assert summary.as_dict() == {
+        "seen": 3,
+        "new": 3,
+        "duplicates": 0,
+        "filtered": 1,
+        "matched": 2,
+        "notified": 2,
+        "failed": 0,
+        "pending": 0,
+        "seeded": 0,
+        "value_known": 3,
+        "value_unknown": 0,
+        "min_value_usd": 9.0,
+        "max_value_usd": 899.0,
+    }
 
 
 def test_empty_batch_is_a_no_op(store, rules):
     assert process([], rules, store, FakeNotifier()).as_dict() == {
-        "seen": 0, "new": 0, "matched": 0, "notified": 0, "failed": 0, "seeded": 0
+        "seen": 0,
+        "new": 0,
+        "duplicates": 0,
+        "filtered": 0,
+        "matched": 0,
+        "notified": 0,
+        "failed": 0,
+        "pending": 0,
+        "seeded": 0,
+        "value_known": 0,
+        "value_unknown": 0,
+        "min_value_usd": None,
+        "max_value_usd": None,
     }
+
+
+def test_summary_explains_duplicates_and_unknown_values(store, rules):
+    store.mark_seen("known-already")
+    items = [
+        Item(item_id="known-already", title="Old mystery item"),
+        Item(item_id="new-cheap", title="New towel", value_usd=8.5),
+    ]
+
+    summary = process(items, rules, store, FakeNotifier())
+
+    assert summary.duplicates == 1
+    assert summary.filtered == 1
+    assert summary.value_known == 1
+    assert summary.value_unknown == 1
+    assert summary.min_value_usd == summary.max_value_usd == 8.5
+
+
+def test_summary_treats_unrepresentable_numeric_value_as_unknown(store):
+    summary = process(
+        [Item(item_id="huge", title="Huge", value_usd=10**1_000)],
+        [Rule(min_value_usd=100, alert_on_unknown_value=False)],
+        store,
+        FakeNotifier(),
+    )
+    assert summary.value_known == 0
+    assert summary.value_unknown == 1
 
 
 def test_failed_delivery_is_counted(store, rules):
@@ -106,7 +159,7 @@ def test_seed_mode_records_without_sending(store, rules):
     assert process(items, rules, store, notifier).new == 0
 
 
-def test_concurrent_claim_only_notifies_once(store, rules):
+def test_concurrent_claim_is_reported_as_pending(store, rules):
     """The timer and the ingest endpoint can both be holding the same item.
 
     Both read the store before either writes, so both see it as new. Only the
@@ -124,6 +177,7 @@ def test_concurrent_claim_only_notifies_once(store, rules):
     summary = process([item], rules, store, notifier)
     assert summary.new == 1
     assert summary.matched == 0 and summary.notified == 0
+    assert summary.pending == 1 and summary.failed == 0
     assert notifier.sent == []
 
     # The winner does send.
@@ -131,8 +185,64 @@ def test_concurrent_claim_only_notifies_once(store, rules):
     assert process([item], rules, store, notifier).notified == 1
 
 
+def test_loser_retries_after_in_flight_delivery_fails(store, rules):
+    import threading
+
+    entered = threading.Event()
+    finish = threading.Event()
+
+    class BlockingFailure:
+        def send(self, item, priority="normal"):
+            entered.set()
+            assert finish.wait(timeout=5)
+            return False
+
+    item = Item(item_id="ip-race", title="TV", value_usd=500.0)
+    winner_summary = []
+    thread = threading.Thread(
+        target=lambda: winner_summary.append(
+            process([item], rules, store, BlockingFailure())
+        )
+    )
+    thread.start()
+    assert entered.wait(timeout=5)
+
+    loser_notifier = FakeNotifier()
+    # Even if rules change while the first delivery is blocked, the retry must
+    # not persist the item as filtered and turn a later failure into silence.
+    loser = process(
+        [item],
+        [Rule(min_value_usd=1_000, alert_on_unknown_value=False)],
+        store,
+        loser_notifier,
+    )
+    assert loser.pending == 1
+    assert loser.notified == 0
+    assert loser_notifier.sent == []
+
+    finish.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert winner_summary[0].failed == 1
+
+    retry = process([item], rules, store, FakeNotifier())
+    assert retry.notified == 1
+
+
 def test_claim_is_released_when_delivery_fails(store, rules):
     item = Item(title="TV", value_usd=500.0)
     process([item], rules, store, FakeNotifier(succeed=False))
     # The claim is gone, so a later run can take it.
     assert store.claim(item.item_id) is True
+
+
+def test_claim_is_released_when_notifier_raises(store, rules):
+    class RaisingNotifier:
+        def send(self, item, priority="normal"):
+            raise RuntimeError("unexpected notifier failure")
+
+    item = Item(title="TV", value_usd=500.0)
+    with pytest.raises(RuntimeError, match="unexpected notifier failure"):
+        process([item], rules, store, RaisingNotifier())
+
+    assert store.is_new(item.item_id) is True

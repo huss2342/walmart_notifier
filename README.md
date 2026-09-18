@@ -18,8 +18,9 @@ Runs entirely on your own machine. **No cloud account, no hosting bill, $0/month
 
 A small Chrome extension reads the reviewer page **you** have open in **your**
 signed-in browser and posts what it sees to a Python server on `127.0.0.1`.
-That server applies your rules, skips anything it has already alerted on, and
-pushes to your phone. Nothing leaves your computer except the notification.
+That server applies your rules to newly observed items, records every item it
+handles (including filtered ones), and pushes matches to your phone. Nothing
+leaves your computer except the notification sent through your chosen provider.
 
 There is deliberately **no auto-claim**. You still claim items by hand.
 
@@ -44,72 +45,107 @@ often; twenty seconds is not. Your account, your call.
 
 ## Setup
 
-Windows, Python 3.11+, Chrome. Commands below are for **PowerShell** — the
-paths use backslashes, so they will not work in Git Bash as written (and
-forward-slash paths will not work in `cmd.exe`).
+Windows, Docker Desktop, and Chrome. Docker is the recommended way to run the
+notifier: it appears as **reviewer-item-notifier** in Docker Desktop, keeps its
+own logs and health indicator there, and restarts automatically whenever Docker
+Desktop starts. The Python/PowerShell launcher remains available as a fallback.
 
-### 1. Install
+### 1. Pick a push channel
 
-```powershell
-python -m venv .venv
-```
-
-```powershell
-.venv\Scripts\pip install -r src\requirements.txt
-```
-
-The server itself is standard library only — `requests` is just for the push
-notifiers.
-
-### 2. Pick a push channel
-
-ntfy is free and needs no account. Install the **ntfy** app on your phone, then
-generate a topic name:
+ntfy push delivery is free and needs no account. The public `ntfy.sh` service
+currently allows [250 published messages per day](https://docs.ntfy.sh/publish/#limitations).
+Install the **ntfy** app on your phone, then generate a topic name:
 
 ```powershell
-python -c "import secrets; print(secrets.token_hex(16))"
+[guid]::NewGuid().ToString('N')
 ```
 
 Subscribe to that exact topic in the app. **The topic name is the password** —
 anyone who knows it can read your alerts, so keep it long and random.
 
-Copy `notifier.example.env` to `notifier.env` and paste it in as `NTFY_TOPIC`.
-If you would rather get email than a push, set `NTFY_EMAIL` too — ntfy will send
-both.
+Create the local settings file, then paste the generated value in as
+`NTFY_TOPIC`:
 
-### 3. Seed the dedupe file
+```powershell
+Copy-Item notifier.example.env notifier.env
+```
+
+`notifier.env` is excluded from both Git and the Docker image. Compose reads it
+only when the container starts.
+
+Email forwarding has stricter requirements: `ntfy.sh` has
+[disabled anonymous email](https://docs.ntfy.sh/publish/#e-mail-notifications),
+so the destination address must belong to a verified ntfy account and
+`NTFY_TOKEN` must contain that account's access token. Set `NTFY_EMAIL` as well
+to request both push and email. If `NTFY_EMAIL` is set without a token, this
+notifier deliberately stays in push-only mode and reports the reason on the
+Options status panel.
+
+### 2. Choose the first-run mode
 
 The portal shows about 30 items per page. On a fresh install every one of them
-looks new, so the first relay would fire 30 notifications at once. Run once in
-seed mode to record what is already there:
+looks new, so the first relay would fire many notifications at once. If
+`data/seen.json` already exists, skip this step. For a genuinely fresh install,
+set `SEED_MODE=true` in `notifier.env` now, before starting the container. Step
+5 explains when to change it back.
+
+### 3. Start the container
+
+Run every `docker compose` command from the repository folder containing
+`compose.yaml`:
 
 ```powershell
-.\run.ps1 -Seed
+docker compose up -d --build
 ```
 
-Leave it running for step 4, then Ctrl-C and start it normally:
+This creates and starts the service. The extension continues using
+`http://127.0.0.1:8787`; Docker publishes that address on this computer only,
+not to the local network. Check it at any time with:
 
 ```powershell
-.\run.ps1
+docker compose ps
+docker compose logs --tail 50 notifier
 ```
+
+Do not run `run.ps1` at the same time because both would need port 8787.
 
 ### 4. Install the extension
 
-1. `chrome://extensions` → Developer mode → **Load unpacked** → pick `extension/`
+1. `chrome://extensions` → Developer mode → **Load unpacked** → pick
+   `extension/`. If it was already installed, click **Reload** on its card and
+   verify that the displayed version is **2.1.3**.
 2. Open its **Options**. The defaults are already correct for a local server —
    endpoint `http://127.0.0.1:8787/ingest`, path `^/reviews/claim-product`.
-3. Set **auto-refresh** to `3` minutes (`0` disables it)
-4. Save
+3. With **reviewer-item-notifier** running, click **Check connection**. This
+   verifies the local server directly; allow local-network access if your
+   Chrome build or policy shows a permission prompt.
+4. Click **Send test alert** and confirm that the labeled test reaches your
+   phone. This bypasses filters and dedupe.
+5. Set **auto-refresh** to `3` minutes (`0` disables it), then save.
 
 ### 5. Open the portal and leave it
 
-Open <https://www.walmart.com/reviews/claim-product?q=> in a tab and leave it
-there. Add more tabs with `?q=headphones`, `?q=air+fryer`, and so on — each one
-relays independently, and the same item arriving twice still only buzzes once.
+Open <https://www.walmart.com/reviews/claim-product?q=> in one tab and leave it
+there. One tab is recommended. If several eligible reviewer tabs are open, the
+extension deterministically selects the first reachable one as active and keeps
+the others passive. A passive tab takes over only if the active one becomes
+unusable; separate query tabs are therefore fallbacks, not independent monitors.
 
 Every sweep walks page 1 to the last page (detected by the portal's "no search
 results" panel), pausing a configurable few seconds between each. Set **Delay
-between pages** and **Auto-refresh** in the Options page.
+between pages** and **Auto-refresh** in the Options page. The active tab records
+a page as visited only after the server acknowledges all of its items. A failed
+or still-running delivery keeps that page open and retries with capped, jittered
+backoff. Stale or empty sweeps are recovered without allowing a passive tab to
+race the active one.
+
+If this was a fresh install started with `SEED_MODE=true`, wait until the first
+full sweep completes. Then set `SEED_MODE=false` in `notifier.env` and recreate
+the container so it reads the changed environment:
+
+```powershell
+docker compose up -d --force-recreate
+```
 
 ## Verifying it works
 
@@ -118,15 +154,36 @@ curl.exe -s http://127.0.0.1:8787/health
 ```
 
 Shows the loaded rules, whether a push channel is configured, and how many items
-are in the dedupe file.
+are in the recorded-item state file.
 
-To prove the whole chain end to end, post a fake item — your phone should buzz:
+With Telegram configured, send `/status` to your bot from the same account
+identified by `TELEGRAM_CHAT_ID`. The reply confirms that the computer,
+notifier process, and Telegram connection are online, and shows uptime, the last
+successful reviewer-page relay, the latest ingest-batch counts, the current
+value filter, and the number of recorded items. Those counts are not a whole-
+sweep total. The command uses outbound Telegram long polling;
+it does not expose a port on your router or accept commands from other users.
+
+To share alerts, create a private Telegram group containing you, the other
+person, and the bot. From your own account, send `/usehere` in that group. The
+bot confirms the switch and sends each future alert once to the group, where
+both members receive it. Only the account in `TELEGRAM_CHAT_ID` can switch the
+destination or request `/status`. Send `/useprivate` in your original private
+bot chat to move alerts back. The chosen group survives container restarts.
+
+If `INGEST_TOKEN` is configured, include
+`-H "X-Ingest-Token: your-token"` on health and rules requests too.
+
+The quickest end-to-end check is **Send test alert** in the extension Options.
+The equivalent HTTP request is:
 
 ```powershell
-curl.exe -X POST http://127.0.0.1:8787/ingest -H "Content-Type: application/json" -d '{\"items\":[{\"item_id\":\"test-001\",\"title\":\"Smoke test\",\"value_usd\":99.0}]}'
+curl.exe -X POST http://127.0.0.1:8787/test-notification
 ```
 
-Change `test-001` each time — dedupe means the same id only ever fires once.
+If you configured `INGEST_TOKEN`, add
+`-H "X-Ingest-Token: your-token"`. This route bypasses filters and state, so it
+can be repeated without inventing a new item id.
 
 ## Filters
 
@@ -141,7 +198,10 @@ the notifier is the only thing that applies them, and a second copy in the
 browser would be a second source of truth that silently disagrees.
 
 Rules are re-read on every relay, so a save takes effect within a refresh cycle
-with no restart.
+with no restart. They apply only when an item is first observed. Matching,
+non-matching, and seed-mode items are all recorded in `data/seen.json`; the file
+is a record of handled items, not merely a history of alerts. Loosening a filter
+does not replay older items that were previously filtered out.
 
 **The full way: JSON.** The Options form edits one combined rule. For several
 rules with different priorities, edit the file. Rules are evaluated top-down and
@@ -172,15 +232,30 @@ and see what actually drops before narrowing it.
 
 ## Keeping it running
 
-The server has to be up whenever Chrome is relaying. Simplest is a terminal
-window left open. To start it automatically at logon:
+The server has to be up whenever Chrome is relaying. Compose sets
+`restart: unless-stopped`, so **reviewer-item-notifier** comes back automatically
+when Docker Desktop starts. There is no PowerShell window to leave open. Docker
+Desktop shows whether it is healthy and has a **Logs** tab; the command-line
+equivalents are:
 
 ```powershell
-schtasks /create /tn "Reviewer Notifier" /tr "powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\Users\Navi\Documents\repos\walmart_notifier\run.ps1" /sc onlogon
+docker compose ps
+docker compose logs -f notifier
+docker compose restart notifier
 ```
 
-A sleeping machine relays nothing. That gap is real and there is no clean way to
-close it without a credential bot, which this project deliberately does not do.
+`restart` is for restarting the same configuration. After changing
+`notifier.env`, use `docker compose up -d --force-recreate` so the new settings
+are loaded.
+
+Use `docker compose stop` when you intentionally want it off, and
+`docker compose start` to resume it. Docker Desktop, Chrome, the signed-in
+reviewer tab, and the computer must still be running. A sleeping machine relays
+nothing; moving the computer to a different internet network is fine.
+
+The bind mount `./data:/app/data` means rebuilding or replacing the container
+does not reset saved rules or dedupe history. Do not run multiple notifier
+containers against that directory at once.
 
 ## What the extension actually reads
 
@@ -197,12 +272,23 @@ Per item card, from the page you already have open:
 
 ## Development
 
+To run without Docker, install Python 3.11+ and use the original launcher:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\pip install -r src\requirements.txt
+.\run.ps1
+```
+
+Stop the Docker container first so port 8787 is available.
+
 ```powershell
 .venv\Scripts\pip install pytest ruff
 ```
 
 ```powershell
-.venv\Scripts\python -m pytest        # 129 tests
+.venv\Scripts\python -m pytest
+node --test tests\test_extension_runtime.mjs
 ```
 
 Tests use an in-memory store and a fake notifier — no network, and the HTTP
@@ -212,13 +298,14 @@ tests bind a real server to an ephemeral port.
 
 | Path | |
 |---|---|
-| `src/server.py` | Local HTTP server: `/ingest`, `/health`, `/rules` |
+| `src/server.py` | Local HTTP server: `/ingest`, `/health`, `/rules`, `/test-notification` |
 | `src/pipeline.py` | source → filter → dedupe → notify |
 | `src/filters.py` | Rule engine |
-| `src/state.py` | Dedupe file (`data/seen.json`), atomic writes |
+| `src/state.py` | Recorded-item state (`data/seen.json`) plus in-memory delivery claims |
 | `src/sources/parsing.py` | Item/price extraction from raw markup (fallback path) |
 | `src/notifiers/` | ntfy, Pushover, Telegram |
 | `extension/` | MV3 browser companion — reads the page, drives the refresh |
-| `run.ps1` / `notifier.example.env` | Launcher and settings template |
-| `tests/` | 129 tests |
+| `Dockerfile` / `compose.yaml` | Recommended notifier runtime |
+| `run.ps1` / `notifier.example.env` | Python fallback and settings template |
+| `tests/` | Python and extension runtime tests |
 | `docs/architecture.md` | Design notes and failure behaviour |

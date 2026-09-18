@@ -10,6 +10,7 @@ const UI_RULE_NAME = 'my-filters';
 const $ = (id) => document.getElementById(id);
 
 const endpointEl = $('endpoint');
+const endpointErrorEl = $('endpointError');
 const tokenEl = $('token');
 const pathEl = $('pathPattern');
 const pathErrorEl = $('pathError');
@@ -27,6 +28,64 @@ const alertUnknownEl = $('alertUnknown');
 const rulesBannerEl = $('rulesBanner');
 const rulesSavedEl = $('rulesSaved');
 const rulesErrorEl = $('rulesError');
+const checkConnectionEl = $('checkConnection');
+const testNotificationEl = $('testNotification');
+const testResultEl = $('testResult');
+
+let activeRule = null;
+let lastHealth = null;
+let lastHealthError = '';
+
+/** Resolve a server route while refusing to send the optional token off-device. */
+function localUrl(path) {
+  const base = new URL(endpointEl.value.trim() || DEFAULT_ENDPOINT);
+  if (base.protocol !== 'http:' || !['127.0.0.1', 'localhost'].includes(base.hostname)) {
+    throw new Error('Use an http://127.0.0.1 or http://localhost endpoint.');
+  }
+  if (base.username || base.password || base.pathname.replace(/\/+$/, '') !== '/ingest' ||
+      base.search || base.hash) {
+    throw new Error('The endpoint must end exactly in /ingest, with no credentials or query.');
+  }
+  return new URL(path, base.origin).toString();
+}
+
+function authHeaders() {
+  const token = tokenEl.value.trim();
+  return token ? { 'X-Ingest-Token': token } : {};
+}
+
+/**
+ * Fetch from a visible extension page. This is an explicit connection check
+ * and a place for affected Chrome builds or policies to show an LNA prompt.
+ */
+function localFetch(url, init = {}, timeoutMs = 15_000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  return fetch(url, {
+    ...init,
+    // localUrl() guarantees a literal loopback destination, so Chrome can
+    // classify it correctly across both PNA-era and current LNA builds.
+    signal: controller.signal
+  }).finally(() => clearTimeout(timeout));
+}
+
+function connectionError(err, url = DEFAULT_ENDPOINT) {
+  const detail = err?.message || String(err);
+  if (err?.status === 403 || /\bHTTP\s+403\b/i.test(detail)) {
+    return `The notifier at ${url} rejected the API token (HTTP 403). The extension's Ingest token ` +
+      `likely does not match INGEST_TOKEN; update it, save the connection settings, and try again.`;
+  }
+  if (err?.name === 'AbortError') {
+    return `The notifier request at ${url} timed out. Check that the reviewer-item-notifier container ` +
+      `is running in Docker Desktop (or run run.ps1), then try again.`;
+  }
+  if (/failed to fetch|networkerror|load failed/i.test(detail)) {
+    return `Could not connect to ${url}. Start the reviewer-item-notifier container in Docker Desktop ` +
+      `(or run run.ps1), then click Check connection ` +
+      `and allow Chrome's local-network prompt if it appears. (${detail})`;
+  }
+  return `Notifier request failed at ${url}: ${detail}`;
+}
 
 // --- connection settings ----------------------------------------------------
 
@@ -39,10 +98,18 @@ chrome.storage.local
     refreshEl.value = refreshMinutes;
     pageDelayEl.value = pageDelaySeconds;
     pathEl.value = pathPattern;
-    loadRules();
+    loadRules().finally(renderStatus);
   });
 
 $('save').addEventListener('click', async () => {
+  try {
+    localUrl('/ingest');
+  } catch (err) {
+    endpointErrorEl.textContent = err.message;
+    return;
+  }
+  endpointErrorEl.textContent = '';
+
   const pattern = pathEl.value.trim() || DEFAULT_PATH_PATTERN;
   try {
     new RegExp(pattern);
@@ -57,20 +124,17 @@ $('save').addEventListener('click', async () => {
     token: tokenEl.value.trim(),
     pathPattern: pattern,
     pageDelaySeconds: Math.min(60, Math.max(1, parseInt(pageDelayEl.value, 10) || 5)),
-    refreshMinutes: Math.max(0, parseInt(refreshEl.value, 10) || 0)
+    refreshMinutes: Math.min(120, Math.max(0, parseInt(refreshEl.value, 10) || 0))
   });
   flash(savedEl, 'Saved');
+  renderStatus();
 });
 
 // --- alert filters ----------------------------------------------------------
 
 /** The rules endpoint sits alongside whatever /ingest the user configured. */
 function rulesUrl() {
-  try {
-    return new URL('/rules', endpointEl.value.trim() || DEFAULT_ENDPOINT).toString();
-  } catch {
-    return new URL('/rules', DEFAULT_ENDPOINT).toString();
-  }
+  return localUrl('/rules');
 }
 
 async function rulesFetch(method, body) {
@@ -79,7 +143,7 @@ async function rulesFetch(method, body) {
   if (token) headers['X-Ingest-Token'] = token;
   if (body !== undefined) headers['Content-Type'] = 'application/json';
 
-  const resp = await fetch(rulesUrl(), {
+  const resp = await localFetch(rulesUrl(), {
     method,
     headers,
     body: body === undefined ? undefined : JSON.stringify(body)
@@ -90,7 +154,8 @@ async function rulesFetch(method, body) {
     parsed = JSON.parse(text);
   } catch { /* server sent plain text */ }
   if (!resp.ok) {
-    throw new Error(parsed?.error || text || `HTTP ${resp.status}`);
+    const detail = parsed?.error || text;
+    throw new Error(`HTTP ${resp.status}${detail ? `: ${detail}` : ''}`);
   }
   return parsed;
 }
@@ -100,6 +165,7 @@ const parseCsv = (value) =>
   (value || '').split(',').map((s) => s.trim()).filter(Boolean);
 
 function fillForm(rule) {
+  activeRule = rule || {};
   minEl.value = rule.min_value_usd ?? '';
   maxEl.value = rule.max_value_usd ?? '';
   keywordsEl.value = csv(rule.keywords);
@@ -142,8 +208,9 @@ async function loadRules() {
     rulesErrorEl.textContent = '';
   } catch (err) {
     banner('');
-    rulesErrorEl.textContent =
-      `Could not reach the notifier at ${rulesUrl()} — is run.ps1 running? (${err.message})`;
+    rulesErrorEl.textContent = connectionError(
+      err, endpointEl.value.trim() || DEFAULT_ENDPOINT
+    );
   }
 }
 
@@ -192,23 +259,68 @@ $('resetRules').addEventListener('click', async () => {
 });
 
 $('resetSweep').addEventListener('click', async () => {
-  // Clears progress only. The dedupe store lives on the notifier and is
-  // deliberately untouched -- wiping it would re-alert on the whole catalogue.
-  const all = await chrome.storage.local.get(null);
-  const sweepKeys = Object.keys(all).filter((k) => k === 'sweep' || k.startsWith('sweep:'));
-  await chrome.storage.local.remove([...sweepKeys, 'lastSweepPages', 'lastSweepDone']);
   try {
-    const tabs = await chrome.tabs.query({ url: 'https://www.walmart.com/reviews/*' });
-    for (const tab of tabs) {
-      const url = new URL(tab.url);
-      url.searchParams.delete('page');
-      await chrome.tabs.update(tab.id, { url: url.toString() });
+    // The background coordinator owns the active tab and generation. Asking it
+    // to restart prevents passive fallback tabs from racing the new sweep.
+    const result = await chrome.runtime.sendMessage({ type: 'reviewer:restart' });
+    if (!result?.ok) {
+      throw new Error(result?.error || 'No reachable reviewer tab is open.');
     }
-    flash(savedEl, tabs.length ? 'Sweep restarted' : 'Cleared (no reviewer tab open)');
+    flash(savedEl, 'Sweep restarted');
   } catch (err) {
-    flash(savedEl, `Cleared, but could not reload the tab: ${err.message}`);
+    flash(savedEl, `Could not restart the sweep: ${err.message}`);
   }
   renderStatus();
+});
+
+checkConnectionEl.addEventListener('click', async () => {
+  checkConnectionEl.disabled = true;
+  endpointErrorEl.textContent = '';
+  try {
+    const resp = await localFetch(localUrl('/health'), {
+      cache: 'no-store', headers: authHeaders()
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    lastHealth = await resp.json();
+    flash(savedEl, `Connected to ${lastHealth.notifier || 'notifier'}`);
+    await loadRules();
+  } catch (err) {
+    endpointErrorEl.textContent = connectionError(err, endpointEl.value.trim());
+  } finally {
+    checkConnectionEl.disabled = false;
+    renderStatus();
+  }
+});
+
+testNotificationEl.addEventListener('click', async () => {
+  testNotificationEl.disabled = true;
+  testResultEl.textContent = '';
+  testResultEl.className = '';
+  const headers = {};
+  const token = tokenEl.value.trim();
+  if (token) headers['X-Ingest-Token'] = token;
+  try {
+    const resp = await localFetch(localUrl('/test-notification'), {
+      method: 'POST', headers
+    }, 25_000);
+    const payload = await resp.json().catch(() => ({}));
+    if (!resp.ok || !payload.ok) {
+      throw new Error(payload.detail || payload.error || `HTTP ${resp.status}`);
+    }
+    if (payload.detail) {
+      testResultEl.className = 'warn';
+      testResultEl.textContent = `Test push sent. ${payload.detail}`;
+    } else {
+      testResultEl.className = 'saved';
+      flash(testResultEl, 'Test alert sent');
+    }
+  } catch (err) {
+    testResultEl.className = 'err';
+    testResultEl.textContent = connectionError(err, endpointEl.value.trim() || DEFAULT_ENDPOINT);
+  } finally {
+    testNotificationEl.disabled = false;
+    renderStatus();
+  }
 });
 
 function flash(el, message) {
@@ -237,39 +349,83 @@ function line(cls, strong, rest = '') {
   return div;
 }
 
-/** Total distinct items the notifier has ever recorded, or null if unreachable. */
-async function knownItemCount() {
+/** Health and safe aggregate diagnostics, or null when the server is unreachable. */
+async function serverHealth() {
   try {
-    const url = new URL('/health', endpointEl.value.trim() || DEFAULT_ENDPOINT);
-    const resp = await fetch(url.toString());
-    if (!resp.ok) return null;
-    return (await resp.json()).seen_items ?? null;
-  } catch {
+    const resp = await localFetch(localUrl('/health'), { headers: authHeaders() });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    lastHealth = await resp.json();
+    lastHealthError = '';
+    return lastHealth;
+  } catch (err) {
+    lastHealthError = connectionError(err, endpointEl.value.trim() || DEFAULT_ENDPOINT);
     return null;
   }
 }
 
-/** The sweep record of the reviewer tab, plus how many such tabs exist. */
+/** The coordinator-selected sweep and the number of eligible fallback tabs. */
 async function activeSweep() {
   try {
-    const tabs = await chrome.tabs.query({ url: 'https://www.walmart.com/reviews/*' });
-    if (!tabs.length) return { sweep: null, tabCount: 0 };
-    const stored = await chrome.storage.local.get(tabs.map((t) => `sweep:${t.id}`));
-    const sweep = tabs.map((t) => stored[`sweep:${t.id}`]).find(Boolean) || null;
-    return { sweep, tabCount: tabs.length };
+    const status = await chrome.runtime.sendMessage({ type: 'reviewer:status' });
+    if (!status?.ok) return { sweep: null, tabCount: 0 };
+    // A tab failover can leave an old per-tab sweep record around until the
+    // newly selected content script writes its first progress update. Never
+    // combine that stale record with the latest page result.
+    const sweep = status.sweep?.generation === status.generation
+      ? status.sweep
+      : null;
+    return { sweep, tabCount: status.tabCount || 0 };
   } catch {
     return { sweep: null, tabCount: 0 };
   }
 }
 
+/**
+ * Include a page whose ingest has completed but whose content script has not
+ * yet persisted the matching `visited` update. That small hand-off window is
+ * otherwise visible as "page 20" beside "19 pages done".
+ */
+function completedSweepPages(sweep, {
+  lastPage, lastRelay, lastFailed = 0, lastPending = 0
+}) {
+  const total = Number(sweep?.total);
+  const visited = new Set(
+    (Array.isArray(sweep?.visited) ? sweep.visited : [])
+      .filter((page) => Number.isInteger(page) && page > 0 &&
+        (!Number.isInteger(total) || page <= total))
+  );
+  if (!Number.isInteger(total) || total < 1) return visited.size;
+
+  const page = Number(lastPage);
+  const relayAt = Number(lastRelay);
+  const startedAt = Number(sweep?.startedAt);
+  const progressedAt = Number(sweep?.lastProgressAt);
+  let next = 1;
+  while (next <= total && visited.has(next)) next += 1;
+
+  const belongsToThisSweep = Number.isInteger(page) && page === next &&
+    Number.isFinite(relayAt) && Number.isFinite(startedAt) && relayAt >= startedAt &&
+    (!Number.isFinite(progressedAt) || relayAt >= progressedAt);
+  const deliveryComplete = !Number(lastFailed) && !Number(lastPending);
+  if (belongsToThisSweep && deliveryComplete) visited.add(page);
+  return Math.min(visited.size, total);
+}
+
 async function renderStatus() {
   const { endpoint = DEFAULT_ENDPOINT, lastRelay, lastSeen = 0, lastNotified = 0,
-          lastPage = 1, lastError = '', lastErrorAt, lastSweepPages,
-          lastSweepDone } = await chrome.storage.local.get(
+          lastNew = 0, lastDuplicates = Math.max(0, lastSeen - lastNew),
+          lastFiltered = 0, lastMatched = 0, lastFailed = 0, lastPending = 0,
+          lastSeeded = 0,
+          lastValueKnown = 0, lastValueUnknown = 0, lastMinValue = null,
+          lastMaxValue = null, lastPage = 1, lastError = '', lastErrorAt,
+          lastSweepPages, lastSweepDone } = await chrome.storage.local.get(
     ['endpoint', 'lastRelay', 'lastSeen', 'lastNotified', 'lastPage',
-     'lastError', 'lastErrorAt', 'lastSweepPages', 'lastSweepDone']
+     'lastNew', 'lastDuplicates', 'lastFiltered', 'lastMatched', 'lastFailed',
+     'lastPending', 'lastSeeded', 'lastValueKnown', 'lastValueUnknown', 'lastMinValue',
+     'lastMaxValue', 'lastError', 'lastErrorAt', 'lastSweepPages', 'lastSweepDone']
   );
   const { sweep, tabCount } = await activeSweep();
+  const health = await serverHealth();
 
   // Built as nodes rather than an HTML string: lastError can contain a server
   // response, and that must never be parsed as markup.
@@ -279,26 +435,62 @@ async function renderStatus() {
   } else if (!lastRelay) {
     frag.appendChild(line(
       'warn', 'Nothing relayed yet.',
-      'Is run.ps1 running? Open your reviewer page in a tab — status updates once it sends.'
+      'Is the reviewer-item-notifier container running? (run.ps1 also works.) Open your reviewer page ' +
+      'in a tab — status updates once it sends.'
     ));
   } else {
     const stale = Date.now() - lastRelay > 60 * 60 * 1000;
     frag.appendChild(line(
       stale ? 'warn' : 'ok',
-      `Last relayed ${ago(lastRelay)}`,
-      `— page ${lastPage}, ${lastSeen} item${lastSeen === 1 ? '' : 's'}, ` +
-      `${lastNotified} alerted.`
+      `Latest page result (relayed ${ago(lastRelay)})`,
+      `— page ${lastPage}, ${lastSeen} item${lastSeen === 1 ? '' : 's'}: ` +
+      `${lastNew} new, ${lastDuplicates} already recorded, ${lastMatched} matched, ` +
+      `${lastNotified} alerted on this page.`
     ));
+    if (lastFiltered) {
+      frag.appendChild(line(
+        'hint', `${lastFiltered} new item${lastFiltered === 1 ? '' : 's'} on this page ` +
+          `did not match the filters.`
+      ));
+    }
+    if (lastFailed) {
+      frag.appendChild(line(
+        'bad', `${lastFailed} matched alert${lastFailed === 1 ? '' : 's'} failed delivery.`,
+        'The relay will keep this page open and retry.'
+      ));
+    }
+    if (lastPending) {
+      frag.appendChild(line(
+        'warn', `${lastPending} delivery attempt${lastPending === 1 ? ' is' : 's are'} still running.`,
+        'The relay will keep this page open until the result is known.'
+      ));
+    }
+    if (lastSeeded) {
+      frag.appendChild(line('warn', `${lastSeeded} item${lastSeeded === 1 ? '' : 's'} seeded; alerts were intentionally disabled.`));
+    }
+    if (lastValueKnown || lastValueUnknown) {
+      let range = '';
+      if (lastMinValue !== null && lastMaxValue !== null) {
+        range = lastMinValue === lastMaxValue
+          ? ` Values on this page: $${Number(lastMinValue).toFixed(2)}.`
+          : ` Values on this page: $${Number(lastMinValue).toFixed(2)}–$${Number(lastMaxValue).toFixed(2)}.`;
+      }
+      frag.appendChild(line(
+        'hint', `${lastValueKnown} value${lastValueKnown === 1 ? '' : 's'} parsed; ` +
+          `${lastValueUnknown} unknown.${range}`
+      ));
+    }
     // Per-page counts read like total coverage; show sweep progress too.
     if (tabCount > 1) {
       frag.appendChild(line(
-        'warn', `${tabCount} reviewer tabs open.`,
-        'Each runs its own sweep and they will cover the same pages twice. ' +
-        'Close all but one.'
+        'hint', `${tabCount} reviewer tabs open.`,
+        'Only the first reachable tab is active; the others are passive fallbacks.'
       ));
     }
     if (sweep && sweep.total) {
-      const done = (sweep.visited || []).length;
+      const done = completedSweepPages(sweep, {
+        lastPage, lastRelay, lastFailed, lastPending
+      });
       frag.appendChild(line(
         'hint', `Sweep in progress: ${done} of ${sweep.total} pages done.`
       ));
@@ -309,13 +501,42 @@ async function renderStatus() {
         (lastSweepDone ? `, finished ${ago(lastSweepDone)}.` : '.')
       ));
     }
-    const total = await knownItemCount();
-    if (total !== null) {
-      frag.appendChild(line('hint', `${total} distinct items recorded so far.`));
+    if (health?.seen_items !== undefined) {
+      frag.appendChild(line('hint', `${health.seen_items} distinct items recorded so far.`));
     }
     if (stale) {
       frag.appendChild(line('hint', 'Over an hour ago.', 'Is the reviewer tab still open?'));
     }
+  }
+  if (health) {
+    const provider = health.notifier || 'notifier';
+    frag.appendChild(line(
+      health.notifier_configured ? 'ok' : 'bad',
+      health.notifier_configured ? `${provider} configured.` : 'No notification provider configured.'
+    ));
+    if (health.seed_mode) {
+      frag.appendChild(line('bad', 'Seed mode is on.', 'Items are recorded but no alerts are sent.'));
+    }
+    if (health.notifier_diagnostic) {
+      frag.appendChild(line('warn', 'Notification provider note:', health.notifier_diagnostic));
+    }
+    const observedMax = health.observed_values?.max_value_usd;
+    const floor = activeRule?.min_value_usd;
+    if (Number.isFinite(floor) && Number.isFinite(observedMax) && floor > observedMax) {
+      frag.appendChild(line(
+        'warn', `Your $${Number(floor).toFixed(2)} minimum is above the highest recorded value ` +
+          `($${Number(observedMax).toFixed(2)}).`,
+        'No known-value item can match that minimum.'
+      ));
+    }
+  } else if (endpoint) {
+    const tokenRejected = /rejected the API token \(HTTP 403\)/i.test(lastHealthError);
+    frag.appendChild(line(
+      'bad', tokenRejected ? 'API token mismatch.' : 'Notifier is unreachable.',
+      lastHealthError ||
+        'Start the reviewer-item-notifier container in Docker Desktop (or run run.ps1), then click ' +
+        'Check connection and approve local-network access if Chrome asks.'
+    ));
   }
   if (lastError) {
     frag.appendChild(line(

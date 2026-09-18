@@ -1,4 +1,6 @@
 
+import pytest
+
 from filters import Rule, first_match, matches
 from models import Item
 
@@ -24,6 +26,14 @@ class TestMinValue:
     def test_unknown_value_can_be_suppressed(self):
         rule = Rule(min_value_usd=100, alert_on_unknown_value=False)
         assert not matches(item(value=None), rule)
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), True, -1, 10**400])
+    def test_invalid_values_follow_the_unknown_value_setting(self, bad):
+        assert matches(item(value=bad), Rule(min_value_usd=100))
+        assert not matches(
+            item(value=bad),
+            Rule(min_value_usd=100, alert_on_unknown_value=False),
+        )
 
     def test_max_value_bound(self):
         rule = Rule(max_value_usd=50)
@@ -79,3 +89,54 @@ class TestFirstMatch:
     def test_returns_none_when_nothing_matches(self):
         assert first_match(item(value=5.0), [Rule(min_value_usd=100,
                                                   alert_on_unknown_value=False)]) is None
+
+
+class TestRuleConfiguration:
+    def test_normalizes_safe_string_fields(self):
+        rule = Rule.from_dict({
+            "name": "  wanted  ",
+            "keywords": [" air fryer "],
+            "exclude_keywords": [" toy "],
+            "categories": [" clearance "],
+            "priority": " HIGH ",
+        })
+
+        assert rule.name == "wanted"
+        assert rule.keywords == ["air fryer"]
+        assert rule.exclude_keywords == ["toy"]
+        assert rule.categories == ["clearance"]
+        assert rule.priority == "high"
+
+    @pytest.mark.parametrize("field", ["keywords", "exclude_keywords", "categories"])
+    @pytest.mark.parametrize("bad", ["tv", [1], ["  "]])
+    def test_string_lists_reject_wrong_or_empty_entries(self, field, bad):
+        with pytest.raises((TypeError, ValueError), match=field):
+            Rule.from_dict({field: bad})
+
+    @pytest.mark.parametrize("field", ["min_value_usd", "max_value_usd"])
+    @pytest.mark.parametrize(
+        "bad", ["50", True, -0.01, float("inf"), float("nan"), 10**1_000]
+    )
+    def test_value_bounds_reject_unsafe_numbers(self, field, bad):
+        with pytest.raises((TypeError, ValueError), match=field):
+            Rule.from_dict({field: bad})
+
+    def test_minimum_cannot_exceed_maximum(self):
+        with pytest.raises(ValueError, match="must not exceed"):
+            Rule.from_dict({"min_value_usd": 51, "max_value_usd": 50})
+
+    @pytest.mark.parametrize("field", ["match_all_keywords", "alert_on_unknown_value"])
+    @pytest.mark.parametrize("bad", [0, 1, "true", None])
+    def test_boolean_fields_require_real_booleans(self, field, bad):
+        with pytest.raises(TypeError, match=field):
+            Rule.from_dict({field: bad})
+
+    @pytest.mark.parametrize("bad", ["critical", "", 4, None])
+    def test_priority_must_be_supported(self, bad):
+        with pytest.raises(ValueError, match="priority"):
+            Rule.from_dict({"priority": bad})
+
+    @pytest.mark.parametrize("bad", ["", "   ", 7, None])
+    def test_name_must_be_a_non_empty_string(self, bad):
+        with pytest.raises(ValueError, match="name"):
+            Rule.from_dict({"name": bad})

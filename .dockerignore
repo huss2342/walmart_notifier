@@ -1,0 +1,6 @@
+# Allowlist the only directory copied into the runtime image. This keeps
+# notifier.env, runtime state, browser data, and unrelated local files out of
+# the build context entirely.
+**
+!src/
+!src/**

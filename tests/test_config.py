@@ -1,10 +1,13 @@
 import json
+import threading
+from pathlib import Path
 
 import pytest
 
 from config import (
     clear_user_rules,
     load_rules,
+    rules_snapshot,
     rules_source,
     rules_to_dicts,
     save_user_rules,
@@ -55,6 +58,23 @@ def test_bad_json_falls_back_to_bundled_defaults(monkeypatch):
     # single-rule default.
     names = [r.name for r in load_rules()]
     assert names == ["expensive", "watched-keywords"]
+
+
+def test_invalid_inline_rule_fields_fall_back_to_bundled_defaults(monkeypatch):
+    monkeypatch.setenv("RULES_JSON", json.dumps({
+        "rules": [{"name": "broken", "min_value_usd": "fifty"}]
+    }))
+    assert [rule.name for rule in load_rules()] == ["expensive", "watched-keywords"]
+
+
+def test_invalid_inline_rules_report_the_successful_fallback_source(monkeypatch):
+    monkeypatch.setenv("RULES_JSON", "{not json")
+
+    rules, source = rules_snapshot()
+
+    assert [rule.name for rule in rules] == ["expensive", "watched-keywords"]
+    assert source == "bundled"
+    assert rules_source() == "bundled"
 
 
 def test_missing_everything_uses_hardcoded_default(monkeypatch, tmp_path):
@@ -135,6 +155,78 @@ def test_invalid_rules_are_rejected_before_anything_is_written(user_rules):
         with pytest.raises(ValueError):
             save_user_rules(bad)
     assert not user_rules.exists()
+
+
+@pytest.mark.parametrize("bad_rule", [
+    {"min_value_usd": "50"},
+    {"max_value_usd": -1},
+    {"min_value_usd": 20, "max_value_usd": 10},
+    {"keywords": "television"},
+    {"exclude_keywords": ["toy", 3]},
+    {"categories": [None]},
+    {"match_all_keywords": "false"},
+    {"alert_on_unknown_value": 1},
+    {"priority": "critical"},
+])
+def test_invalid_rule_fields_are_rejected_before_writing(user_rules, bad_rule):
+    with pytest.raises((TypeError, ValueError)):
+        save_user_rules({"rules": [bad_rule]})
+    assert not user_rules.exists()
+
+
+def test_mixed_valid_and_non_object_rules_are_rejected(user_rules):
+    with pytest.raises(ValueError, match="every rule"):
+        save_user_rules({"rules": [{"name": "valid"}, "not-a-rule"]})
+    assert not user_rules.exists()
+
+
+def test_concurrent_rule_saves_are_serialized(monkeypatch, user_rules):
+    """Threaded HTTP PUTs must not race through the shared rules.tmp file."""
+    real_write_text = Path.write_text
+    first_inside = threading.Event()
+    release_first = threading.Event()
+    second_inside = threading.Event()
+    calls_lock = threading.Lock()
+    calls = 0
+
+    def controlled_write(path, *args, **kwargs):
+        nonlocal calls
+        if path == user_rules.with_suffix(".tmp"):
+            with calls_lock:
+                calls += 1
+                call_number = calls
+            if call_number == 1:
+                first_inside.set()
+                assert release_first.wait(timeout=5)
+            else:
+                second_inside.set()
+        return real_write_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", controlled_write)
+    errors = []
+
+    def save(name):
+        try:
+            save_user_rules({"rules": [{"name": name}]})
+        except Exception as exc:  # pragma: no cover - assertion reports details
+            errors.append(exc)
+
+    first = threading.Thread(target=save, args=("first",))
+    second = threading.Thread(target=save, args=("second",))
+    first.start()
+    assert first_inside.wait(timeout=5)
+    second.start()
+
+    # The second writer cannot reach the shared temp path while the first owns
+    # the process-wide rules lock.
+    assert not second_inside.wait(timeout=0.1)
+    release_first.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert errors == []
+    assert load_rules()[0].name == "second"
 
 
 def test_saved_rules_round_trip_every_field(user_rules):

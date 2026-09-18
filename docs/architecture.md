@@ -17,6 +17,14 @@ key, a Key Vault round trip, a CORS failure mode, and the monthly cost. What it
 gave up: alerting while this machine is off — which was never real anyway, since
 the browser tab has to be open for items to be read.
 
+The notifier normally runs in a small Docker container on that same machine.
+Docker is only a process supervisor and visibility layer here: Chrome and the
+signed-in reviewer tab remain on the host, while `data/seen.json` and
+`data/rules.json` are bind-mounted from the repository so replacing the
+container cannot erase them. The host publishes the service only at
+`127.0.0.1:8787`, so changing Wi-Fi networks does not affect the extension and
+does not expose the listener to that network.
+
 ## Why there is no credential-login source
 
 The obvious design — store the Walmart password, sign in on a schedule, scrape
@@ -78,9 +86,12 @@ claimed is pure noise. `Free items remaining: N` is read once per page and
 attached to each item, because zero claims left decides whether an alert is
 actionable.
 
-`src/sources/parsing.py` is a separate, server-side extractor for raw HTML
-posted to `/ingest`. It is the fallback path, kept because it is well tested and
-costs nothing; the structured JSON the extension sends does not go through it.
+`src/sources/parsing.py` remains a separate extractor for raw HTML used by
+non-HTTP and legacy callers. The HTTP `/ingest` contract accepts only UTF-8
+`application/json` and validates the complete item array before processing it.
+Malformed, oversized, or partly invalid batches return an error; they never
+degrade to an empty successful relay that lets the browser advance past data
+the server did not understand.
 
 ## Price association in the markup fallback
 
@@ -103,35 +114,52 @@ Two failure modes it is built to avoid, both covered by regression tests in
 
 ## The extension's refresh loop
 
+The service worker is a coordinator, not merely a timer. It sorts eligible tabs
+by window, position, and tab id, leases the first reachable tab as the sole
+active reviewer, and tells every other eligible tab to remain passive. The
+lease includes a generation number. Reports from a former document or a tab
+that lost the lease are rejected even if they finish after a reload or failover.
+The current active tab stays sticky while it remains reachable, so opening or
+moving another tab does not interrupt a sweep.
+
 The reload schedule lives in `background.js`, not in the content script. A
 content script dies with its page, so a reload landing on a sign-in redirect or
-a bot-check interstitial would end the loop permanently and silently — exactly
-the state the refresh exists to escape. A `chrome.alarms` alarm in the service
-worker keeps firing regardless of what the tab currently shows, and asks the
-content script whether the user is mid-interaction before reloading. A tab with
-no content script answering is reloaded anyway.
+a bot-check interstitial could otherwise end the loop permanently and silently.
+A one-shot `chrome.alarms` alarm is always re-armed. It probes the active tab,
+defers while a sweep or user interaction is in progress, repairs stale sweeps,
+reloads an eligible tab whose content script disappeared, and selects a passive
+fallback if the active tab is no longer usable.
 
-Change detection also lives in the background worker. In the content script it
-was reinitialised on every reload, so each refresh re-POSTed the whole page.
+Relaying a page is transactional from the browser's point of view. The content
+script does not add the page to `visited[]` until the service worker receives a
+successful server summary under the same lease generation. A network error, an
+HTTP error, a failed notification, or another request still delivering an item
+is a negative acknowledgement. The same page stays open and retries after
+jittered delays of 2, 5, 15, 30, then at most 60 seconds.
 
 The worker posts to a different origin than the pages it reads, so the manifest
-needs `http://127.0.0.1/*` in `host_permissions`. Without it the fetch is
-subject to CORS and every relay fails silently. The server answers preflight for
-`chrome-extension://` origins anyway — belt and braces, because this exact
-mistake shipped once already.
+permits only `http://127.0.0.1/*` and `http://localhost/*`. Fetches explicitly
+use those literal loopback hosts and do not set `targetAddressSpace`: current
+LNA calls that address space `loopback`, while older PNA-era Chrome called it
+`local`, so letting Chrome classify the literal is correct across both naming
+schemes. Current Chrome authorizes extension-origin requests through the host
+permissions; the visible **Check connection** action also verifies the server
+directly and can surface a Local Network Access prompt on affected builds or
+managed policies. The server answers extension CORS and older Private Network
+Access preflights for compatibility.
 
 ## Pagination
 
 A sweep visits every page once. Progress is an explicit `{total, visited[]}`
-record in `chrome.storage.local`, keyed **per tab** (`sweep:<tabId>`), not an
-inference from the current URL.
+record in `chrome.storage.local`, keyed to the **active tab**
+(`sweep:<tabId>`), not an inference from the current URL. When the lease moves,
+inactive progress keys are removed so a fallback cannot resume another tab's
+stale navigation.
 
-The per-tab key matters: several reviewer tabs sharing one record stomped each
-other. Each read the other's visited pages, so both walks jumped around, and
-the "unknown total" fallback -- highest visited page plus one -- climbed far
-past the real page count, reaching page 120 of a 24-page catalogue. The options
-page now also warns when more than one reviewer tab is open, since two tabs
-cover the same pages twice for no benefit.
+The one-active-tab rule matters: several independent reviewer tabs previously
+stomped shared progress and walked the same catalogue in parallel. A user may
+still leave several reviewer tabs open, but only the deterministic primary
+sweeps; the Options page identifies the others as passive fallbacks.
 
 Deriving the next page as "current + 1" failed in practice: Walmart rewrites
 the query string between loads (`page` appears before `affinityOverride` on one
@@ -195,7 +223,14 @@ options page says so in a banner rather than letting someone edit a form that
 silently does nothing.
 
 Rules are re-read per request. At one relay every few minutes that cost is
-nothing, and it buys edits that apply without a restart.
+nothing, and it buys edits that apply without a restart. They are evaluated
+only for newly observed items. Matching, filtered, and seed-mode items are all
+recorded, so changing a rule affects future arrivals and does not replay an old
+backlog. The state file is therefore a handled-item ledger, not an alert log.
+
+The HTTP server is threaded, so rule-file reads, saves, and resets share one
+process-wide lock. A save validates the whole rule set before an atomic replace,
+and a response obtains the rules and source from the same locked snapshot.
 
 ## Identity and dedupe
 
@@ -203,35 +238,63 @@ nothing, and it buys edits that apply without a restart.
 so a retitled listing does not re-alert. Without a URL it falls back to a hash
 of the normalised title.
 
-State is `data/seen.json`. Writes go to a temp file and are then renamed over
-the target, so a crash mid-write leaves the previous good file rather than a
-truncated one — losing that file means re-alerting on everything. The file is
-trimmed to the newest 20,000 entries; the portal shows around 971 items today,
-so that is generous headroom.
+Persisted state is `data/seen.json`. Writes go to a temp file and are then
+renamed over the target, so a crash mid-write leaves the previous good file
+rather than a truncated one — losing that file means re-alerting on everything.
+The file is trimmed to the newest 20,000 entries; the portal shows around 971
+items today, so that is generous headroom.
 
-`SeenStore.claim` is check-and-insert under one lock. The server handles each
-request on its own thread and several tabs can relay the same item at the same
-moment, so a separate read-then-write would let one item buzz twice.
+`SeenStore.claim` reserves a matching item under one lock, but that pending
+claim lives only in memory. It becomes a persisted record only after the
+notifier reports success. An overlapping HTTP request sees `pending`, does not
+run changed filters over the in-flight item, and returns a retry signal to the
+browser. This closes the race between a timed-out request and its retry without
+turning a crash during delivery into a permanently missed alert.
+
+There is an unavoidable ambiguity if the process dies after the provider
+accepts a notification but before `commit()`: the next run may send a duplicate.
+The design intentionally prefers that possible duplicate to silently losing an
+alert. Once committed, matching and non-matching items deduplicate identically.
 
 ## Failure behaviour
 
 Deliberate choices about what happens when something breaks:
 
-- **Delivery failure releases the item's claim**, so the next relay retries
-  instead of silently swallowing an item you wanted.
+- **Delivery failure releases the in-memory claim**, and both failed and
+  still-pending counts are negative acknowledgements. The active browser tab
+  keeps the same page open and retries instead of silently swallowing an item.
 - **Non-matching items are still marked seen**, so loosening a rule later does
   not replay every old listing at once.
 - **A misconfigured notifier degrades to `NullNotifier`** and logs, rather than
   crashing the server.
-- **An unparseable payload yields zero items, not an error.** The relay posting
-  something odd must never take the notifier down.
+- **Malformed HTTP JSON is rejected with a 400**, including a mixed batch with
+  one invalid item. The extension receives a negative acknowledgement and does
+  not mark that page visited. The tolerant markup parser remains isolated from
+  this HTTP contract.
+- **`POST /test-notification` bypasses filters and state** so connection and
+  provider delivery can be diagnosed independently of catalog extraction.
+- **ntfy quota errors open circuit breakers.** Public `ntfy.sh` currently
+  allows 250 messages per day; code `42908` suppresses further publish attempts
+  until midnight UTC. Email-only failures pause email forwarding and retry the
+  same alert push-only. On `ntfy.sh`, setting `NTFY_EMAIL` without a verified
+  account token starts directly in push-only mode with a visible diagnostic.
+- **Network exposure requires an explicit secret.** A native launch binds to
+  `127.0.0.1`; a non-loopback `BIND_HOST` is refused unless `INGEST_TOKEN` is
+  non-empty. The one narrow exception is the supplied container configuration:
+  a bridged container listens on its internal wildcard interface while Compose
+  publishes it only on the host's `127.0.0.1`. The explicit
+  `CONTAINER_LOOPBACK_ONLY` assertion permits only wildcard addresses, never a
+  LAN address or hostname. Browser-origin mutations are accepted only from
+  extension origins.
 - **A corrupt state file starts empty and is rewritten.** The cost is one round
   of duplicate alerts; the alternative is a server that will not start.
 
 ## Latency
 
-Bounded by the extension's refresh interval, not by anything server-side — the
-POST is handled in milliseconds. Three minutes is the suggested default. See the
+Discovery is bounded by the extension's refresh interval and the time required
+to walk the catalogue. Server-side filtering and state checks are local, while
+provider delivery can take up to its network timeout and is acknowledged before
+the page advances. Three minutes is the suggested refresh default. See the
 Terms of Use discussion in the README before lowering it: the interval is the
 main dial controlling how much this looks like a person and how much it looks
 like a bot.
