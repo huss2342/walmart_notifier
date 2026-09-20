@@ -40,6 +40,7 @@ from models import Item  # noqa: E402
 from notifiers import build_notifier  # noqa: E402
 from notifiers.telegram import TelegramNotifier  # noqa: E402
 from pipeline import process  # noqa: E402
+from relay_watchdog import RelayWatchdog  # noqa: E402
 from sources.webhook_source import parse_json_ingest_payload  # noqa: E402
 from state import SeenStore, default_path  # noqa: E402
 from telegram_commands import (  # noqa: E402
@@ -620,6 +621,8 @@ def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
     Handler.telegram_commands = None
 
     notifier = Handler.notifier
+    watchdog = RelayWatchdog.from_env(Handler.runtime_status, notifier, dict(os.environ))
+    watchdog.start()
     rules = load_rules()
 
     httpd = ThreadingHTTPServer((host, port), Handler)
@@ -680,6 +683,7 @@ def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
     except KeyboardInterrupt:
         print("\nStopping.")
     finally:
+        watchdog.stop()
         if command_poller is not None:
             command_poller.stop()
         Handler.store.save()

@@ -355,8 +355,22 @@ async function pageDelayMs() {
 }
 
 async function finishSweep(sweep, generation) {
-  await removeCurrentSweep(generation, new Set(sweep.visited || []).size);
+  const pages = new Set(sweep.visited || []).size;
+  await removeCurrentSweep(generation, pages);
   if (!isCurrent(generation)) return;
+  if (!pages) {
+    // A sweep that relayed nothing used to end silently, so a page stuck on
+    // the no-results panel produced no items, no error, and no clue -- the
+    // relay was dead for eighteen hours and the status simply aged. Record it
+    // so the options page and the staleness alert have something to show.
+    await chrome.storage.local.set({
+      lastError:
+        'A sweep finished without reading any pages: the reviewer page kept ' +
+        'showing "no search results". If the catalogue is not actually empty, ' +
+        'reload the tab.',
+      lastErrorAt: Date.now()
+    });
+  }
   phase = 'complete';
   lastActivityAt = Date.now();
 }

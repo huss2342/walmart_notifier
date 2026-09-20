@@ -261,6 +261,26 @@ The bind mount `./data:/app/data` means rebuilding or replacing the container
 does not reset saved rules or dedupe history. Do not run multiple notifier
 containers against that directory at once.
 
+## If it goes quiet
+
+No alerts can mean "nothing matched your filter" or "the browser stopped
+feeding it", and those look identical from the notifier's side. The notifier
+therefore watches the age of the last successful relay and sends one alert when
+it exceeds `STALE_RELAY_HOURS` (default 6). It re-arms when relays resume, so
+one outage produces one alert.
+
+Almost always it is the browser: the reviewer tab was closed, navigated away,
+or is sitting on a bot check. Reopen
+<https://www.walmart.com/reviews/claim-product> and the sweep picks up again.
+
+To check by hand:
+
+```powershell
+curl.exe -s http://127.0.0.1:8787/health
+```
+
+`runtime.last_successful_relay.age_seconds` is the number that matters.
+
 ## If Walmart shows "Robot or human?"
 
 That page (`walmart.com/blocked`) means Walmart has flagged the traffic as
