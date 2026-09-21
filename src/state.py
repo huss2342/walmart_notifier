@@ -385,6 +385,19 @@ class SeenStore:
             self._markers[key] = value
             self._queue("marker", key, value)
 
+    def iter_records(self) -> list[tuple[str, dict]]:
+        """A snapshot of recorded items, for re-applying changed rules.
+
+        Returned as a list rather than a generator so the lock is not held
+        while the caller sends notifications.
+        """
+        with self._lock:
+            return [
+                (item_id, dict(record))
+                for item_id, record in self._seen.items()
+                if isinstance(record, dict)
+            ]
+
     # --- introspection ------------------------------------------------------
 
     def __len__(self) -> int:

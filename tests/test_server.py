@@ -672,3 +672,91 @@ def test_bot_check_rejects_a_web_origin(live_server):
     with pytest.raises(urllib.error.HTTPError) as exc:
         urllib.request.urlopen(req, timeout=5)
     assert exc.value.code == 403
+
+
+# --- rescanning recorded items ----------------------------------------------
+
+
+def _record_items(store, entries):
+    for item_id, title, value in entries:
+        store.mark_seen(item_id, title, value)
+    store.flush()
+
+
+def test_rescan_reports_without_sending_by_default(live_server, monkeypatch):
+    """Dedupe means a changed filter never revisits recorded items."""
+    monkeypatch.setenv("RULES_JSON", json.dumps({"rules": [
+        {"name": "hunt", "min_value_usd": 80.0, "keywords": ["vanity", "mirror"]}
+    ]}))
+    _record_items(server.Handler.store, [
+        ("ip-1", "Hollywood Vanity Mirror with Lights", 99.0),
+        ("ip-2", "Bulife GPS Wireless Collar", 83.99),
+        ("ip-3", "Bathroom Vanity Light", 49.99),
+    ])
+
+    status, body = request(live_server, "POST", path="/rescan", payload={})
+    assert status == 200
+    assert body["applied"] is False
+    assert body["matched"] == 1
+    assert body["sample"][0]["item_id"] == "ip-1"
+    # Reporting must not notify: a loosened filter can match thousands.
+    assert not [s for n in RecordingNotifier.instances for s in n.sent]
+
+
+def test_rescan_alerts_only_when_asked(live_server, monkeypatch):
+    monkeypatch.setenv("RULES_JSON", json.dumps({"rules": [
+        {"name": "hunt", "min_value_usd": 80.0, "keywords": ["mirror"]}
+    ]}))
+    _record_items(server.Handler.store, [
+        ("ip-1", "Hollywood Vanity Mirror with Lights", 99.0),
+        ("ip-2", "Unrelated item", 120.0),
+    ])
+
+    status, body = request(
+        live_server, "POST", path="/rescan", payload={"apply": True}
+    )
+    assert status == 200 and body["alerted"] == 1
+    sent = [s for n in RecordingNotifier.instances for s in n.sent]
+    assert [item_id for item_id, _, _ in sent] == ["ip-1"]
+
+
+def test_rescan_caps_the_alert_burst_and_prefers_high_values(live_server, monkeypatch):
+    monkeypatch.setenv("RULES_JSON", json.dumps({"rules": [{"name": "everything"}]}))
+    _record_items(server.Handler.store, [
+        (f"ip-{index}", f"item {index}", float(index)) for index in range(40)
+    ])
+
+    _, body = request(
+        live_server, "POST", path="/rescan", payload={"apply": True, "limit": 5}
+    )
+    assert body["alerted"] == 5
+    assert body["suppressed"] == body["matched"] - 5
+
+    sent = [s for n in RecordingNotifier.instances for s in n.sent]
+    # The budget goes to the most valuable items, not to arbitrary ones.
+    assert [value for _, _, value in sent] == [39.0, 38.0, 37.0, 36.0, 35.0]
+
+
+def test_rescan_limit_cannot_exceed_the_hard_cap(live_server, monkeypatch):
+    monkeypatch.setenv("RULES_JSON", json.dumps({"rules": [{"name": "everything"}]}))
+    _record_items(server.Handler.store, [
+        (f"ip-{index}", f"item {index}", 1.0) for index in range(60)
+    ])
+
+    _, body = request(
+        live_server, "POST", path="/rescan", payload={"apply": True, "limit": 10_000}
+    )
+    assert body["alerted"] == server.RESCAN_ALERT_LIMIT
+
+
+def test_rescan_rejects_a_non_object_body(live_server):
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        request(live_server, "POST", path="/rescan", payload=["not", "an", "object"])
+    assert exc.value.code == 400
+
+
+def test_rescan_requires_the_token_and_extension_origin(live_server, monkeypatch):
+    monkeypatch.setattr(server.Handler, "token", "sekrit")
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        request(live_server, "POST", path="/rescan", payload={}, token="wrong")
+    assert exc.value.code == 403

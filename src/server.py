@@ -36,6 +36,7 @@ from config import (  # noqa: E402
     save_user_rules,
     seed_mode,
 )
+from filters import first_match  # noqa: E402
 from models import Item  # noqa: E402
 from notifiers import build_notifier  # noqa: E402
 from notifiers.telegram import TelegramNotifier  # noqa: E402
@@ -54,6 +55,8 @@ MAX_INGEST_BYTES = 4_000_000
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
 LAST_RELAY_MARKER = "runtime:last-successful-relay"
+# A loosened filter can match thousands of recorded items; cap the burst.
+RESCAN_ALERT_LIMIT = 25
 
 
 class RuntimeStatus:
@@ -414,7 +417,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.split("?")[0].rstrip("/")
-        if path not in ("/ingest", "/test-notification", "/bot-check"):
+        if path not in ("/ingest", "/test-notification", "/bot-check", "/rescan"):
             self._reply(404, "not found")
             return
         if not self._authorized():
@@ -429,6 +432,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/bot-check":
             self._send_bot_check_alert()
+            return
+        if path == "/rescan":
+            self._rescan()
             return
 
         if not self._require_json():
@@ -471,6 +477,93 @@ class Handler(BaseHTTPRequestHandler):
         else:
             log.debug("Ingest: %s", json.dumps(summary.as_dict()))
         self._reply(200, summary.as_dict())
+
+    def _rescan(self) -> None:
+        """Re-apply the current rules to already-recorded items.
+
+        Dedupe means a recorded item is never judged again, so tightening or
+        loosening a filter has no effect on anything already seen -- and once
+        the whole catalogue is recorded, that is everything. This re-runs the
+        rules over stored records.
+
+        It reports by default and only alerts when explicitly asked, because
+        a loosened filter can match thousands of recorded items at once.
+        """
+        apply = False
+        limit = RESCAN_ALERT_LIMIT
+        body = self._read_body()
+        if body is None:
+            return
+        if body:
+            try:
+                data = json.loads(body.decode("utf-8"))
+                apply = bool(data.get("apply", False))
+                limit = int(data.get("limit", RESCAN_ALERT_LIMIT))
+            except (AttributeError, TypeError, ValueError):
+                self._reply(400, {"error": "body must be a JSON object"})
+                return
+        limit = max(0, min(limit, RESCAN_ALERT_LIMIT))
+
+        rules = load_rules()
+        matches: list[tuple[str, dict]] = []
+        for item_id, record in self.store.iter_records():
+            value = record.get("value_usd")
+            item = Item(
+                item_id=item_id,
+                title=str(record.get("title") or ""),
+                value_usd=value if isinstance(value, (int, float)) else None,
+            )
+            if first_match(item, rules) is not None:
+                matches.append((item_id, record))
+
+        # Highest value first: if the alert budget is spent, spend it on the
+        # items most worth knowing about.
+        matches.sort(key=lambda pair: pair[1].get("value_usd") or 0, reverse=True)
+        payload = {
+            "ok": True,
+            "applied": apply,
+            "scanned": len(self.store),
+            "matched": len(matches),
+            "alert_limit": limit,
+            "sample": [
+                {"item_id": item_id, "title": record.get("title"),
+                 "value_usd": record.get("value_usd")}
+                for item_id, record in matches[:10]
+            ],
+        }
+
+        if not apply:
+            payload["note"] = (
+                "Nothing was sent. POST {\"apply\": true} to alert on these."
+            )
+            self._reply(200, payload)
+            return
+
+        sent = 0
+        failed = 0
+        for item_id, record in matches[:limit]:
+            value = record.get("value_usd")
+            item = Item(
+                item_id=item_id,
+                title=str(record.get("title") or ""),
+                value_usd=value if isinstance(value, (int, float)) else None,
+                url=f"https://www.walmart.com/ip/{item_id.removeprefix('ip-')}",
+                source="rescan",
+            )
+            try:
+                delivered = self.notifier.send(item, priority="high")
+            except Exception:
+                log.exception("Rescan alert failed for %s.", item_id)
+                delivered = False
+            if delivered:
+                sent += 1
+            else:
+                failed += 1
+        payload["alerted"] = sent
+        payload["failed"] = failed
+        payload["suppressed"] = max(0, len(matches) - limit)
+        log.info("Rescan alerted on %d of %d matching records.", sent, len(matches))
+        self._reply(200, payload)
 
     def _notifier_diagnostic(self) -> str:
         """A notifier-owned message guaranteed not to contain its secrets."""
