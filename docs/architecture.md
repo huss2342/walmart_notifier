@@ -204,6 +204,26 @@ decides how hard this hits the site. The walk defers while the user is
 mid-interaction, and the refresh alarm clears the visited set to start a fresh
 pass -- but skips tabs whose sweep is still running.
 
+## Expressing "either condition"
+
+A rule ANDs its own clauses; `first_match` ORs across rules. So "at least $80
+**or** a vanity/mirror title" is two rules, not one.
+
+The options form wrote exactly one rule, so it could only ever produce AND --
+and it did so silently. A user asking for either condition got the stricter
+reading with nothing in the UI to reveal it, and the filter simply never fired.
+
+The form now has a match mode. "All" writes the single `my-filters` rule as
+before. "Any" writes `my-filters-value` and `my-filters-keywords`, splitting
+the value bounds from the keywords so each can match alone. Both carry the
+exclusions and the priority, since a veto has to apply to either half.
+
+The two names are also how the form recognises a set it wrote itself. Without
+that, reloading would see two rules and warn that saving will collapse a
+hand-built multi-rule configuration. A side left blank contributes no rule at
+all rather than an empty always-true one, which would alert on the entire
+catalogue.
+
 ## Where the filters live
 
 The extension's options page edits filters, but it does not hold them. It reads

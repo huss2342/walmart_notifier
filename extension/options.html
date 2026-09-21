@@ -39,6 +39,17 @@
 
 <div id="rulesBanner"></div>
 
+<label>Alert when
+  <span class="hint">
+    <strong>Any</strong> = value alone is enough, or a keyword alone is enough.
+    <strong>All</strong> = a match needs both. "Never alert on" always wins.
+  </span>
+  <select id="matchMode">
+    <option value="any">Any condition matches (value OR keyword)</option>
+    <option value="all">All conditions match (value AND keyword)</option>
+  </select>
+</label>
+
 <div class="row">
   <label>Minimum value ($)
     <span class="hint">Alert only at or above this retail value.</span>

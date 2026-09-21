@@ -5,7 +5,12 @@
 
 const DEFAULT_PATH_PATTERN = '^/reviews/claim-product';
 const DEFAULT_ENDPOINT = 'http://127.0.0.1:8787/ingest';
+// "Any" is expressed as two rules, because the engine ORs across rules and
+// ANDs within one. The names let this form recognise a set it wrote itself
+// rather than warning about it as a hand-built multi-rule configuration.
 const UI_RULE_NAME = 'my-filters';
+const UI_VALUE_RULE = 'my-filters-value';
+const UI_KEYWORD_RULE = 'my-filters-keywords';
 
 const $ = (id) => document.getElementById(id);
 
@@ -25,6 +30,7 @@ const keywordsEl = $('keywords');
 const excludeEl = $('excludeKeywords');
 const priorityEl = $('priority');
 const alertUnknownEl = $('alertUnknown');
+const matchModeEl = $('matchMode');
 const rulesBannerEl = $('rulesBanner');
 const rulesSavedEl = $('rulesSaved');
 const rulesErrorEl = $('rulesError');
@@ -164,6 +170,25 @@ const csv = (list) => (list || []).join(', ');
 const parseCsv = (value) =>
   (value || '').split(',').map((s) => s.trim()).filter(Boolean);
 
+/** Populate the form from a rule set this page wrote, in either mode. */
+function fillFormFromRules(rules) {
+  const value = rules.find((r) => r.name === UI_VALUE_RULE);
+  const keyword = rules.find((r) => r.name === UI_KEYWORD_RULE);
+  if (value || keyword) {
+    matchModeEl.value = 'any';
+    fillForm({
+      ...(value || {}),
+      keywords: (keyword || {}).keywords || [],
+      exclude_keywords: (value || keyword || {}).exclude_keywords || [],
+      priority: (value || keyword || {}).priority || 'normal'
+    });
+    return true;
+  }
+  matchModeEl.value = 'all';
+  fillForm(rules[0] || {});
+  return false;
+}
+
 function fillForm(rule) {
   activeRule = rule || {};
   minEl.value = rule.min_value_usd ?? '';
@@ -186,8 +211,8 @@ function banner(text, tone = 'banner') {
 async function loadRules() {
   try {
     const { rules, source } = await rulesFetch('GET');
-    fillForm(rules[0] || {});
-    if (rules.length > 1) {
+    const ours = fillFormFromRules(rules);
+    if (!ours && rules.length > 1) {
       // The form edits one rule. Saving would collapse a multi-rule setup, so
       // say that plainly instead of quietly discarding the rest.
       banner(
@@ -214,32 +239,70 @@ async function loadRules() {
   }
 }
 
-function formToRule() {
-  const rule = {
-    name: UI_RULE_NAME,
-    keywords: parseCsv(keywordsEl.value),
-    exclude_keywords: parseCsv(excludeEl.value),
-    priority: priorityEl.value,
-    alert_on_unknown_value: alertUnknownEl.checked
-  };
+function bounds() {
   const min = parseFloat(minEl.value);
   const max = parseFloat(maxEl.value);
-  if (Number.isFinite(min)) rule.min_value_usd = min;
-  if (Number.isFinite(max)) rule.max_value_usd = max;
-  return rule;
+  const result = {};
+  if (Number.isFinite(min)) result.min_value_usd = min;
+  if (Number.isFinite(max)) result.max_value_usd = max;
+  return result;
+}
+
+/** The rule set for the current form, one rule for "all" and two for "any". */
+function formToRules() {
+  const keywords = parseCsv(keywordsEl.value);
+  const shared = {
+    exclude_keywords: parseCsv(excludeEl.value),
+    priority: priorityEl.value
+  };
+  const limits = bounds();
+
+  if (matchModeEl.value !== 'any') {
+    return [{
+      name: UI_RULE_NAME,
+      keywords,
+      ...shared,
+      ...limits,
+      alert_on_unknown_value: alertUnknownEl.checked
+    }];
+  }
+
+  // Either condition alone is enough, so each becomes its own rule and the
+  // engine's first-match-wins gives the OR. A blank side contributes nothing
+  // rather than an always-true rule that would alert on the whole catalogue.
+  const rules = [];
+  if (Object.keys(limits).length) {
+    rules.push({
+      name: UI_VALUE_RULE,
+      keywords: [],
+      ...shared,
+      ...limits,
+      alert_on_unknown_value: alertUnknownEl.checked
+    });
+  }
+  if (keywords.length) {
+    rules.push({ name: UI_KEYWORD_RULE, keywords, ...shared });
+  }
+  return rules;
 }
 
 $('saveRules').addEventListener('click', async () => {
-  const rule = formToRule();
-  if (rule.min_value_usd !== undefined && rule.max_value_usd !== undefined &&
-      rule.min_value_usd > rule.max_value_usd) {
+  const limits = bounds();
+  if (limits.min_value_usd !== undefined && limits.max_value_usd !== undefined &&
+      limits.min_value_usd > limits.max_value_usd) {
     rulesErrorEl.textContent = 'Minimum value is above the maximum — nothing would ever match.';
+    return;
+  }
+  const next = formToRules();
+  if (!next.length) {
+    rulesErrorEl.textContent =
+      'Set a value, a keyword, or both. With neither, nothing would be alerted on.';
     return;
   }
   rulesErrorEl.textContent = '';
   try {
-    const { rules } = await rulesFetch('PUT', { rules: [rule] });
-    fillForm(rules[0]);
+    const { rules } = await rulesFetch('PUT', { rules: next });
+    fillFormFromRules(rules);
     banner('');
     flash(rulesSavedEl, 'Filters saved');
   } catch (err) {
@@ -250,7 +313,7 @@ $('saveRules').addEventListener('click', async () => {
 $('resetRules').addEventListener('click', async () => {
   try {
     const { rules } = await rulesFetch('DELETE');
-    fillForm(rules[0] || {});
+    fillFormFromRules(rules);
     await loadRules();
     flash(rulesSavedEl, 'Reset to defaults');
   } catch (err) {

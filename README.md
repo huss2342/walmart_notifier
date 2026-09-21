@@ -115,7 +115,7 @@ Do not run `run.ps1` at the same time because both would need port 8787.
 
 1. `chrome://extensions` → Developer mode → **Load unpacked** → pick
    `extension/`. If it was already installed, click **Reload** on its card and
-   verify that the displayed version is **2.2.1**.
+   verify that the displayed version is **2.3.0**.
 2. Open its **Options**. The defaults are already correct for a local server —
    endpoint `http://127.0.0.1:8787/ingest`, path `^/reviews/claim-product`.
 3. With **reviewer-item-notifier** running, click **Check connection**. This

@@ -116,7 +116,10 @@ function loadBackground({
   };
 }
 
-function loadOptions({ initial = {}, sweepStatus = { ok: true, tabCount: 1 } } = {}) {
+function loadOptions({
+  initial = {}, sweepStatus = { ok: true, tabCount: 1 }, rulesBody = null
+} = {}) {
+  const optionsFetches = [];
   class FakeNode {
     constructor() {
       this.children = [];
@@ -158,7 +161,7 @@ function loadOptions({ initial = {}, sweepStatus = { ok: true, tabCount: 1 } } =
     'maxValue', 'keywords', 'excludeKeywords', 'priority', 'alertUnknown',
     'rulesBanner', 'rulesSaved', 'rulesError', 'checkConnection',
     'testNotification', 'testResult', 'save', 'saveRules', 'resetRules',
-    'resetSweep'
+    'resetSweep', 'matchMode'
   ];
   const elements = Object.fromEntries(ids.map((id) => [id, new FakeNode()]));
   const document = {
@@ -199,10 +202,14 @@ function loadOptions({ initial = {}, sweepStatus = { ok: true, tabCount: 1 } } =
     clearTimeout,
     setInterval() {},
     console,
-    fetch: async (url) => {
+    fetch: async (url, init = {}) => {
       const path = new URL(url).pathname;
+      optionsFetches.push({ path, ...init });
       if (path === '/rules') {
-        return response({
+        if (init.method === 'PUT') {
+          return response({ source: 'saved', rules: JSON.parse(init.body).rules });
+        }
+        return response(rulesBody || {
           source: 'saved',
           rules: [{
             name: 'my-filters', keywords: [], exclude_keywords: [],
@@ -218,10 +225,10 @@ function loadOptions({ initial = {}, sweepStatus = { ok: true, tabCount: 1 } } =
   });
   vm.runInContext(
     `${optionsSource}\n;globalThis.__test = {` +
-      'completedSweepPages, activeSweep, renderStatus};',
+      'completedSweepPages, activeSweep, renderStatus, formToRules, loadRules};',
     context
   );
-  return { api: context.__test, elements, local };
+  return { api: context.__test, elements, local, optionsFetches };
 }
 
 test('coordinator deterministically picks the leftmost reachable tab, then stays sticky', async () => {
@@ -817,4 +824,84 @@ test('Restart sweep is the user saying the check is solved', async () => {
   assert.equal(bg.tabActions.at(-1).type, 'update');
   // The count survives, so an immediate repeat still backs off longer.
   assert.equal(bg.local.data.botCheck.count, 2);
+});
+
+
+// --- filter modes ------------------------------------------------------------
+
+function fillFilterForm(elements, { mode, min = '', keywords = '', exclude = '' }) {
+  elements.matchMode.value = mode;
+  elements.minValue.value = min;
+  elements.keywords.value = keywords;
+  elements.excludeKeywords.value = exclude;
+  elements.priority.value = 'high';
+}
+
+test('"any" writes two rules, because the engine ORs across rules only', () => {
+  // A single rule ANDs its clauses, so "$80 or a vanity/mirror title" cannot
+  // be expressed as one rule -- which silently made the filter stricter.
+  const { api, elements } = loadOptions();
+  fillFilterForm(elements, {
+    mode: 'any', min: '80', keywords: 'vanity, mirror', exclude: 'covers'
+  });
+
+  const rules = api.formToRules();
+  assert.equal(rules.length, 2);
+  // Joined rather than deep-compared: arrays built inside the vm context have
+  // a different Array prototype, which deepStrictEqual treats as unequal.
+  assert.equal(rules.map((r) => r.name).join(','),
+    'my-filters-value,my-filters-keywords');
+  assert.equal(rules[0].min_value_usd, 80);
+  assert.equal(rules[0].keywords.join(','), '');
+  assert.equal(rules[1].keywords.join(','), 'vanity,mirror');
+  // The veto applies to both halves, or an excluded item slips through one.
+  assert.equal(rules[0].exclude_keywords.join(','), 'covers');
+  assert.equal(rules[1].exclude_keywords.join(','), 'covers');
+});
+
+test('"all" still writes the single combined rule', () => {
+  const { api, elements } = loadOptions();
+  fillFilterForm(elements, { mode: 'all', min: '80', keywords: 'vanity' });
+
+  const rules = api.formToRules();
+  assert.equal(rules.length, 1);
+  assert.equal(rules[0].name, 'my-filters');
+  assert.equal(rules[0].min_value_usd, 80);
+  assert.equal(rules[0].keywords.join(','), 'vanity');
+});
+
+test('an empty side of "any" contributes no rule at all', () => {
+  // An empty rule matches everything, which would alert on the catalogue.
+  const { api, elements } = loadOptions();
+  fillFilterForm(elements, { mode: 'any', min: '', keywords: 'mirror' });
+  assert.equal(api.formToRules().map((r) => r.name).join(','), 'my-filters-keywords');
+
+  fillFilterForm(elements, { mode: 'any', min: '25', keywords: '' });
+  assert.equal(api.formToRules().map((r) => r.name).join(','), 'my-filters-value');
+
+  fillFilterForm(elements, { mode: 'any', min: '', keywords: '' });
+  assert.equal(api.formToRules().length, 0);
+});
+
+test('a saved "any" pair reloads as "any" and is not flagged as hand-built', async () => {
+  const { api, elements } = loadOptions({
+    rulesBody: {
+      source: 'user',
+      rules: [
+        { name: 'my-filters-value', keywords: [], exclude_keywords: ['covers'],
+          min_value_usd: 80, priority: 'high' },
+        { name: 'my-filters-keywords', keywords: ['vanity', 'mirror'],
+          exclude_keywords: ['covers'], priority: 'high' }
+      ]
+    }
+  });
+
+  await api.loadRules();
+
+  assert.equal(elements.matchMode.value, 'any');
+  assert.equal(elements.minValue.value, 80);
+  assert.equal(elements.keywords.value, 'vanity, mirror');
+  assert.equal(elements.excludeKeywords.value, 'covers');
+  // The multi-rule warning is for configurations this form did not write.
+  assert.equal(elements.rulesBanner.textContent, '');
 });
