@@ -357,6 +357,9 @@ def test_failed_delivery_does_not_replace_last_successful_relay(tmp_path):
     runtime = server.RuntimeStatus(store)
     runtime.record_relay({"seen": 2, "notified": 1, "failed": 0, "pending": 0})
     runtime.record_relay({"seen": 2, "notified": 0, "failed": 1, "pending": 0})
+    # Saving is debounced now, so the marker reaches disk on an explicit flush
+    # -- which the ingest route performs once per request.
+    store.save()
 
     restarted = server.RuntimeStatus(SeenStore(store.path)).snapshot()
     assert restarted["last_successful_relay"]["summary"]["notified"] == 1

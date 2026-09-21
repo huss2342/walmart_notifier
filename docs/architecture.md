@@ -289,6 +289,45 @@ check. Now a check:
 check. It clears the pause but keeps the count, so an immediate repeat still
 backs off longer.
 
+## How the seen store is written
+
+Two properties are in tension: an item must not alert twice, and the file must
+not be rewritten constantly.
+
+The original design saved the whole JSON file inside every `mark_seen` and
+`commit`. At 20,000 records that is a 4.6 MB rewrite per item, so one 38-item
+page wrote about 175 MB and a 21-page sweep several GB. Retention was a bare
+row cap of 20,000, which quietly made the real window whatever the churn rate
+implied: measured at 3,000-10,000 new ids a day, that was about three days, so
+an item still listed in the portal could be trimmed and alert again as if new.
+
+Now:
+
+- **Retention is stated in days** (`RETENTION_DAYS`, default 60). `MAX_ENTRIES`
+  survives only as a backstop against unbounded growth. Records with no
+  timestamp predate value tracking and are treated as expired rather than
+  immortal.
+- **New records are appended**, one JSON line each, to a `.log` beside the
+  snapshot. A write costs what is new rather than what is stored.
+- **The snapshot is rewritten only on compaction**: when the log is both at
+  least `MIN_COMPACT_LINES` and at least as long as the live set, and at
+  shutdown. Comparing against *twice* the live set never fires, because with
+  append-only inserts the log and the store grow together.
+- **Appends are batched** by a background thread and forced once per ingest.
+  A hard kill loses at most a second of records, whose only consequence is
+  that those items may alert once more -- the same trade already made for
+  in-flight claims.
+
+Ordering matters in two places. Compaction deletes the log only after the
+snapshot has been replaced, so a failed snapshot write cannot lose the records
+the log still holds. A failed append puts its records back on the queue rather
+than dropping them, since a lost record means a duplicate alert later.
+
+Loading replays the log over the snapshot, and does so even when no snapshot
+exists yet -- until the first compaction the log is the only copy. A torn final
+line, the expected cost of appending without fsync, is skipped without
+discarding the lines before it.
+
 ## Failure behaviour
 
 Deliberate choices about what happens when something breaks:

@@ -462,6 +462,10 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
         self.runtime_status.record_relay(summary.as_dict())
+        # Append once per request rather than once per item, after the relay
+        # marker is recorded so it lands in the same write. This costs the
+        # number of new records; the snapshot is rewritten only on compaction.
+        self.store.flush()
         if summary.notified or summary.failed:
             log.info("Ingest: %s", json.dumps(summary.as_dict()))
         else:
@@ -686,7 +690,7 @@ def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
         watchdog.stop()
         if command_poller is not None:
             command_poller.stop()
-        Handler.store.save()
+        Handler.store.close()
         httpd.server_close()
 
 
