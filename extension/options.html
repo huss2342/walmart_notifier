@@ -5,15 +5,18 @@
   body { font: 14px/1.5 system-ui, sans-serif; max-width: 38rem; margin: 2rem auto; padding: 0 1rem; }
   h2 { margin: 2.5rem 0 .25rem; font-size: 1.05em; border-bottom: 1px solid #e2e6ea; padding-bottom: .4rem; }
   label { display: block; margin-top: 1rem; font-weight: 600; }
-  input, select { width: 100%; padding: .5rem; margin-top: .25rem; font: inherit;
+  input, select, textarea { width: 100%; padding: .5rem; margin-top: .25rem; font: inherit;
           border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
-  input[type=checkbox] { width: auto; margin-right: .4rem; vertical-align: -2px; }
+  textarea { resize: vertical; }
+  .toggle { display: flex; align-items: baseline; gap: .5rem; }
+  .toggle input { width: auto; margin: 0; flex: 0 0 auto; }
+  .suboption { margin-left: 1.5rem; }
   button { margin-top: 1.25rem; padding: .5rem 1.25rem; font: inherit;
            background: #0071dc; color: #fff; border: 0; border-radius: 4px; cursor: pointer; }
   button:disabled { opacity: .6; cursor: wait; }
   button.secondary { background: #eef1f4; color: #2b3137; }
-  .row { display: flex; gap: .75rem; }
-  .row > label { flex: 1; }
+  details { margin-top: 1.5rem; padding: .75rem 1rem; border: 1px solid #e2e6ea; border-radius: 6px; }
+  summary { cursor: pointer; font-weight: 600; }
   .hint { color: #666; font-weight: 400; font-size: .85em; }
   .saved { margin-left: .75rem; color: #087443; font-weight: 600; }
   .err { color: #b3261e; font-weight: 400; font-size: .85em; }
@@ -21,8 +24,6 @@
             background: #f4f6f8; border: 1px solid #e2e6ea; }
   .status h2 { margin: 0 0 .5rem; font-size: 1em; border: 0; padding: 0; }
   .ok { color: #087443; } .warn { color: #a15c00; } .bad { color: #b3261e; }
-  .banner { margin-top: .75rem; padding: .6rem .8rem; border-radius: 5px;
-            background: #fff8e6; border: 1px solid #f0dca8; font-size: .9em; }
 </style>
 
 <h1>Reviewer Item Relay</h1>
@@ -31,69 +32,23 @@
   notifier on this machine. No Walmart credentials stored.
 </p>
 
-<h2>Alert filters</h2>
+<h2>Discord alerts</h2>
 <p class="hint">
-  Stored on the notifier. Applied to newly observed items on the next relay,
-  no restart. Items already recorded stay deduplicated.
+  Detected items are automatically routed by category and value. Member tiers,
+  delivery delays and stock rules are managed by the Discord service.
+  Choose what to scan below; delivery progress appears in Status.
 </p>
 
-<div id="rulesBanner"></div>
+<h2>Scanning</h2>
+<p class="hint">Scan mode, page delay and refresh timing are saved in
+  <code>data/relay-settings.json</code>. Additional scans, tab behavior, verification
+  preferences and the reviewer page pattern are saved in <code>data/scanner-settings.json</code>.
+  Edit those files or save this form; file changes are picked up within about a minute.
+  Latest scan status is mirrored to <code>data/scanner-status.json</code>.
+  Connection credentials stay in this browser.</p>
 
-<label>Alert when
-  <span class="hint">
-    <strong>Any</strong> = value alone is enough, or a keyword alone is enough.
-    <strong>All</strong> = a match needs both. "Never alert on" always wins.
-  </span>
-  <select id="matchMode">
-    <option value="any">Any condition matches (value OR keyword)</option>
-    <option value="all">All conditions match (value AND keyword)</option>
-  </select>
-</label>
-
-<div class="row">
-  <label>Minimum value ($)
-    <span class="hint">Alert only at or above this retail value.</span>
-    <input id="minValue" type="number" min="0" step="0.01" placeholder="25">
-  </label>
-  <label>Maximum value ($)
-    <span class="hint">Optional upper bound.</span>
-    <input id="maxValue" type="number" min="0" step="0.01" placeholder="(none)">
-  </label>
-</div>
-
-<label>Item name must contain
-  <span class="hint">Comma separated, matches any. Blank = allow everything.</span>
-  <input id="keywords" type="text" placeholder="headphones, air fryer, tool">
-</label>
-
-<label>Never alert on
-  <span class="hint">Comma separated. Wins over the list above.</span>
-  <input id="excludeKeywords" type="text" placeholder="toy, kids, baby, gift card">
-</label>
-
-<label>Priority
-  <span class="hint">Notification priority.</span>
-  <select id="priority">
-    <option value="low">Low — silent</option>
-    <option value="normal" selected>Normal</option>
-    <option value="high">High</option>
-    <option value="urgent">Urgent</option>
-  </select>
-</label>
-
-<label style="font-weight:400;">
-  <input id="alertUnknown" type="checkbox">
-  Also alert on items with no listed value
-  <span class="hint">Some listings show no figure at all.</span>
-</label>
-
-<button id="saveRules">Save filters</button>
-<button id="resetRules" class="secondary" type="button">Reset to defaults</button>
-<span id="rulesSaved" class="saved"></span>
-<div id="rulesError" class="err"></div>
-
-<h2>Connection</h2>
-
+<details>
+<summary>Advanced connection</summary>
 <label>Ingest endpoint
   <span class="hint">Where the <code>reviewer-item-notifier</code> container listens; <code>run.ps1</code> uses the same address.</span>
   <input id="endpoint" type="url" placeholder="http://127.0.0.1:8787/ingest">
@@ -107,39 +62,105 @@
 
 <label>Reviewer page path
   <span class="hint">Regex on the URL path. Order and returns pages always excluded.</span>
-  <input id="pathPattern" type="text" placeholder="^/reviews/claim-product">
+  <input id="pathPattern" type="text" maxlength="200" placeholder="^/reviews/claim-product">
   <span id="pathError" class="err"></span>
+</label>
+</details>
+
+<label>Search mode
+  <select id="sweepMode" aria-describedby="sweepModeHint">
+    <option value="none">None</option>
+    <option value="sweep">Sweep (a–z)</option>
+    <option value="high-value">High Value</option>
+  </select>
+  <span id="sweepModeHint" class="hint">None reads the full catalogue. A persistent blank page or a confirmed unusable results page triggers preset category searches for that round; brief loading states and confirmed catalogue ends keep normal pagination. Sweep searches a through z. High Value searches the preset keywords from Accessories through Wood. Each search reads every results page before advancing. Save, then click Restart sweep to apply.</span>
 </label>
 
 <label>Delay between pages (seconds)
-  <span class="hint">Every sweep walks page 1 to the end. This paces it.</span>
-  <input id="pageDelaySeconds" type="number" min="1" max="60" step="1" placeholder="5">
+  <span class="hint">Minimum spacing; default 15 seconds, with varying timing. Regular mode spreads pages across the refresh interval. Saved timing resumes as soon as verification is cleared.</span>
+  <input id="pageDelaySeconds" type="number" min="5" max="60" step="1" placeholder="15">
 </label>
 
 <label>Auto-refresh every (minutes)
   <span class="hint">
-    Restarts the sweep at page 1. <strong>0 disables it.</strong> Deferred while
-    you are clicking or scrolling. Minimum 1.
+    Target interval between sweep starts. <strong>0 disables automatic restarts.</strong>
+    Every page is still checked. Long scans get a 1–5 minute break after completion;
+    unresolved verification pauses scanning. Default 30 minutes.
   </span>
-  <input id="refreshMinutes" type="number" min="0" max="120" step="1" placeholder="0">
+  <input id="refreshMinutes" type="number" min="0" max="120" step="1" placeholder="30">
 </label>
 
-<button id="save">Save connection settings</button>
+<h2>Additional coverage</h2>
+<p id="auxiliaryHint" class="hint">Keep the home catalogue scan running independently.
+  Department and keyword tabs run by default. The department tab discovers Walmart's
+  top-level departments and reads every available page in each, without walking
+  subdepartments. Each department is checked before its results are accepted;
+  the keyword tab reads every page
+  for each search below. You can disable either additional scan here.
+  All scans share recorded items and pause together for verification. Save these
+  preferences here or edit <code>data/scanner-settings.json</code> directly.</p>
+
+<label class="toggle" for="auxiliaryDepartments">
+  <input id="auxiliaryDepartments" type="checkbox" aria-describedby="auxiliaryHint">
+  Scan all departments in an additional tab
+</label>
+<div class="suboption">
+  <label class="toggle" for="auxiliaryBrands">
+    <input id="auxiliaryBrands" type="checkbox" aria-describedby="auxiliaryBrandsHint">
+    Also scan brands within each department
+  </label>
+  <p id="auxiliaryBrandsHint" class="hint">Optional. Reads each available brand filter
+    within its department and increases scan duration. Requires department scanning.</p>
+</div>
+
+<label class="toggle" for="auxiliaryKeywords">
+  <input id="auxiliaryKeywords" type="checkbox" aria-describedby="auxiliaryHint auxiliaryKeywordsHint">
+  Search item names in an additional tab
+</label>
+<label for="auxiliaryKeywordQueries">Item names and keywords</label>
+<p id="auxiliaryKeywordsHint" class="hint">One search per line, up to 100 searches
+  and 80 characters per search. Repeated terms are combined without regard to case.
+  Include both broad categories and specific item names, such as Furniture, Chair,
+  Couch and Pet. The preset terms are editable.</p>
+<textarea id="auxiliaryKeywordQueries" rows="7" aria-describedby="auxiliaryKeywordsHint auxiliaryKeywordError"
+  spellcheck="false"></textarea>
+<div id="auxiliaryKeywordError" class="err" role="alert"></div>
+
+<label class="toggle" for="groupScannerTabs">
+  <input id="groupScannerTabs" type="checkbox" aria-describedby="groupScannerTabsHint">
+  Group scanner tabs
+</label>
+<p id="groupScannerTabsHint" class="hint">Keeps the home, department and keyword
+  scans together in a Chrome tab group. Enabled by default.</p>
+<label class="toggle" for="rotateScannerTabs">
+  <input id="rotateScannerTabs" type="checkbox" aria-describedby="rotateScannerTabsHint">
+  Rotate scanner tabs for scrolling
+</label>
+<p id="rotateScannerTabsHint" class="hint">Selects scanner tabs within Chrome so
+  they can read each results page with a smooth downward scroll and varying steps
+  and timing. Long pages resume in later turns. The scanner waits for a settled
+  bottom and selects its tab again before changing page. Yields when you use the
+  browser, select another tab or verification is active. While enabled, scanning
+  waits on its current page when Chrome is minimized or another app is in front.
+  Select a scanner tab in the foreground to resume. Disabling rotation permits
+  background scanning without a guaranteed visible reading pass.
+  Enabled by default; fewer verification checks are not guaranteed.</p>
+
+<button id="save">Save settings</button>
 <button id="checkConnection" class="secondary" type="button">Check connection</button>
 <button id="resetSweep" class="secondary" type="button">Restart sweep</button>
 <span id="saved" class="saved"></span>
 <div class="hint">
   Restart sweep clears the active tab's page-progress record and sends it back
-  to page 1. Other reviewer tabs remain passive fallbacks. This does not touch
+  to page 1 (searching a when Sweep mode is enabled). Other ordinary reviewer tabs remain passive fallbacks. This does not touch
   items already recorded by the notifier.
 </div>
 
 <button id="testNotification" class="secondary" type="button">Send test alert</button>
 <span id="testResult"></span>
 <div class="hint">
-  Sends one clearly labeled alert directly through the configured notification
-  provider. It bypasses item filters and dedupe, so it is the quickest way to
-  distinguish a delivery problem from a filter that matched nothing.
+  Sends one clearly labeled setup alert to the private collector health channel
+  when Discord sending is enabled. It does not post a product alert to member channels.
 </div>
 
 <div class="status">
@@ -147,4 +168,58 @@
   <div id="status">Loading…</div>
 </div>
 
+<div class="status">
+  <h2>Additional scan status</h2>
+  <div id="auxiliaryStatus" role="status" aria-live="polite">Loading additional scans…</div>
+  <button id="restartAuxiliary" class="secondary" type="button" aria-describedby="auxiliaryRestartHint">Restart additional scans</button>
+  <span id="auxiliaryActionStatus" role="status" aria-live="polite"></span>
+  <p id="auxiliaryRestartHint" class="hint">Save changes first. Restarts the enabled
+    department and keyword scans from their first target. Recorded items remain deduplicated.</p>
+</div>
+
+<h2>Automatic verification</h2>
+<p class="hint">Built into Reviewer Item Relay. Disable or remove the old
+  Reviewer Verification Assistant companion so only this extension controls checks.
+  Chrome's debugging permission supplies tab input. This permission is broad;
+  attachment is restricted to Walmart reviewer and blocked pages. Normal
+  department scans use Walmart's page-provided destinations.</p>
+<p class="hint">Experimental: releases on readable completion feedback and stops
+  if progress stalls. Without readable progress, holds start at 15 seconds and
+  increase on retries, up to 30 seconds. Recovery must be confirmed. Up to 10
+  attempts per tab/check and per hour, with about 10–20 seconds between completed
+  attempts. A timed-out pointer move can retry when no press was sent and cleanup
+  is confirmed. Uncertain press or cleanup stops retries. Reloads preserve the count;
+  Chrome suspension can delay a retry.</p>
+<button id="enableVerificationAssist" type="button">Enable automatic verification</button>
+<button id="disableVerificationAssist" class="secondary" type="button">Disable automatic verification</button>
+<button id="retryVerificationAssist" class="secondary" type="button" hidden>Retry current check</button>
+<p id="verificationRetryHint" class="hint" hidden>Release your mouse button before
+  retrying failed input. Your existing attempt limits are preserved.</p>
+<div id="verificationAssistStatus" role="status" aria-live="polite">Loading verification status…</div>
+<h3>Windows mouse fallback</h3>
+<p class="hint">Uses the installed Windows helper after a safely completed Chrome
+  input failure. It waits for five seconds of user idle, selects the reviewer tab
+  and moves your real mouse. Moving the mouse, typing, changing focus or locking
+  Windows cancels the hold. A separate process releases the button if the helper
+  stops responding. The same attempt limits apply. This cannot guarantee acceptance.</p>
+<button id="enableNativeVerification" class="secondary" type="button">Enable Windows fallback</button>
+<button id="disableNativeVerification" class="secondary" type="button">Disable Windows fallback</button>
+<div id="nativeVerificationStatus" role="status" aria-live="polite">Loading Windows fallback status…</div>
+
+<h2>Diagnostics</h2>
+<p class="hint">Keeps up to 300 timing, navigation, retry and verification events locally for up to 7 days.
+  The export includes extension version and scan settings. It excludes credentials, cookies,
+  product details and full URLs. The safe snapshot is also mirrored to the notifier on this computer,
+  so it can be inspected without an export. No diagnostic traffic goes to Walmart.</p>
+<button id="exportDiagnostics" class="secondary" type="button">Export diagnostics</button>
+<span id="diagnosticsResult" role="status"></span>
+<p class="hint">When verification appears, select that tab and click the extension icon to save
+  a screenshot and diagnostic JSON in Downloads/ReviewerItemRelay. Capture is attempted automatically
+  when Chrome has already granted access. Screenshots contain the visible page; the JSON export
+  stays free of credentials and page contents.</p>
+
+<script src="sweep-modes.js"></script>
+<script src="runtime-policy.js"></script>
+<script src="relay-settings.js"></script>
+<script src="scanner-control.js"></script>
 <script src="options.js"></script>

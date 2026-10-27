@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 
 import requests
 
@@ -13,6 +14,10 @@ from models import Item
 from .base import format_message
 
 log = logging.getLogger(__name__)
+DEFAULT_RATE_LIMIT_SECONDS = 30
+MAX_RATE_LIMIT_SECONDS = 86400
+MAX_RATE_LIMIT_DESTINATIONS = 32
+_RATE_LIMIT_DIAGNOSTIC = "Telegram delivery is rate limited; waiting for retry window"
 
 
 class TelegramNotifier:
@@ -23,6 +28,7 @@ class TelegramNotifier:
         self.owner_chat_id = str(chat_id).strip()
         self._chat_id = self.owner_chat_id
         self._destination_lock = threading.RLock()
+        self._rate_limited_until: dict[str, float] = {}
         self.last_diagnostic = ""
 
     @property
@@ -54,6 +60,38 @@ class TelegramNotifier:
             log_context=f"item {item.item_id}",
         )
 
+    def _reap_rate_limits(self, now: float) -> None:
+        expired = [chat for chat, until in self._rate_limited_until.items() if until <= now]
+        for chat in expired:
+            del self._rate_limited_until[chat]
+
+    def _is_rate_limited(self, destination: str, update_diagnostic: bool) -> bool:
+        with self._destination_lock:
+            self._reap_rate_limits(time.monotonic())
+            limited = destination in self._rate_limited_until
+            if limited and update_diagnostic:
+                self.last_diagnostic = _RATE_LIMIT_DIAGNOSTIC
+            return limited
+
+    def _defer_rate_limited(
+        self, destination: str, seconds: int, update_diagnostic: bool,
+    ) -> None:
+        with self._destination_lock:
+            now = time.monotonic()
+            self._reap_rate_limits(now)
+            if (destination not in self._rate_limited_until
+                    and len(self._rate_limited_until) >= MAX_RATE_LIMIT_DESTINATIONS):
+                earliest = min(self._rate_limited_until, key=self._rate_limited_until.get)
+                del self._rate_limited_until[earliest]
+            self._rate_limited_until[destination] = max(
+                self._rate_limited_until.get(destination, 0), now + seconds,
+            )
+            if update_diagnostic:
+                self.last_diagnostic = _RATE_LIMIT_DIAGNOSTIC
+        # Use fixed text: provider descriptions and message context can carry
+        # tokens, chat IDs, URLs or product text. No HTTP or sleep under lock.
+        log.warning("Telegram rate limited delivery; retry deferred for %d seconds.", seconds)
+
     def send_text(
         self,
         text: str,
@@ -75,6 +113,8 @@ class TelegramNotifier:
         destination = self.chat_id if chat_id is None else str(chat_id).strip()
         if not destination:
             raise ValueError("Telegram chat ID cannot be empty")
+        if self._is_rate_limited(destination, update_diagnostic):
+            return False
         request_payload: dict[str, object] = {
             "chat_id": destination,
             "text": text,
@@ -93,6 +133,10 @@ class TelegramNotifier:
                 response_payload = resp.json()
             except (AttributeError, TypeError, ValueError):
                 response_payload = None
+            retry_after = _rate_limit_seconds(resp, response_payload)
+            if retry_after is not None:
+                self._defer_rate_limited(destination, retry_after, update_diagnostic)
+                return False
             if (
                 not isinstance(response_payload, dict)
                 or response_payload.get("ok") is not True
@@ -109,8 +153,13 @@ class TelegramNotifier:
                 self.last_diagnostic = ""
             return True
         except requests.RequestException as exc:
+            response = getattr(exc, "response", None)
+            retry_after = _rate_limit_seconds(response)
+            if retry_after is not None:
+                self._defer_rate_limited(destination, retry_after, update_diagnostic)
+                return False
             detail = _safe_failure_detail(
-                getattr(exc, "response", None),
+                response,
                 exc,
                 secrets=(self.bot_token, self.chat_id, destination),
             )
@@ -120,6 +169,25 @@ class TelegramNotifier:
                 self.last_diagnostic = detail
             log.error("%s while sending %s.", detail, log_context)
             return False
+
+
+def _rate_limit_seconds(response, payload=None) -> int | None:
+    if payload is None and response is not None:
+        try:
+            payload = response.json()
+        except (AttributeError, TypeError, ValueError):
+            payload = None
+    json_limited = (
+        isinstance(payload, dict) and payload.get("ok") is False
+        and type(payload.get("error_code")) is int and payload["error_code"] == 429
+    )
+    if getattr(response, "status_code", None) != 429 and not json_limited:
+        return None
+    parameters = payload.get("parameters") if isinstance(payload, dict) else None
+    seconds = parameters.get("retry_after") if isinstance(parameters, dict) else None
+    if type(seconds) is int and 1 <= seconds <= MAX_RATE_LIMIT_SECONDS:
+        return seconds
+    return DEFAULT_RATE_LIMIT_SECONDS
 
 
 def _safe_failure_detail(

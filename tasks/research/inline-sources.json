@@ -1,0 +1,111 @@
+{
+  "schemaVersion": 1,
+  "items": [
+    {
+      "id": "recorded-values",
+      "title": "What values has the notifier recorded?",
+      "queries": [
+        {
+          "id": "history-bands",
+          "source": {
+            "label": "Walmart notifier history",
+            "files": [
+              {
+                "label": "seen.json"
+              },
+              {
+                "label": "seen.log"
+              }
+            ],
+            "metricDefinitions": [
+              {
+                "label": "Recorded item IDs",
+                "definition": "One retained Walmart item ID after replaying item events over the snapshot. Includes filtered items and product variants."
+              }
+            ],
+            "filters": [
+              "Numeric, finite, nonnegative retail values",
+              "Snapshot plus item events; marker events excluded"
+            ],
+            "caveats": [
+              "Handled item IDs, including filtered and seeded records, are not successful alerts or claims.",
+              "Variants are separate Walmart item IDs; explicit variant text is only a lower bound on families.",
+              "seen_at is a handling timestamp, not a Walmart listing timestamp or verified availability.",
+              "No department, source query, last-seen, full URL, image, or stock history is retained here.",
+              "Historical titles may be truncated to 120 characters; older rows can be longer.",
+              "Zero retail values are recorded observations and need separate quality review.",
+              "Coverage depends on the owner's account, query modes, retention, and scanner uptime.",
+              "Trailing windows end at the latest recorded timestamp, not at execution time."
+            ],
+            "executedAt": "2026-10-21T17:29:46+00:00",
+            "evidenceFlow": [
+              {
+                "kind": "validation",
+                "title": "Reconciled counts",
+                "detail": "58,108 snapshot IDs plus 12,291 item events, with zero overlapping IDs and zero malformed log lines, equal 70,399 distinct IDs. Disjoint value bands and independent threshold counts reconcile."
+              }
+            ]
+          },
+          "reportingPeriod": "September 17\u2013October 21, 2026; latest record 8:40:24 AM CDT",
+          "columns": [
+            {
+              "field": "band",
+              "label": "Retail value band"
+            },
+            {
+              "field": "item_ids",
+              "label": "Recorded item IDs"
+            },
+            {
+              "field": "share_pct",
+              "label": "Share (%)"
+            }
+          ],
+          "rows": [
+            {
+              "band": "$0 to <$10",
+              "item_ids": 19422,
+              "share_pct": 27.5885
+            },
+            {
+              "band": "$10 to <$20",
+              "item_ids": 32486,
+              "share_pct": 46.1455
+            },
+            {
+              "band": "$20 to <$40",
+              "item_ids": 15447,
+              "share_pct": 21.9421
+            },
+            {
+              "band": "$40 to <$80",
+              "item_ids": 2624,
+              "share_pct": 3.7273
+            },
+            {
+              "band": "$80 to <$200",
+              "item_ids": 402,
+              "share_pct": 0.571
+            },
+            {
+              "band": "$200+",
+              "item_ids": 18,
+              "share_pct": 0.0256
+            }
+          ],
+          "preview": {
+            "kind": "aggregate",
+            "note": "Six mutually exclusive value bands over 70,399 retained item IDs.",
+            "totalRows": 70399
+          },
+          "methods": [
+            {
+              "language": "python",
+              "code": "\"\"\"Read-only history audit for the October 21 Discord plan; no project imports.\n\nRun from the repository root with:\n    .venv/Scripts/python.exe tasks/research/analyze_item_history.py\nOnly derived files in tasks/research are written. Runtime state is never opened\nfor writing, instantiated as a SeenStore, pruned, or compacted.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport contextlib\nimport hashlib\nimport io\nimport json\nimport math\nfrom collections import Counter\nfrom datetime import UTC, datetime, timedelta\nfrom pathlib import Path\n\nROOT = Path(__file__).resolve().parents[2]\nOUTPUT = Path(__file__).resolve().parent\nBANDS = [(0, 10), (10, 20), (20, 40), (40, 80), (80, 200), (200, None)]\n\n\ndef analyze(root: Path = ROOT) -> dict:\n    snapshot_bytes = (root / \"data/seen.json\").read_bytes()\n    log_bytes = (root / \"data/seen.log\").read_bytes()\n    rows = dict(json.loads(snapshot_bytes)[\"seen\"])\n    snapshot_count = len(rows)\n    event_counts: Counter = Counter()\n    malformed = 0\n    overlap = 0\n    for line in log_bytes.decode(\"utf-8\").splitlines():\n        if not line.strip():\n            continue\n        try:\n            event = json.loads(line)\n        except json.JSONDecodeError:\n            malformed += 1\n            continue\n        event_counts[event.get(\"t\")] += 1\n        if event.get(\"t\") == \"item\" and isinstance(event.get(\"v\"), dict):\n            overlap += event[\"k\"] in rows\n            rows[event[\"k\"]] = event[\"v\"]\n\n    valid = {\n        key: row for key, row in rows.items()\n        if isinstance(row.get(\"value_usd\"), (int, float))\n        and not isinstance(row[\"value_usd\"], bool)\n        and math.isfinite(row[\"value_usd\"]) and row[\"value_usd\"] >= 0\n    }\n    values = sorted(row[\"value_usd\"] for row in valid.values())\n    stamps = [datetime.fromisoformat(row[\"seen_at\"]) for row in rows.values()]\n    latest = max(stamps)\n    histogram = []\n    for low, high in BANDS:\n        count = sum(low <= value and (high is None or value < high) for value in values)\n        histogram.append({\n            \"band\": f\"${low} to <${high}\" if high else f\"${low}+\",\n            \"lower_inclusive\": low, \"upper_exclusive\": high,\n            \"item_ids\": count, \"share_pct\": round(100 * count / len(values), 4),\n        })\n    recent = {}\n    for days in (7, 14):\n        subset = [row for row in valid.values()\n                  if datetime.fromisoformat(row[\"seen_at\"]) >= latest - timedelta(days=days)]\n        recent[str(days)] = {\n            \"item_ids\": len(subset),\n            \"counts_at_least_usd\": {\n                str(floor): sum(row[\"value_usd\"] >= floor for row in subset)\n                for floor in (40, 80, 100, 200)\n            },\n        }\n    high = {key: row for key, row in valid.items() if row[\"value_usd\"] >= 200}\n    # Reconcile the disjoint histogram against independent threshold counts.\n    assert sum(band[\"item_ids\"] for band in histogram) == len(values)\n    assert sum(band[\"item_ids\"] for band in histogram[:3]) == sum(v < 40 for v in values)\n    assert histogram[-1][\"item_ids\"] == len(high)\n    assert snapshot_count + event_counts[\"item\"] - overlap == len(rows)\n\n    return {\n        \"captured_at_utc\": datetime.now(UTC).isoformat(timespec=\"seconds\"),\n        \"sources\": {\n            \"data/seen.json\": {\"sha256\": hashlib.sha256(snapshot_bytes).hexdigest(),\n                               \"bytes\": len(snapshot_bytes), \"item_ids\": snapshot_count},\n            \"data/seen.log\": {\"sha256\": hashlib.sha256(log_bytes).hexdigest(),\n                              \"bytes\": len(log_bytes), \"event_counts\": dict(event_counts)},\n        },\n        \"malformed_log_lines\": malformed, \"overlapping_item_events\": overlap,\n        \"item_ids\": len(rows), \"known_values\": len(values),\n        \"unknown_or_invalid_values\": len(rows) - len(values),\n        \"non_walmart_id_records\": sum(not key.startswith(\"ip-\") for key in rows),\n        \"recorded_from_utc\": min(stamps).isoformat(),\n        \"recorded_through_utc\": latest.isoformat(),\n        \"zero_value_ids\": sum(v == 0 for v in values),\n        \"explicit_variant_ids\": sum(\"variant on\" in row[\"title\"].lower() for row in rows.values()),\n        \"high_value_explicit_variant_ids\": sum(\"variant on\" in row[\"title\"].lower() for row in high.values()),\n        \"min_value_usd\": min(values), \"max_value_usd\": max(values),\n        \"percentiles_nearest_rank_index\": {\n            str(p): values[round((len(values) - 1) * p)] for p in (.1, .25, .5, .75, .9, .95, .99)\n        },\n        \"bands\": histogram, \"trailing_days_ending_at_latest_record\": recent,\n        \"daily_recorded_ids_utc\": dict(sorted(Counter(row[\"seen_at\"][:10] for row in rows.values()).items())),\n        \"top_value_sample\": [dict(item_id=key, **row) for key, row in\n                             sorted(valid.items(), key=lambda pair: (-pair[1][\"value_usd\"], pair[0]))[:20]],\n        \"record_fields\": sorted({field for row in rows.values() for field in row}),\n        \"caveats\": [\n            \"Handled item IDs, including filtered and seeded records, are not successful alerts or claims.\",\n            \"Variants are separate Walmart item IDs; explicit variant text is only a lower bound on families.\",\n            \"seen_at is a handling timestamp, not a Walmart listing timestamp or verified availability.\",\n            \"No department, source query, last-seen, full URL, image, or stock history is retained here.\",\n            \"Historical titles may be truncated to 120 characters; older rows can be longer.\",\n            \"Zero retail values are recorded observations and need separate quality review.\",\n            \"Coverage depends on the owner's account, query modes, retention, and scanner uptime.\",\n            \"Trailing windows end at the latest recorded timestamp, not at execution time.\",\n        ],\n    }\n\n\n"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

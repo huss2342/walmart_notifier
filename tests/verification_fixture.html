@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8">
+<title>Verification assistant — local DOM tests</title>
+<style>
+body { font:16px/1.5 system-ui; max-width:55rem; margin:2rem auto; padding:0 1rem; }
+#px-captcha { width:352px; height:102px; background:#edf2fa; margin:1rem 0; }
+#cover { position:fixed;inset:0;z-index:100;display:none;background:#ffffff01; }
+.pass {color:#087443}.fail {color:#b3261e}
+</style>
+<h1>Verification assistant — local DOM tests</h1>
+<p>This page tests DOM targeting, visible feedback and the recovery state machine.
+It uses a local test driver. It does not test Chrome debugger input or Walmart acceptance.</p>
+<ul id="results"></ul>
+<main><div id="px-captcha"></div><a id="product" href="/ip/local-test">Local test catalogue item</a></main>
+<div id="cover"></div>
+<p id="summary" role="status">Running…</p>
+<script src="/engine.js"></script><script src="/chrome-driver.js"></script>
+<script>
+(async () => {
+  const marker = document.getElementById('px-captcha');
+  const shadow = marker.attachShadow({mode:'closed'});
+  shadow.innerHTML = '<button style="width:100%;height:100%">Local hold test</button>';
+  const cover = document.getElementById('cover');
+  const product = document.getElementById('product');
+  const current = {protocol:'https:',hostname:'www.walmart.com',port:'',pathname:'/reviews/claim-product'};
+  const read = () => VerificationChrome.readPage(document, current);
+  const results = [];
+  function check(name, condition) {
+    results.push(Boolean(condition));
+    const li = document.createElement('li'); li.className = condition ? 'pass' : 'fail';
+    li.textContent = `${condition ? 'PASS' : 'FAIL'} — ${name}`;
+    document.getElementById('results').append(li);
+  }
+  check('Closed-shadow widget is targeted and visible cached items do not prove recovery',
+    read().challenge && read().target && !read().ready);
+  cover.style.display = 'block';
+  check('An obscuring layer prevents input targeting', !read().target);
+  cover.style.display = 'none';
+  marker.style.marginLeft = '3000px';
+  check('An off-screen widget prevents input targeting', !read().target);
+  marker.style.marginLeft = '';
+  marker.style.opacity = '0';
+  product.style.display = 'none';
+  check('Invisible widget plus hidden cached cards is not ready', !read().ready && !read().target);
+  marker.style.opacity = '1';
+  product.style.display = '';
+  const signals = [];
+  let pressed = 0;
+  const result = await VerificationEngine.run({
+    now: () => performance.now(), sleep: ms => new Promise(resolve => setTimeout(resolve,ms)),
+    enabled: async () => true, page: async () => read(),
+    feedback: async () => pressed && performance.now() - pressed >= 1250 ? 'release' : 'unknown',
+    down: async () => { signals.push('down'); pressed = performance.now(); },
+    up: async () => { signals.push('up'); marker.style.display = 'none'; },
+    detach: async () => signals.push('detach')
+  });
+  check('Real DOM and timers: feedback releases before fallback and confirms stable recovery',
+    result.outcome === 'verified' && result.holdMs >= 1250 && result.holdMs < 4000 && signals.join() === 'down,up,detach');
+  current.pathname = '/blocked';
+  check('Blocked route cannot be accepted as recovered catalogue', !read().ready);
+  document.getElementById('summary').textContent =
+    results.every(Boolean) ? `${results.length} browser checks passed.` : 'Browser checks FAILED.';
+})().catch(() => {document.getElementById('summary').textContent='Browser checks FAILED with an exception.';});
+</script></html>

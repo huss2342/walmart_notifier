@@ -14,6 +14,7 @@ so a tab left closed overnight does not produce an alert per check.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from collections.abc import Callable
 
@@ -21,16 +22,17 @@ from models import Item
 
 log = logging.getLogger(__name__)
 
-DEFAULT_STALE_HOURS = 6.0
+# Four missed sweeps at the browser's default half-hour cadence.
+DEFAULT_STALE_HOURS = 2.0
 DEFAULT_CHECK_SECONDS = 300.0
 
 
 def _hours(value: object, fallback: float) -> float:
     try:
         parsed = float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return fallback
-    return parsed if parsed > 0 else fallback
+    return parsed if parsed > 0 and math.isfinite(parsed * 3600) else fallback
 
 
 class RelayWatchdog:
@@ -109,8 +111,10 @@ class RelayWatchdog:
         if self._alerted:
             return False
 
-        self._alerted = True
-        return self._alert(age)
+        # A failed send must remain retryable on the next scheduled check.
+        # Only a delivered warning suppresses subsequent alerts in this outage.
+        self._alerted = self._alert(age)
+        return self._alerted
 
     def _alert(self, age_seconds: float) -> bool:
         hours = age_seconds / 3600

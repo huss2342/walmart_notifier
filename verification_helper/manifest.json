@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "minimum_chrome_version": "120",
+  "name": "Reviewer Verification Assistant",
+  "version": "0.1.0",
+  "description": "Experimental local verification recovery for the signed-in Walmart reviewer collector.",
+  "permissions": ["storage", "debugger"],
+  "host_permissions": ["https://www.walmart.com/*"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [{
+    "matches": ["https://www.walmart.com/reviews/claim-product*", "https://www.walmart.com/blocked*"],
+    "js": ["detector.js"],
+    "run_at": "document_idle"
+  }],
+  "options_page": "options.html",
+  "action": { "default_title": "Reviewer Verification Assistant" }
+}

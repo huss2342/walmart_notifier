@@ -106,7 +106,7 @@ def test_unauthorized_or_unknown_messages_are_silently_consumed(monkeypatch, upd
     assert poller._next_offset == 42
 
 
-def test_prepare_registers_status_menu_only_for_configured_chat(monkeypatch):
+def test_prepare_registers_useful_menu_for_owner(monkeypatch):
     poller = make_poller()
     calls = []
 
@@ -119,10 +119,230 @@ def test_prepare_registers_status_menu_only_for_configured_chat(monkeypatch):
     assert poller._prepare() is True
     method, payload, _ = calls[1]
     assert method == "setMyCommands"
-    assert payload["commands"] == [
-        {"command": "status", "description": "Check the reviewer relay"}
-    ]
+    assert {entry["command"] for entry in payload["commands"]} == {
+        "help", "start", "status", "test", "filters", "useprivate"
+    }
     assert payload["scope"] == {"type": "chat", "chat_id": "456"}
+
+
+def test_selected_group_menu_keeps_owner_private_menu(monkeypatch):
+    poller = make_poller()
+    poller.notifier.set_chat_id("-100987")
+    calls = []
+    monkeypatch.setattr(
+        poller, "_api_call", lambda method, payload, **kwargs: calls.append(payload) or (True, "")
+    )
+
+    poller._register_status_menu()
+
+    assert {payload["scope"]["chat_id"] for payload in calls} == {"456", "-100987"}
+    menus = {
+        payload["scope"]["chat_id"]: {entry["command"] for entry in payload["commands"]}
+        for payload in calls
+    }
+    assert "useprivate" in menus["456"]
+    assert "usehere" in menus["-100987"]
+    assert {"help", "status", "test", "filters"}.issubset(menus["-100987"])
+
+
+@pytest.mark.parametrize("command", ["/help", "/start", "/status", "/filters"])
+def test_private_owner_commands_still_work_when_alerts_go_to_group(monkeypatch, command):
+    poller = make_poller()
+    poller.notifier.set_chat_id("-100987")
+    sent = []
+    monkeypatch.setattr(
+        poller.notifier,
+        "send_text",
+        lambda text, **kwargs: sent.append((text, kwargs)) or True,
+    )
+
+    poller._handle_update(make_update(text=command))
+
+    assert len(sent) == 1
+    assert sent[0][1]["chat_id"] == "456"
+    assert sent[0][1]["update_diagnostic"] is False
+    assert sent[0][0]
+    if command in {"/help", "/start"}:
+        assert all(name in sent[0][0] for name in ("/status", "/test", "/filters"))
+        assert "group" in sent[0][0].lower()
+
+
+@pytest.mark.parametrize("command", ["/help", "/start", "/status", "/test", "/filters"])
+@pytest.mark.parametrize("location", ["another-owner", "unselected-group"])
+def test_new_commands_preserve_owner_and_destination_boundary(monkeypatch, command, location):
+    poller = make_poller()
+    poller.notifier.set_chat_id("-100987")
+    sent = []
+    monkeypatch.setattr(poller.notifier, "send_text", lambda *a, **k: sent.append(1) or True)
+    update = (
+        make_update(chat_id=999, sender_id=999, text=command)
+        if location == "another-owner"
+        else make_update(chat_id=-100222, sender_id=456, chat_type="group", text=command)
+    )
+
+    poller._handle_update(update)
+
+    assert sent == []
+
+
+def test_delivery_test_checks_group_destination_and_confirms_privately(monkeypatch):
+    import config
+
+    store = SeenStore("")
+    poller = make_poller(store)
+    poller.notifier.set_chat_id("-100987")
+    sent = []
+    monkeypatch.setattr(
+        poller.notifier,
+        "send_text",
+        lambda text, **kwargs: sent.append((text, kwargs)) or True,
+    )
+    monkeypatch.setattr(config, "rules_snapshot", lambda: pytest.fail("A test must bypass filters"))
+
+    poller._handle_update(make_update(text="/test"))
+
+    assert len(sent) == 2
+    assert sent[0][1]["chat_id"] == "-100987"
+    assert "test" in sent[0][0].lower()
+    assert "item" in sent[0][0].lower()
+    assert sent[1][1]["chat_id"] == "456"
+    assert "group" in sent[1][0].lower()
+    assert "delivered" in sent[1][0].lower()
+    assert len(store) == 0
+
+
+def test_failed_group_delivery_test_reports_failure_to_private_owner(monkeypatch):
+    poller = make_poller()
+    poller.notifier.set_chat_id("-100987")
+    sent = []
+    monkeypatch.setattr(
+        poller.notifier,
+        "send_text",
+        lambda text, **kwargs: sent.append((text, kwargs)) or kwargs["chat_id"] == "456",
+    )
+
+    poller._handle_update(make_update(text="/test"))
+
+    assert len(sent) == 2
+    assert "could not" in sent[1][0].lower()
+    assert "test" in poller.health()["diagnostic"].lower()
+
+
+@pytest.mark.parametrize("group", [False, True])
+def test_repeatable_delivery_test_preserves_item_diagnostic(monkeypatch, group):
+    poller = make_poller()
+    chat_id = -100987 if group else 456
+    if group:
+        poller.notifier.set_chat_id(str(chat_id))
+    poller.notifier.last_diagnostic = "last item failure"
+    sent = []
+    monkeypatch.setattr(
+        poller.notifier,
+        "send_text",
+        lambda text, **kwargs: sent.append((text, kwargs)) or True,
+    )
+
+    for update_id in (41, 42):
+        poller._handle_update(
+            make_update(
+                update_id, chat_id=chat_id, chat_type="group" if group else "private", text="/test"
+            )
+        )
+
+    assert len(sent) == 2
+    assert all(kwargs["chat_id"] == str(chat_id) for _, kwargs in sent)
+    assert all(kwargs["update_diagnostic"] is False for _, kwargs in sent)
+    assert poller.notifier.last_diagnostic == "last item failure"
+    assert poller.health()["last_reply_at"] is not None
+    assert poller.health()["diagnostic"] == ""
+
+
+def test_menu_failure_is_reported_without_disabling_typed_commands(monkeypatch):
+    poller = make_poller()
+
+    def fake_call(method, payload, *, timeout):
+        return ({}, "") if method == "getWebhookInfo" else (None, "Telegram returned HTTP 400")
+
+    monkeypatch.setattr(poller, "_api_call", fake_call)
+    sent = []
+    monkeypatch.setattr(poller.notifier, "send_text", lambda *a, **k: sent.append(1) or True)
+
+    assert poller._prepare() is True
+    poller._handle_update(make_update(text="/help"))
+
+    assert sent == [1]
+    assert "HTTP 400" in poller.health()["menu_diagnostic"]
+
+
+def test_filters_reports_live_rules_without_mutating_or_showing_priority(monkeypatch):
+    import config
+    from filters import Rule
+
+    poller = make_poller()
+    rules = [Rule(name="electronics", keywords=["TV"], min_value_usd=20, priority="low")]
+    sent = []
+    monkeypatch.setattr(config, "rules_snapshot", lambda: (rules, "user"))
+    monkeypatch.setattr(
+        poller.notifier,
+        "send_text",
+        lambda text, **kwargs: sent.append((text, kwargs)) or True,
+    )
+
+    poller._handle_update(make_update(text="/filters"))
+
+    assert len(sent) == 1
+    assert "electronics" in sent[0][0]
+    assert "TV" in sent[0][0]
+    assert "$20" in sent[0][0]
+    assert "priority" not in sent[0][0].lower()
+    assert "options" in sent[0][0].lower()
+    assert rules[0].priority == "low"
+
+
+def test_filters_callback_failure_is_safe_and_actionable(monkeypatch, caplog):
+    def filters_text():
+        raise RuntimeError("token 123:top-secret for chat 456")
+
+    poller = TelegramCommandPoller(
+        TelegramNotifier("123:top-secret", "456"),
+        SeenStore(""),
+        lambda: "healthy status",
+        filters_text=filters_text,
+    )
+    sent = []
+    monkeypatch.setattr(poller.notifier, "send_text", lambda text, **k: sent.append(text) or True)
+
+    poller._handle_update(make_update(text="/filters"))
+
+    assert len(sent) == 1
+    assert "/test" in sent[0]
+    assert "123:top-secret" not in caplog.text + sent[0]
+    assert "chat 456" not in caplog.text + sent[0]
+
+
+def test_one_broken_update_does_not_stop_batch_or_lose_offset(monkeypatch, caplog):
+    poller = make_poller()
+    sent = []
+    monkeypatch.setattr(
+        poller, "_api_call", lambda *args, **kwargs: ([make_update(41), make_update(42)], "")
+    )
+
+    def send(text, **kwargs):
+        if not sent:
+            sent.append("failed")
+            raise RuntimeError("private token 123:top-secret, chat 456")
+        sent.append(text)
+        return True
+
+    monkeypatch.setattr(poller.notifier, "send_text", send)
+    caplog.set_level(logging.ERROR)
+
+    assert poller._poll_once() is True
+    assert sent == ["failed", "healthy status"]
+    assert poller._next_offset == 43
+    assert "123:top-secret" not in caplog.text
+    assert "chat 456" not in caplog.text
+    assert "RuntimeError" in caplog.text
 
 
 def test_owner_can_move_alerts_to_group_and_choice_survives_restart(monkeypatch):

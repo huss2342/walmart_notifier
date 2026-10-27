@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reviewer alerts · Discord decision brief</title>
+<style>
+:root{color-scheme:light;--ink:#172333;--muted:#536172;--line:#d8dfe6;--accent:#315880;--paper:#fff;--wash:#f3f5f7;--soft:#e9eff5;--warn:#775022}
+*{box-sizing:border-box}body{margin:0;background:var(--wash);color:var(--ink);font:16px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif}main{max-width:1120px;margin:44px auto 70px;padding:0 28px}header{max-width:850px;margin-bottom:28px}.eyebrow{font-size:12px;letter-spacing:.13em;text-transform:uppercase;color:var(--accent);font-weight:700}h1{font-size:clamp(30px,5vw,48px);line-height:1.12;letter-spacing:-.035em;margin:12px 0 18px}h2{font-size:25px;line-height:1.3;margin:28px 0 13px}h3{font-size:18px;line-height:1.35;margin:0 0 10px}p{margin:0 0 14px}.lede{font-size:19px;color:var(--muted)}.meta,.small{font-size:13px;color:var(--muted)}nav{display:flex;gap:6px;padding:7px;background:#e5eaf0;border-radius:11px;margin-bottom:24px;width:max-content;max-width:100%}button{font:inherit;border:0;cursor:pointer}nav button{padding:9px 19px;border-radius:7px;color:#384b61;background:transparent;font-size:14px;font-weight:600}nav button[aria-selected=true]{background:white;color:#172333;box-shadow:0 1px 4px #14233a17}button:focus-visible,a:focus-visible,input:focus-visible{outline:3px solid #5688bb;outline-offset:4px}.panel[hidden]{display:none}.card{background:var(--paper);border:1px solid var(--line);border-radius:12px;padding:24px;margin-bottom:18px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.grid>.card{margin-bottom:0}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:20px}.stat{background:white;border:1px solid var(--line);border-radius:10px;padding:18px}.number{display:block;font-size:28px;line-height:1.2;font-weight:700;letter-spacing:-.025em}.label{display:block;font-size:12px;color:var(--muted);margin-top:8px}.pill{display:inline-block;border-radius:99px;background:var(--soft);color:#294d70;padding:3px 10px;font-size:12px;font-weight:650;margin-bottom:10px}.decision{border-left:4px solid var(--accent)}.caution{background:#faf6ef;border-color:#e4d6c1;color:#594224}table{width:100%;border-collapse:collapse;font-size:14px}th{text-align:left;font-size:12px;text-transform:uppercase;letter-spacing:.035em;color:var(--muted)}td,th{padding:11px 10px;border-bottom:1px solid var(--line);vertical-align:top}td:first-child,th:first-child{padding-left:0}tr:last-child td{border-bottom:0}.numeric{text-align:right;font-variant-numeric:tabular-nums}.table-wrap{overflow-x:auto}ul,ol{padding-left:23px;margin:10px 0 0}li{margin-bottom:9px}a{color:#245b8c;text-underline-offset:3px}.channel{font:13px/1.8 ui-monospace,Consolas,monospace;background:#f5f7f9;padding:15px;border-radius:7px;white-space:pre-wrap;overflow-wrap:anywhere}.mock{background:#29323e;color:#f2f4f6;border-radius:9px;padding:20px;font-size:14px;border-left:4px solid #88a9cb}.mock p{color:#d0d9e3}.mock .mock-title{font-weight:700;font-size:18px}.mock-links{display:flex;gap:8px;flex-wrap:wrap;margin-top:15px}.mock-links span{padding:6px 10px;background:#435570;border-radius:5px;font-size:12px}.mock .small{color:#bac9da}.flow{display:flex;flex-wrap:wrap;gap:9px;align-items:center;font-size:13px;margin-top:15px}.flow span{padding:8px 12px;background:var(--soft);border-radius:6px}.flow b{color:#768a9d}.source-list li{margin-bottom:12px}.two{display:grid;grid-template-columns:1.2fr 1fr;gap:24px}.field{display:flex;align-items:center;gap:12px;margin:15px 0}.field input{border:1px solid #b8c7d6;border-radius:5px;padding:8px;font:inherit;width:130px}output{display:block;padding:16px;background:var(--soft);border-radius:7px;min-height:90px}.foot{border-top:1px solid var(--line);margin-top:30px;padding-top:18px;color:var(--muted);font-size:13px}@media(max-width:760px){main{padding:0 18px;margin-top:26px}.stats{grid-template-columns:1fr 1fr}.grid,.two{grid-template-columns:1fr}nav{width:100%;overflow:auto}nav button{padding:8px 12px}.card{padding:19px}h1{font-size:34px}}
+@media(max-width:760px){nav{flex-wrap:wrap;overflow:visible;width:100%}nav button{flex:1 1 42%;text-align:center}}
+</style>
+</head>
+<body><main>
+<header><div class="eyebrow">Decision brief · October 21, 2026</div>
+<h1>A useful reviewer feed,<br>built around relevance and timing.</h1>
+<p class="lede">The existing notifier can support a Discord pilot. The history supports testing affordable plans; it does not support a $99 promise of frequent expensive products.</p>
+<p class="meta">Proposed design · local project and item-history review · public sources checked October 21 · no server or subscriptions created</p></header>
+<nav role="tablist" aria-label="Brief sections">
+<button id="tab-overview" role="tab" aria-selected="true" aria-controls="overview" tabindex="0">Overview</button>
+<button id="tab-competitors" role="tab" aria-selected="false" aria-controls="competitors" tabindex="-1">Competitors</button>
+<button id="tab-guidance" role="tab" aria-selected="false" aria-controls="guidance" tabindex="-1">Guidance</button>
+<button id="tab-sources" role="tab" aria-selected="false" aria-controls="sources" tabindex="-1">Sources</button>
+</nav>
+<section class="panel" id="overview" role="tabpanel" aria-labelledby="tab-overview">
+<div class="stats">
+<div class="stat"><span class="number">70,399</span><span class="label">Recorded Walmart item IDs</span></div>
+<div class="stat"><span class="number">95.7%</span><span class="label">Observed values below $40</span></div>
+<div class="stat"><span class="number">18</span><span class="label">IDs valued at $200 or more</span></div>
+<div class="stat"><span class="number">$14.99</span><span class="label">Median observed retail value</span></div>
+</div>
+<div class="card decision"><span class="pill">Recommended experiment</span><h3>Two paid plans. One free historical recap.</h3>
+<p><strong>$4.99 Starter:</strong> items below $40, released five minutes after detection. <strong>$19.99 Pro:</strong> all observed values, no intentional delivery delay, with price and department channels. Free members get up to ten representative families in a next-day recap.</p>
+<p class="small">Prices, cutoff and delays are proposals. The five-minute delay must be tested against real item lifetime. “Immediate” begins at detection, not Walmart listing publication.</p></div>
+<div class="grid">
+<div class="card"><h3>What the recorded values support</h3><div class="table-wrap"><table><thead><tr><th>Retail value</th><th class="numeric">Item IDs</th><th class="numeric">Share</th></tr></thead><tbody>
+<tr><td>$0–below $10</td><td class="numeric">19,422</td><td class="numeric">27.59%</td></tr>
+<tr><td>$10–below $20</td><td class="numeric">32,486</td><td class="numeric">46.15%</td></tr>
+<tr><td>$20–below $40</td><td class="numeric">15,447</td><td class="numeric">21.94%</td></tr>
+<tr><td>$40–below $80</td><td class="numeric">2,624</td><td class="numeric">3.73%</td></tr>
+<tr><td>$80–below $200</td><td class="numeric">402</td><td class="numeric">0.57%</td></tr>
+<tr><td>$200+</td><td class="numeric">18</td><td class="numeric">0.026%</td></tr>
+</tbody></table></div><p class="small" style="margin-top:12px">Recorded Sept 17–Oct 21, 2026, ending 8:40 AM CDT. Includes 540 recorded zeros and variants. These are handled IDs, not current stock, quantities or successful claims.</p></div>
+<div class="card"><h3>What changes in the project</h3><ul>
+<li>Replace promotional badges as “category” with item-level department classification and explicit unknowns.</li>
+<li>Keep the sampling URL parameters; the current extractor removes the query string.</li>
+<li>Capture every observed item before personal Telegram filtering.</li>
+<li>Store durable delivery jobs for each channel and release time.</li>
+<li>Keep account-wide claims remaining out of shared alerts.</li>
+</ul><p class="small">29,133 records explicitly say “variant on.” Grouping should reduce notification noise while retaining each eligible variant link.</p></div>
+</div>
+<div class="card caution" style="margin-top:18px"><h3>Commercial feasibility needs resolution</h3><p>Walmart’s current terms restrict commercial use and automated collection. Discord also restricts monetized offerings centered on third-party promotion. Obtain a permitted source and confirm the offering’s eligibility before public sales. These are unresolved dependencies, not approval findings.</p><p class="small"><a href="https://www.walmart.com/help/article/walmart.com-terms-of-use/3b75080af40340d6bbd596f116fae5a0">Walmart terms</a> · <a href="https://support.discord.com/hc/en-us/articles/10575066024983-Monetization-Policy">Discord monetization policy</a></p></div>
+</section>
+<section class="panel" id="competitors" role="tabpanel" aria-labelledby="tab-competitors" hidden>
+<div class="card"><span class="pill">Evidence, not a demand forecast</span><h2 style="margin-top:0">Adjacent services anchor the price test.</h2><p>No directly comparable paid Walmart reviewer alert service with independently verified demand was established in the targeted search. Amazon Vine tools are substitutes for attention and workflow, not the same inventory or audience.</p></div>
+<div class="grid"><div class="card"><h3>Ultraviner</h3><p><strong>Confirmed offer:</strong> alerts, rules and Discord integrations. Indexed official pricing lists Basic $4.99, Turbo $9.99 and Ultimate $14.99 monthly.</p><p><strong>Buyer appeal:</strong> a broader toolset at an accessible monthly price. This puts pressure on a $20 alert-only proposition.</p><p><strong>Where this project can separate:</strong> Walmart-specific discovery, portable links, relevance and clear feed health—once proved.</p><p class="small">The live page loads some pricing dynamically. Reconfirm checkout. Published prices do not establish subscriber counts or willingness to pay for Walmart. <a href="https://www.ultraviner.com/">Official product/pricing</a></p></div>
+<div class="card"><h3>SmartViner and free alternatives</h3><p><strong>Confirmed seller positioning:</strong> SmartViner advertises a free beta with filtering and alert features. Manual portal checking and existing community sharing remain alternatives.</p><p><strong>Buyer appeal:</strong> little or no subscription cost. The paid feed must save effort and reduce irrelevant notifications.</p><p><strong>Do not claim:</strong> superiority, guaranteed availability or proven paid demand. Vendor claims are not an independent performance comparison.</p><p class="small"><a href="https://smartviner.com/">Official SmartViner page</a> · <a href="https://www.reddit.com/r/VineHelper/comments/1o92mdx/new_connection_limits/">Anecdotal price resistance</a></p></div></div>
+<div class="card" style="margin-top:18px"><h3>What to say, clarify and prove</h3><div class="two"><div><p><strong>Say:</strong> “Choose the reviewer items you care about and open them in your own Walmart account.”</p><p><strong>Clarify:</strong> whether the buyer is already invited, which categories matter, how they currently find items, and how often delayed items remain useful.</p></div><div><p><strong>Prove:</strong> link behavior, classification accuracy, useful alerts, delivery uptime, actual payment and renewal.</p><p><strong>Avoid:</strong> guaranteed claims, admission to Walmart’s program, exclusive stock, guaranteed savings, or reducing competition outside this server.</p></div></div></div>
+<div class="card"><h3>A small pilot answers the missing questions</h3><ol><li>Recruit 10–20 existing invited reviewers after source/eligibility checks.</li><li>Run a 14-day private pilot with cancelable paid beta plans.</li><li>Collect voluntary unavailable/claimed/not-eligible feedback and search time saved.</li><li>Look for ten actual paying users and six second-month renewals before expanding. These are proposed gates, not industry benchmarks.</li></ol></div>
+</section>
+<section class="panel" id="guidance" role="tabpanel" aria-labelledby="tab-guidance" hidden>
+<div class="grid"><div class="card"><h3>A server that makes access understandable</h3><div class="channel">START HERE · everyone
+#welcome-and-eligibility
+#how-it-works · #feed-status
+
+COMMUNITY · everyone
+#general · #feature-requests
+#yesterday-recap
+
+STARTER · 5 min · below $40
+#items-under-40
+
+PRO · live by value
+#under-10 · #10-to-20 · #20-to-40
+#40-to-80 · #80-to-200 · #200-plus
+
+PRO · live by type
+#furniture · #electronics · #kitchen-appliances
+#home-storage-decor · #pets · other types
+
+PRO · optional muted firehose
+#all-items
+
+STAFF · private
+#collector-health · #delivery-errors
+#classification-review · #audit</div><p class="small" style="margin-top:12px">Pro items appear in one value channel and one primary category channel. Mute alternate views to avoid duplicate pings. Starter uses a separate channel so visibility cannot reveal Pro messages early.</p></div>
+<div class="card"><h3>An alert people can act on</h3><p class="small">Illustrative card based on a logged item; no live availability claim.</p><div class="mock"><div class="small">PETS · $80–below $200 · OBSERVED RETAIL</div><p class="mock-title">$99.99 · Indoor Dog Playpen</p><p>8-panel pet fence · white · 24 in.<br>Detected 12:00 · Last observed 12:00<br>Availability depends on your Walmart account.</p><div class="mock-links"><span>Open review item ↗</span><span>View product ↗</span><span>Reviewer catalog ↗</span></div><div class="small" style="margin-top:14px">Mock controls only. No claim is submitted.</div></div>
+<h3 style="margin-top:25px">Timing example</h3><p class="small">Illustrates the proposed policy from a 12:00 detection. This does not simulate Walmart stock.</p><div class="field"><label for="value">Retail value ($)</label><input id="value" type="number" min="0" max="10000" step="0.01" value="29.99"></div><output id="timing" for="value" aria-live="polite"></output></div></div>
+<div class="card" style="margin-top:18px"><h3>One durable pipeline</h3><div class="flow"><span>Browser observation</span><b>→</b><span>Normalize & tag</span><b>→</b><span>SQLite transaction</span><b>→</b><span>Destination jobs</span><b>→</b><span>Discord worker</span></div><p style="margin-top:16px">Acknowledge durable intake, then send independently by destination. Retries, rate limits and five-minute delays must survive restarts. Telegram failure must not stop discovery before paid launch.</p><p class="small">Do not queue the old history as new alerts. Live availability and listing publication times are not known. Verification pauses remain manual.</p></div>
+<div class="grid"><div class="card"><h3>Links and categories need evidence</h3><p>The supplied sampling link has contextual parameters and no obvious account token. Preserve an allowlisted review URL alongside the regular product URL, and test it with a second invited account.</p><p>Classify each item using department evidence, title rules and overrides. A search query is a hint: “wood” is not a product department.</p><p class="small">The browser connector could not access the user’s Chrome session. Cross-account and mobile behavior remain untested. Share neither the owner’s session nor claims allowance.</p></div>
+<div class="card"><h3>Keep launch scope small</h3><ol><li>Resolve source permission and test links.</li><li>Build one private durable Discord alert.</li><li>Add item tagging, value routing and visible feed health.</li><li>Prove permissions, delays, stale handling and restarts.</li><li>Connect eligible billing; run the capped paid pilot.</li><li>Add opt-in personal DMs if demand warrants them.</li></ol><p class="small">Native server billing is a candidate if the creator and offering qualify. Paid app features can have separate Premium Apps obligations. External checkout is not automatic policy clearance.</p></div></div>
+</section>
+<section class="panel" id="sources" role="tabpanel" aria-labelledby="tab-sources" hidden>
+<div class="card"><h3>Source posture</h3><p><strong>Local evidence:</strong> current extension and Python source, active saved filters, 58,108 snapshot item rows plus 12,291 appended item rows; marker events excluded. Counts reconcile to 70,399 distinct IDs with no malformed log lines or overlap. Recent Docker logs establish successful value alerts, connection failures and verification pauses.</p><p><strong>Limitations:</strong> account-specific, retained observation history; 29,133 explicit variants; 540 zeros. Titles can be truncated. No full URL, image, department, last-seen or stock history is retained in this ledger. Seven-day and 14-day slices end at the latest record, not at report generation.</p><p><strong>Not verified:</strong> permission for commercial reuse, Discord acceptance of the offering, current checkout totals, customer payment behavior, cross-account claim eligibility, complete catalog coverage or live stock.</p><p class="small">CRM, internal messaging and warehouse integrations were not relevant. No customer payment data or user Walmart credentials were collected.</p></div>
+<div class="card"><h3>Public references · checked October 21, 2026</h3><ol class="source-list">
+<li><a href="https://www.walmart.com/help/article/walmart.com-terms-of-use/3b75080af40340d6bbd596f116fae5a0">Walmart Site Terms</a> — commercial-use and automated-collection restrictions.</li>
+<li><a href="https://www.walmart.com/reviews/terms-and-conditions">Recognized Reviewer terms</a> — invitation, account eligibility, ordering and incorporated terms.</li>
+<li><a href="https://docs.discord.com/developers/topics/permissions">Discord permissions</a> and <a href="https://github.com/discord/discord-api-docs/blob/main/developers/topics/threads.mdx">threads</a> — access is controlled through roles/channels; forum tags are not paid entitlements.</li>
+<li><a href="https://docs.discord.com/developers/components/reference">Discord components</a>, <a href="https://docs.discord.com/developers/resources/message">messages</a> and <a href="https://docs.discord.com/developers/topics/rate-limits">rate limits</a> — URL buttons, message identity and response-driven retries.</li>
+<li><a href="https://creator-support.discord.com/hc/en-us/articles/10423011974551-Server-Shop-For-Server-Owners-and-Admins">Discord creator setup</a> and <a href="https://support.discord.com/hc/en-us/articles/5330075836311-Monetization-Terms">Monetization Terms</a> — eligibility, paid tiers and fees; actual onboarding is untested.</li>
+<li><a href="https://support.discord.com/hc/en-us/articles/10575066024983-Monetization-Policy">Discord Monetization Policy</a> and <a href="https://support-dev.discord.com/hc/en-us/articles/23810643331735-Premium-Apps-Required-Support-for-Monetizing-Apps">Premium Apps requirements</a> — offering restrictions and supported paid-app purchase obligations.</li>
+<li><a href="https://www.ultraviner.com/">Ultraviner</a> and <a href="https://smartviner.com/">SmartViner</a> — adjacent product/pricing offers, not independently verified demand.</li>
+<li><a href="https://www.reddit.com/r/VineHelper/comments/1o92mdx/new_connection_limits/">VineHelper price discussion</a> — self-selected community signal.</li>
+<li><a href="https://whop.com/network/pricing/">Whop payments pricing</a> — base processing and separate services; not a verified all-in Discord subscription quote.</li>
+</ol></div>
+</section>
+<footer class="foot">Execution documents: tasks/plan.md and tasks/todo.md. Reproducible measurements: tasks/research/analyze_item_history.py and item-history-summary.json. Planning deliverables only; existing production files and settings were preserved.</footer>
+</main>
+<script>
+const tabs = Array.from(document.querySelectorAll('[role="tab"]'));
+function selectTab(tab, focus = false) {
+  for (const candidate of tabs) {
+    const active = candidate === tab;
+    candidate.setAttribute('aria-selected', String(active));
+    candidate.tabIndex = active ? 0 : -1;
+    document.getElementById(candidate.getAttribute('aria-controls')).hidden = !active;
+  }
+  if (focus) tab.focus();
+}
+for (const tab of tabs) {
+  tab.addEventListener('click', () => selectTab(tab));
+  tab.addEventListener('keydown', event => {
+    const index = tabs.indexOf(tab);
+    let next;
+    if (event.key === 'ArrowRight') next = tabs[(index + 1) % tabs.length];
+    if (event.key === 'ArrowLeft') next = tabs[(index + tabs.length - 1) % tabs.length];
+    if (event.key === 'Home') next = tabs[0];
+    if (event.key === 'End') next = tabs[tabs.length - 1];
+    if (next) { event.preventDefault(); selectTab(next, true); }
+  });
+}
+const amount = document.getElementById('value');
+const timing = document.getElementById('timing');
+function showTiming() {
+  if (amount.value === '') { timing.textContent = 'Enter an observed retail value to inspect routing.'; return; }
+  const value = Number(amount.value);
+  if (!Number.isFinite(value) || value <= 0) {
+    timing.textContent = 'Unverified value: exclude from Starter pending review. Pro may receive a clearly labeled value-unverified item.';
+    return;
+  }
+  const cents = Math.round(value * 100);
+  timing.textContent = cents < 4000
+    ? 'Pro: 12:00. Starter: 12:05, subject to expiry or observed unavailability. Free: possible next-day recap inclusion; capped at ten families.'
+    : 'Pro: 12:00. Starter: excluded by the $40 value ceiling. Free: possible next-day historical recap inclusion; capped at ten families.';
+}
+amount.addEventListener('input', showTiming);
+showTiming();
+</script>
+</body></html>

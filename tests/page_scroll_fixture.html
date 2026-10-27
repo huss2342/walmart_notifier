@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Results page scrolling test</title>
+<style>
+body { font: 18px system-ui; margin: 0; background: #eef3f7; color: #162332; }
+header { position: fixed; top: 0; padding: 14px 22px; background: white; width: 100%; box-sizing: border-box; z-index: 2; box-shadow: 0 1px 8px #bcc8d2; }
+button { font: inherit; margin-right: 12px; padding: 6px 14px; }
+main { padding-top: 150px; }
+article { height: 750px; margin: 16px 24px; background: white; padding: 20px; border-radius: 12px; }
+pre { font-size: 14px; white-space: pre-wrap; margin: 8px 0 0; }
+</style>
+<header><strong>Results page scrolling test</strong><p><button id="start">Read this page</button><button id="stop">Stop reading</button></p><pre id="status">Ready. Uses the production page-scroll module.</pre></header>
+<main id="cards"></main>
+<script src="/page-scroll.js"></script>
+<script>
+  const cards = document.getElementById('cards');
+  for (let i = 1; i <= 10; i++) {
+    const card = document.createElement('article');
+    card.textContent = `Example results block ${i} of 10`;
+    cards.append(card);
+  }
+  let controller, running = false, positions = [];
+  addEventListener('scroll', () => { if (running) positions.push({ y: scrollY, ms: Math.round(performance.now()) }); });
+  document.getElementById('start').onclick = async () => {
+    controller?.abort();
+    controller = new AbortController();
+    running = true; positions = [];
+    document.getElementById('status').textContent = 'Reading…';
+    const result = await ReviewerPageScroll.run({ window, document, signal: controller.signal,
+      startAtTop: true, budgetMs: 8000 });
+    running = false;
+    window.scrollFixtureResult = { ...result, y: scrollY, bottom: document.documentElement.scrollHeight - innerHeight,
+      samples: positions.length, monotonic: positions.every((p, i) => !i || p.y >= positions[i-1].y),
+      positions };
+    document.getElementById('status').textContent = JSON.stringify({ ...window.scrollFixtureResult, positions: undefined });
+  };
+  document.getElementById('stop').onclick = () => controller?.abort();
+</script></html>

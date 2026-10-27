@@ -142,6 +142,8 @@ def _strict_json_item(entry: Any, index: int, source: str) -> Item:
         raise ValueError(f"{label}.claims_remaining must be a non-negative integer")
     if "query" in payload and not isinstance(payload["query"], str):
         raise ValueError(f"{label}.query must be a string")
+    if "available" in payload and not isinstance(payload["available"], bool):
+        raise ValueError(f"{label}.available must be a boolean")
 
     payload.setdefault("title", "")
     payload.setdefault("source", source)

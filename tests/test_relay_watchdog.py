@@ -90,25 +90,48 @@ def test_an_install_that_never_relayed_is_measured_from_startup():
 
 
 def test_a_provider_failure_does_not_kill_the_watchdog():
-    dog = watchdog(FakeStatus(age_seconds=7 * 3600), FakeNotifier(raises=True))
+    notifier = FakeNotifier(raises=True)
+    dog = watchdog(FakeStatus(age_seconds=7 * 3600), notifier)
     assert dog.check() is False
-    # The episode is still marked, so it will not retry in a tight loop.
     assert dog.check() is False
+
+    notifier.raises = False
+    assert dog.check() is True
+    assert dog.check() is False
+    assert len(notifier.sent) == 1
 
 
 def test_undeliverable_alert_is_reported_as_not_sent():
-    dog = watchdog(FakeStatus(age_seconds=7 * 3600), FakeNotifier(delivered=False))
+    notifier = FakeNotifier(delivered=False)
+    dog = watchdog(FakeStatus(age_seconds=7 * 3600), notifier)
     assert dog.check() is False
+
+    notifier.delivered = True
+    assert dog.check() is True
+    assert dog.check() is False
+    assert len(notifier.sent) == 2
 
 
 @pytest.mark.parametrize("value,expected_hours", [
     ("2", 2.0), ("0.5", 0.5), ("", DEFAULT_STALE_HOURS), ("junk", DEFAULT_STALE_HOURS),
     ("0", DEFAULT_STALE_HOURS), ("-3", DEFAULT_STALE_HOURS), (None, DEFAULT_STALE_HOURS),
+    ("nan", DEFAULT_STALE_HOURS), ("inf", DEFAULT_STALE_HOURS),
+    ("-inf", DEFAULT_STALE_HOURS), ("1e309", DEFAULT_STALE_HOURS),
 ])
 def test_threshold_comes_from_the_environment_with_a_sane_fallback(value, expected_hours):
     env = {} if value is None else {"STALE_RELAY_HOURS": value}
     dog = RelayWatchdog.from_env(FakeStatus(age_seconds=0), FakeNotifier(), env)
     assert dog.stale_seconds == pytest.approx(expected_hours * 3600)
+
+
+def test_default_alerts_after_four_missed_half_hour_sweeps():
+    notifier = FakeNotifier()
+    status = FakeStatus(age_seconds=2 * 3600 - 1)
+    dog = RelayWatchdog.from_env(status, notifier, {})
+
+    assert dog.check() is False
+    status.age_seconds = 2 * 3600
+    assert dog.check() is True
 
 
 def test_missing_age_is_not_treated_as_stale():

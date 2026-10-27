@@ -1,0 +1,47 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Passive Walmart challenge detection regression</title>
+<h1>Passive challenge watcher — local fixture</h1>
+<p id="result" role="status">Running…</p>
+<div id="px-captcha" hidden>Robot or human? Press &amp; Hold</div>
+<script src="/fixture-stubs.js"></script>
+<script src="/page-controls.js"></script>
+<script src="/verification-watch.js"></script>
+<script>
+(async () => {
+  const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const assert = (condition, message) => { if (!condition) throw new Error(message); };
+  const result = document.getElementById('result');
+  const widget = document.getElementById('px-captcha');
+  const probe = () => {
+    let answer;
+    fixtureListeners[0]({ type: 'reviewer:challenge-probe' }, {}, value => { answer = value; });
+    return answer;
+  };
+  try {
+    assert(fixtureMessages.length === 0 && probe().challenge === false,
+      'A hidden placeholder was mistaken for a check');
+    widget.hidden = false;
+    await wait(250);
+    assert(probe().challenge && fixtureMessages.length === 1,
+      'A visible ordinary-page check was not reported');
+    widget.setAttribute('title', 'DOM changed');
+    await wait(250);
+    assert(fixtureMessages.length === 1, 'An unchanged episode was reported twice');
+    widget.hidden = true;
+    await wait(250);
+    assert(probe().challenge === false, 'A cleared check did not pass a fresh probe');
+    widget.hidden = false;
+    await wait(250);
+    assert(fixtureMessages.length === 2, 'A new challenge episode was not reported');
+    assert(fixtureMessages.every(message => message.type === 'reviewer:verification'),
+      'The passive watcher started scanner work');
+    widget.hidden = true;
+    await wait(250);
+    result.textContent = 'PASS: ordinary-page challenges are reported once per episode, hidden placeholders stay clear, recovery probes read the current DOM, and no scanner work starts.';
+  } catch (error) {
+    result.textContent = `FAIL: ${error.message}`;
+    console.error(error);
+  }
+})();
+</script>

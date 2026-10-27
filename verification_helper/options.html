@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Reviewer Verification Assistant</title>
+<style>
+  body {font:16px/1.6 system-ui,sans-serif;max-width:42rem;margin:3rem auto;padding:0 1rem;color:#202a35}
+  button {font:inherit;padding:.6rem 1rem;margin:.7rem .5rem .7rem 0;cursor:pointer}
+  #disable {background:#fff;color:#8b1d1d;border:1px solid #8b1d1d}
+  #enable {background:#0071dc;color:white;border:0}
+  #status {padding:1rem;background:#eef3f7;border-radius:.5rem}
+</style>
+<h1>Reviewer Verification Assistant</h1>
+<p>Automatically attempt supported Press &amp; Hold checks on your signed-in Walmart reviewer pages.</p>
+<p><strong>Experimental:</strong> live reliability is not established. Readable completion feedback
+  releases the button early; otherwise the assistant releases at 15 seconds. It waits for a usable
+  catalogue before reporting recovery. A failed or uncertain attempt keeps monitoring paused.</p>
+<p>This companion has Chrome debugger access, which is a broad permission. Its code restricts
+  attachment and input to Walmart reviewer and blocked pages. It does not move your desktop mouse.
+  Chrome may display a debugging banner; another debugger can prevent an attempt.</p>
+<p>One attempt per observed episode, up to three per hour, at least one minute apart.
+  Attempts are remembered across worker restarts. Disabling stops an active hold at its next check.
+  No cookies, credentials, page text or screenshots are saved or sent to a service.</p>
+<button id="enable" type="button">Enable automatic attempts</button>
+<button id="disable" type="button">Disable automatic attempts</button>
+<div id="status" role="status" aria-live="polite">Loading…</div>
+<script src="options.js"></script>
+</html>

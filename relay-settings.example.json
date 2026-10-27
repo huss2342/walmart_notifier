@@ -1,0 +1,6 @@
+{
+  "schemaVersion": 1,
+  "refreshMinutes": 10,
+  "pageDelaySeconds": 15,
+  "sweepMode": "none"
+}

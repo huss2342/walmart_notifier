@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "auxiliaryDepartments": true,
+  "auxiliaryKeywords": true,
+  "auxiliaryBrands": false,
+  "auxiliaryKeywordQueries": null,
+  "groupScannerTabs": true,
+  "rotateScannerTabs": true,
+  "verificationAssistEnabled": false,
+  "verificationNativeEnabled": false,
+  "pathPattern": "^/reviews/claim-product"
+}

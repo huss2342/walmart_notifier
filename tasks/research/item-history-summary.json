@@ -1,0 +1,276 @@
+{
+  "captured_at_utc": "2026-10-21T17:29:46+00:00",
+  "sources": {
+    "data/seen.json": {
+      "sha256": "cc93d6ab10150ddb1f14807f235f402fb8bdfec5f3e74f1ac07f3a9225a84d72",
+      "bytes": 13142155,
+      "item_ids": 58108
+    },
+    "data/seen.log": {
+      "sha256": "4fafb4d4a7d4da84735be1e78c22994fba607caf3baacf437200e531240e6ada",
+      "bytes": 7667460,
+      "event_counts": {
+        "item": 12291,
+        "marker": 15644
+      }
+    }
+  },
+  "malformed_log_lines": 0,
+  "overlapping_item_events": 0,
+  "item_ids": 70399,
+  "known_values": 70399,
+  "unknown_or_invalid_values": 0,
+  "non_walmart_id_records": 1,
+  "recorded_from_utc": "2026-09-17T15:06:47+00:00",
+  "recorded_through_utc": "2026-10-21T13:40:24+00:00",
+  "zero_value_ids": 540,
+  "explicit_variant_ids": 29133,
+  "high_value_explicit_variant_ids": 6,
+  "min_value_usd": 0.0,
+  "max_value_usd": 399.99,
+  "percentiles_nearest_rank_index": {
+    "0.1": 5.99,
+    "0.25": 9.99,
+    "0.5": 14.99,
+    "0.75": 21.49,
+    "0.9": 30.99,
+    "0.95": 39.99,
+    "0.99": 69.99
+  },
+  "bands": [
+    {
+      "band": "$0 to <$10",
+      "lower_inclusive": 0,
+      "upper_exclusive": 10,
+      "item_ids": 19422,
+      "share_pct": 27.5885
+    },
+    {
+      "band": "$10 to <$20",
+      "lower_inclusive": 10,
+      "upper_exclusive": 20,
+      "item_ids": 32486,
+      "share_pct": 46.1455
+    },
+    {
+      "band": "$20 to <$40",
+      "lower_inclusive": 20,
+      "upper_exclusive": 40,
+      "item_ids": 15447,
+      "share_pct": 21.9421
+    },
+    {
+      "band": "$40 to <$80",
+      "lower_inclusive": 40,
+      "upper_exclusive": 80,
+      "item_ids": 2624,
+      "share_pct": 3.7273
+    },
+    {
+      "band": "$80 to <$200",
+      "lower_inclusive": 80,
+      "upper_exclusive": 200,
+      "item_ids": 402,
+      "share_pct": 0.571
+    },
+    {
+      "band": "$200+",
+      "lower_inclusive": 200,
+      "upper_exclusive": null,
+      "item_ids": 18,
+      "share_pct": 0.0256
+    }
+  ],
+  "trailing_days_ending_at_latest_record": {
+    "7": {
+      "item_ids": 9227,
+      "counts_at_least_usd": {
+        "40": 493,
+        "80": 50,
+        "100": 19,
+        "200": 1
+      }
+    },
+    "14": {
+      "item_ids": 17339,
+      "counts_at_least_usd": {
+        "40": 923,
+        "80": 104,
+        "100": 42,
+        "200": 1
+      }
+    }
+  },
+  "daily_recorded_ids_utc": {
+    "2026-09-17": 3175,
+    "2026-09-18": 3485,
+    "2026-09-19": 10362,
+    "2026-09-20": 2838,
+    "2026-09-21": 5742,
+    "2026-09-22": 3854,
+    "2026-09-23": 3794,
+    "2026-09-24": 2593,
+    "2026-09-25": 2446,
+    "2026-09-26": 1476,
+    "2026-09-27": 2172,
+    "2026-09-28": 2235,
+    "2026-09-29": 1849,
+    "2026-09-30": 978,
+    "2026-10-01": 571,
+    "2026-10-02": 748,
+    "2026-10-03": 1737,
+    "2026-10-04": 253,
+    "2026-10-05": 384,
+    "2026-10-06": 1790,
+    "2026-10-07": 578,
+    "2026-10-09": 2204,
+    "2026-10-11": 2746,
+    "2026-10-12": 98,
+    "2026-10-13": 1611,
+    "2026-10-14": 2052,
+    "2026-10-15": 1760,
+    "2026-10-16": 2395,
+    "2026-10-17": 119,
+    "2026-10-18": 826,
+    "2026-10-19": 2013,
+    "2026-10-20": 1271,
+    "2026-10-21": 244
+  },
+  "top_value_sample": [
+    {
+      "item_id": "ip-20360508509",
+      "seen_at": "2026-09-21T02:57:28+00:00",
+      "title": "9ft, variant on Goosiay 7 ft Pre-Lit Norfolk Pine Christmas Tree, PE Slim Artificial Tree with 300 Warm White & Multicol",
+      "value_usd": 399.99
+    },
+    {
+      "item_id": "ip-20371363241",
+      "seen_at": "2026-09-21T02:57:27+00:00",
+      "title": "Goosiay 7 ft Pre-Lit Norfolk Pine Christmas Tree, PE Slim Artificial Tree with 300 Warm White & Multicolor 10-Function L",
+      "value_usd": 399.99
+    },
+    {
+      "item_id": "ip-20400810352",
+      "seen_at": "2026-09-21T02:57:28+00:00",
+      "title": "12ft, variant on Goosiay 7 ft Pre-Lit Norfolk Pine Christmas Tree, PE Slim Artificial Tree with 300 Warm White & Multico",
+      "value_usd": 399.99
+    },
+    {
+      "item_id": "ip-20633469130",
+      "title": "VOCIC AX25 PRO Electric Floor Lift Chair with Premium Upholstered Seat for Elderly, 300 lbs Weight Capacity, Beige",
+      "value_usd": 379.99,
+      "seen_at": "2026-10-19T15:22:33+00:00"
+    },
+    {
+      "item_id": "ip-20802151173",
+      "seen_at": "2026-09-21T11:33:15+00:00",
+      "title": "Matte Black, variant on Kelloza Tub Shower Door 56-60\" W x 58\" H, Frameless Sliding Glass Door, 1/4\" (6mm) SGCC Tempered",
+      "value_usd": 339.99
+    },
+    {
+      "item_id": "ip-20851263325",
+      "seen_at": "2026-09-21T11:33:13+00:00",
+      "title": "Kelloza Tub Shower Door 56-60\" W x 58\" H, Frameless Sliding Glass Door, 1/4\" (6mm) SGCC Tempered Glass, Waterproof Strip",
+      "value_usd": 339.99
+    },
+    {
+      "item_id": "ip-20863018767",
+      "seen_at": "2026-09-21T11:33:14+00:00",
+      "title": "Brushed Gold, variant on Kelloza Tub Shower Door 56-60\" W x 58\" H, Frameless Sliding Glass Door, 1/4\" (6mm) SGCC Tempere",
+      "value_usd": 339.99
+    },
+    {
+      "item_id": "ip-20877556036",
+      "seen_at": "2026-09-21T11:33:14+00:00",
+      "title": "Chrome, variant on Kelloza Tub Shower Door 56-60\" W x 58\" H, Frameless Sliding Glass Door, 1/4\" (6mm) SGCC Tempered Glas",
+      "value_usd": 339.99
+    },
+    {
+      "item_id": "ip-20333973931",
+      "seen_at": "2026-09-21T08:13:07+00:00",
+      "title": ", 7ft Pre-Lit Pre-Decorated Flocked Christmas Tree with Red Berries & Pinecones, 350 Warm White & Multicolor LED Lights,",
+      "value_usd": 339.98
+    },
+    {
+      "item_id": "ip-20350262917",
+      "seen_at": "2026-09-23T00:33:44+00:00",
+      "title": "7FT Pre-Lit Flocked Christmas Tree, 300 Warm White LED Lights, 1060 PE & PVC Tips Snowy Artificial Christmas Tree",
+      "value_usd": 275.99
+    },
+    {
+      "item_id": "ip-20312916660",
+      "seen_at": "2026-09-23T12:03:38+00:00",
+      "title": "6FT, variant on Goosiay 7ft Pre-Lit Christmas Tree with 2264 Branch Tips, 350 Multicolor LED Lights, Slim Artificial Chr",
+      "value_usd": 259.99
+    },
+    {
+      "item_id": "ip-20360458666",
+      "seen_at": "2026-09-23T12:03:37+00:00",
+      "title": "Goosiay 7ft Pre-Lit Christmas Tree with 2264 Branch Tips, 350 Multicolor LED Lights, Slim Artificial Christmas Tree for ",
+      "value_usd": 259.99
+    },
+    {
+      "item_id": "ip-19676954215",
+      "seen_at": "2026-09-23T06:23:20+00:00",
+      "title": "990 990X 990XL 990XC Ink Cartridges High Yield Black Cyan Magenta Yellow Replacement for PageWide Color 755dn MFP 774dn ",
+      "value_usd": 258.99
+    },
+    {
+      "item_id": "ip-20498368171",
+      "seen_at": "2026-09-23T11:29:55+00:00",
+      "title": ", 9FT Pre-Lit Full Christmas Tree,2468 Dense PVC Branch Tips,800 Stepless Dimmable Dual Color LED,Foldable Metal Stand f",
+      "value_usd": 251.98
+    },
+    {
+      "item_id": "ip-19645708152",
+      "seen_at": "2026-09-23T22:08:56+00:00",
+      "title": "Monopoly Legacy Edition by WS Game Company Deluxe Cherry Wood Cabinet with Vegan Leather Rolling Area Premium Collectors",
+      "value_usd": 249.99
+    },
+    {
+      "item_id": "ip-20844561976",
+      "seen_at": "2026-09-24T10:00:04+00:00",
+      "title": ", Ktaxon Compact Electric Dryer, 1.7 cu. ft. 9LBS Capacity, Touch Panel, White",
+      "value_usd": 229.99
+    },
+    {
+      "item_id": "ip-21050121136",
+      "seen_at": "2026-10-01T17:34:32+00:00",
+      "title": "Pure Garden 28.35\u201d Outdoor Fire Pit with Faux Wood Look - Outdoor Firepit with Cover, Gray",
+      "value_usd": 219.95
+    },
+    {
+      "item_id": "ip-1757784167",
+      "seen_at": "2026-09-21T05:26:41+00:00",
+      "title": "ANDONT 4-Stack LED Andon Tower Signal Light with Buzzer, Red/Yellow/Green/Blue, On/Off/Flash, Plug-and-Play",
+      "value_usd": 217.54
+    },
+    {
+      "item_id": "ip-20257421431",
+      "seen_at": "2026-09-24T23:33:07+00:00",
+      "title": "RIG 900 Max HS Dual Wireless Gaming Headset with Bluetooth Officially Licensed for Playstation PS5 - Multi-Function Char",
+      "value_usd": 199.99
+    },
+    {
+      "item_id": "ip-20371313357",
+      "seen_at": "2026-09-22T17:29:23+00:00",
+      "title": "7FT, variant on Goosiay 6FT Pre-Lit Artificial Christmas Tree, Slim Cypress Christmas Tree with Realistic Branches, 877 ",
+      "value_usd": 199.99
+    }
+  ],
+  "record_fields": [
+    "seen_at",
+    "title",
+    "value_usd"
+  ],
+  "caveats": [
+    "Handled item IDs, including filtered and seeded records, are not successful alerts or claims.",
+    "Variants are separate Walmart item IDs; explicit variant text is only a lower bound on families.",
+    "seen_at is a handling timestamp, not a Walmart listing timestamp or verified availability.",
+    "No department, source query, last-seen, full URL, image, or stock history is retained here.",
+    "Historical titles may be truncated to 120 characters; older rows can be longer.",
+    "Zero retail values are recorded observations and need separate quality review.",
+    "Coverage depends on the owner's account, query modes, retention, and scanner uptime.",
+    "Trailing windows end at the latest recorded timestamp, not at execution time."
+  ]
+}

@@ -29,5 +29,7 @@ jobs:
           node-version: "20"
       # Cheap syntax gate: a typo in the service worker is otherwise only
       # visible as a silently dead relay.
-      - run: for f in extension/*.js; do node --check "$f"; done
+      - run: for f in extension/*.js verification_helper/*.js; do node --check "$f"; done
+      - run: node --test tests/test_extension_runtime.mjs tests/test_extension_discord.mjs tests/test_scan_timing.mjs tests/test_challenge_evidence.mjs tests/test_verification_watch.mjs tests/test_verification_assist.mjs tests/test_verification_automation.mjs tests/test_integrated_verification.mjs tests/test_native_verification.mjs tests/test_facet_controls.mjs tests/test_facet_input.mjs tests/test_department_data.mjs tests/test_auxiliary_options.mjs tests/test_auxiliary_scans.mjs tests/test_tab_workspace.mjs tests/test_scanner_control.mjs tests/test_page_scroll.mjs tests/test_scan_metrics.mjs
       - run: python3 -c "import json; json.load(open('extension/manifest.json'))"
+      - run: python3 -c "import json; json.load(open('verification_helper/manifest.json'))"

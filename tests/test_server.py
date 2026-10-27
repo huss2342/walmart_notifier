@@ -10,10 +10,12 @@ import socket
 import threading
 import urllib.error
 import urllib.request
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 import server
+from scanner_control import ScannerCommandsStore, ScannerSettingsStore, ScannerStatusStore
 from sources.webhook_source import MAX_ITEMS
 from state import SeenStore
 
@@ -59,6 +61,13 @@ def live_server(monkeypatch, tmp_path):
     # directly, so they have to supply it the same way.
     server.Handler.notifier = RecordingNotifier.from_env()
     server.Handler.runtime_status = server.RuntimeStatus(server.Handler.store)
+    server.Handler.browser_diagnostics = server.BrowserDiagnosticsStore(
+        tmp_path / "browser-diagnostics.json"
+    )
+    server.Handler.relay_settings = server.RelaySettingsStore(tmp_path / "relay-settings.json")
+    server.Handler.scanner_settings = ScannerSettingsStore(tmp_path / "scanner-settings.json")
+    server.Handler.scanner_commands = ScannerCommandsStore(tmp_path / "scanner-commands.json")
+    server.Handler.scanner_status = ScannerStatusStore(tmp_path / "scanner-status.json")
     server.Handler.telegram_commands = None
 
     from http.server import ThreadingHTTPServer
@@ -88,6 +97,92 @@ def get(base, path="/health"):
         return resp.status, json.loads(resp.read())
 
 
+def test_scan_settings_json_roundtrip_and_manual_file_edit(live_server):
+    assert get(live_server, "/relay-settings") == (200, {"settings": None})
+    scan = {"schemaVersion": 1, "refreshMinutes": 10,
+            "pageDelaySeconds": 15, "sweepMode": "none"}
+    request = urllib.request.Request(
+        f"{live_server}/relay-settings", json.dumps(scan).encode(),
+        {"Content-Type": "application/json"}, method="PUT",
+    )
+    with urllib.request.urlopen(request) as response:
+        assert response.status == 200
+        assert json.load(response) == {"settings": scan}
+    assert get(live_server, "/relay-settings") == (200, {"settings": scan})
+    changed = {**scan, "refreshMinutes": 0}
+    server.Handler.relay_settings.path.write_text(json.dumps(changed), encoding="utf-8")
+    assert get(live_server, "/relay-settings") == (200, {"settings": changed})
+    assert len(server.Handler.store) == 0
+    assert server.Handler.notifier.sent == []
+    assert server.Handler.runtime_status.snapshot()["last_successful_relay"] is None
+
+
+@pytest.mark.parametrize("method", ["GET", "PUT"])
+def test_scan_settings_require_existing_api_token(live_server, method):
+    server.Handler.token = "correct-token"
+    request = urllib.request.Request(
+        f"{live_server}/relay-settings", b"{}" if method == "PUT" else None,
+        {"Content-Type": "application/json"}, method=method,
+    )
+    with pytest.raises(urllib.error.HTTPError) as error:
+        urllib.request.urlopen(request)
+    assert error.value.code == 403
+
+
+@pytest.mark.parametrize("headers,status", [
+    ({"Origin": "https://evil.example", "Content-Type": "application/json"}, 403),
+    ({"Content-Type": "text/plain"}, 415),
+])
+def test_scan_settings_reject_web_origins_and_non_json(live_server, headers, status):
+    request = urllib.request.Request(
+        f"{live_server}/relay-settings", b"{}", headers, method="PUT",
+    )
+    with pytest.raises(urllib.error.HTTPError) as error:
+        urllib.request.urlopen(request)
+    assert error.value.code == status
+
+
+def test_scan_settings_invalid_input_and_bad_file_are_generic(live_server):
+    request = urllib.request.Request(
+        f"{live_server}/relay-settings", b'{"token":"private-data"}',
+        {"Content-Type": "application/json"}, method="PUT",
+    )
+    with pytest.raises(urllib.error.HTTPError) as error:
+        urllib.request.urlopen(request)
+    assert error.value.code == 400
+    assert b"private-data" not in error.value.read()
+    server.Handler.relay_settings.path.write_text('{"token":"private-data"}', encoding="utf-8")
+    with pytest.raises(urllib.error.HTTPError) as error:
+        get(live_server, "/relay-settings")
+    assert error.value.code == 400
+    assert b"private-data" not in error.value.read()
+
+
+def test_scan_settings_write_error_is_generic_and_size_limit_precedes_body_read(
+    live_server, monkeypatch,
+):
+    def fail_save(value):
+        raise OSError("private path and error details")
+
+    monkeypatch.setattr(server.Handler.relay_settings, "save", fail_save)
+    request = urllib.request.Request(
+        f"{live_server}/relay-settings", b"{}",
+        {"Content-Type": "application/json"}, method="PUT",
+    )
+    with pytest.raises(urllib.error.HTTPError) as error:
+        urllib.request.urlopen(request)
+    assert error.value.code == 500
+    assert b"private" not in error.value.read()
+    request = urllib.request.Request(
+        f"{live_server}/relay-settings", b"{}",
+        {"Content-Type": "application/json", "Content-Length": str(16 * 1024 + 1)},
+        method="PUT",
+    )
+    with pytest.raises(urllib.error.HTTPError) as error:
+        urllib.request.urlopen(request)
+    assert error.value.code == 413
+
+
 ITEM = {
     "item_id": "ip-20583371838",
     "title": "Kojic Acid Cleansing Soap Bar",
@@ -95,6 +190,67 @@ ITEM = {
     "url": "https://www.walmart.com/ip/Kojic-Acid-Soap/20583371838",
     "claims_remaining": 3,
 }
+
+
+def diagnostic_report():
+    now = int(datetime.now(UTC).timestamp() * 1000)
+    return {
+        "schemaVersion": 1, "extensionVersion": "2.7.0", "exportedAt": now,
+        "settings": {"refreshMinutes": 10, "pageDelaySeconds": 15, "sweepMode": "none"},
+        "verification": {"count": 1, "lastAt": now, "pausedUntil": now + 3600_000},
+        "events": [{"at": now, "event": "page-delivered", "page": 2, "new": 1,
+                    "items": 24, "durationMs": 120}],
+    }
+
+
+@pytest.mark.parametrize("page_delay", [1, 15])
+def test_browser_diagnostics_mirror_is_inspectable_and_does_not_count_as_item_relay(
+    live_server, page_delay,
+):
+    assert get(live_server, "/browser-diagnostics")[1]["report"] is None
+    before = get(live_server)[1]["runtime"]["last_successful_relay"]
+    report = diagnostic_report()
+    report["settings"]["pageDelaySeconds"] = page_delay
+    status, body = request(live_server, "POST", "/browser-diagnostics", report)
+    assert status == 200 and body["ok"] is True
+    mirrored = get(live_server, "/browser-diagnostics")[1]
+    assert mirrored["report"] == report
+    assert mirrored["receivedAt"] > 0
+    assert get(live_server)[1]["runtime"]["last_successful_relay"] == before
+
+
+def test_browser_diagnostics_require_auth_and_reject_web_origins(live_server, monkeypatch):
+    monkeypatch.setattr(server.Handler, "token", "sekrit")
+    for method in ("GET", "POST"):
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            request(live_server, method, "/browser-diagnostics", diagnostic_report())
+        assert exc.value.code == 403
+    req = urllib.request.Request(f"{live_server}/browser-diagnostics",
+                                 data=json.dumps(diagnostic_report()).encode(), method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("X-Ingest-Token", "sekrit")
+    req.add_header("Origin", "https://example.org")
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=5)
+    assert exc.value.code == 403
+
+
+def test_browser_diagnostics_reject_secret_fields_and_large_bodies(live_server):
+    report = diagnostic_report()
+    report["token"] = "must-not-be-echoed"
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        request(live_server, "POST", "/browser-diagnostics", report)
+    assert exc.value.code == 400
+    assert b"must-not-be-echoed" not in exc.value.read()
+    # The route rejects the declared size before reading. A small body avoids
+    # Windows aborting a simultaneous large send when the server closes early.
+    req = urllib.request.Request(f"{live_server}/browser-diagnostics",
+                                 data=b"{}", method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Content-Length", str(128 * 1024 + 1))
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=5)
+    assert exc.value.code == 413
 
 
 def test_health_reports_configuration(live_server):
@@ -341,6 +497,243 @@ def request(base, method, path="/rules", payload=None, token=None):
 # --- delivery and failure diagnostics ---------------------------------------
 
 
+def browser_report(**changes):
+    return {
+        "phase": "ready",
+        "tab_count": 1,
+        "reachable": True,
+        "refresh_minutes": 10,
+        "paused_until": 0,
+        **changes,
+    }
+
+
+def test_browser_heartbeat_is_visible_but_does_not_count_as_an_item_relay(live_server):
+    runtime = server.Handler.runtime_status
+    runtime.started_monotonic -= 7200
+    status, body = request(
+        live_server, "POST", path="/relay-status", payload=browser_report()
+    )
+
+    assert status == 200 and body == {"ok": True}
+    snapshot = get(live_server)[1]["runtime"]
+    assert snapshot["browser"]["phase"] == "ready"
+    assert snapshot["browser"]["last_sweep_pages"] == 0
+    assert snapshot["browser"]["last_sweep_at"] == 0
+    assert snapshot["browser"]["age_seconds"] >= 0
+    assert datetime.fromisoformat(snapshot["browser"]["at"]).tzinfo is not None
+    assert snapshot["last_successful_relay"] is None
+    assert snapshot["last_relay_attempt"] is None
+    assert snapshot["last_notification"] is None
+    watchdog = server.RelayWatchdog(runtime, server.Handler.notifier)
+    assert watchdog.relay_age_seconds() >= 7200
+    assert server.RuntimeStatus(server.Handler.store).snapshot()["browser"] is None
+
+
+def test_browser_heartbeat_accepts_alphabet_sweep_page_counts(live_server):
+    status, _ = request(live_server, "POST", path="/relay-status", payload=browser_report(
+        phase="complete", last_sweep_pages=2600,
+    ))
+    assert status == 200
+    assert get(live_server)[1]["runtime"]["browser"]["last_sweep_pages"] == 2600
+
+
+def test_browser_heartbeat_accepts_high_value_sweep_page_counts(live_server):
+    status, _ = request(live_server, "POST", path="/relay-status", payload=browser_report(
+        phase="complete", last_sweep_pages=6200,
+    ))
+    assert status == 200
+    assert get(live_server)[1]["runtime"]["browser"]["last_sweep_pages"] == 6200
+
+
+@pytest.mark.parametrize("phase", [
+    "passive", "waiting-verification", "ready", "sweeping", "waiting-user",
+    "ingest-retry", "complete", "unreachable",
+])
+def test_browser_heartbeat_accepts_the_shared_phase_contract(live_server, phase):
+    status, _ = request(live_server, "POST", path="/relay-status", payload=browser_report(
+        phase=phase, last_sweep_pages=7, last_sweep_at=1000.5,
+    ))
+    assert status == 200
+    snapshot = get(live_server)[1]["runtime"]["browser"]
+    assert snapshot["phase"] == phase
+    assert snapshot["last_sweep_pages"] == 7
+    assert snapshot["last_sweep_at"] == 1000.5
+
+
+@pytest.mark.parametrize("field,value", [
+    ("phase", "invented"), ("phase", None), ("phase", []),
+    ("tab_count", True), ("tab_count", 1.5), ("tab_count", -1), ("tab_count", 101),
+    ("reachable", 1), ("reachable", "true"),
+    ("refresh_minutes", True), ("refresh_minutes", "10"),
+    ("refresh_minutes", -1), ("refresh_minutes", 121),
+    ("refresh_minutes", float("nan")), ("refresh_minutes", float("inf")),
+    ("paused_until", True), ("paused_until", -1),
+    ("paused_until", float("inf")),
+    ("last_sweep_pages", True), ("last_sweep_pages", 1.5),
+    ("last_sweep_pages", 6201),
+    ("last_sweep_at", True), ("last_sweep_at", -1),
+    ("last_sweep_at", float("inf")), ("last_sweep_at", 10**400),
+    ("extra", "injected"), ("at", "client-controlled"),
+])
+def test_browser_heartbeat_rejects_invalid_fields(live_server, field, value):
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        request(live_server, "POST", path="/relay-status", payload=browser_report(
+            **{field: value}
+        ))
+    assert exc.value.code == 400
+    assert server.Handler.runtime_status.snapshot()["browser"] is None
+
+
+@pytest.mark.parametrize("field", [
+    "phase", "tab_count", "reachable", "refresh_minutes", "paused_until",
+])
+def test_browser_heartbeat_requires_core_fields(live_server, field):
+    payload = browser_report()
+    del payload[field]
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        request(live_server, "POST", path="/relay-status", payload=payload)
+    assert exc.value.code == 400
+
+
+def test_browser_heartbeat_rejects_a_pause_beyond_one_week(live_server):
+    far_future = (datetime.now(UTC) + timedelta(days=8)).timestamp() * 1000
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        request(live_server, "POST", path="/relay-status", payload=browser_report(
+            paused_until=far_future,
+        ))
+    assert exc.value.code == 400
+
+
+def test_browser_heartbeat_requires_token_extension_origin_and_json(live_server, monkeypatch):
+    monkeypatch.setattr(server.Handler, "token", "sekrit")
+    payload = json.dumps(browser_report()).encode()
+    headers = {"Content-Type": "application/json", "X-Ingest-Token": "sekrit"}
+    for changed, expected in [
+        ({"X-Ingest-Token": "wrong"}, 403),
+        ({"Origin": "https://example.com"}, 403),
+        ({"Content-Type": "text/plain"}, 415),
+    ]:
+        req = urllib.request.Request(f"{live_server}/relay-status", data=payload,
+                                     headers={**headers, **changed}, method="POST")
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(req, timeout=5)
+        assert exc.value.code == expected
+    headers["Origin"] = "chrome-extension://extension"
+    req = urllib.request.Request(f"{live_server}/relay-status", data=payload,
+                                 headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        assert resp.status == 200
+
+
+def test_browser_heartbeat_bounds_body_and_rejects_malformed_json(live_server, monkeypatch):
+    for payload in (b"not-json", b"[]", b"{}", b"\xff"):
+        req = urllib.request.Request(f"{live_server}/relay-status", data=payload,
+                                     headers={"Content-Type": "application/json"},
+                                     method="POST")
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(req, timeout=5)
+        assert exc.value.code == 400
+    monkeypatch.setattr(server, "MAX_INGEST_BYTES", 20)
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        request(live_server, "POST", path="/relay-status", payload=browser_report())
+    assert exc.value.code == 413
+
+
+def test_last_item_notification_survives_restart_and_silent_relays(tmp_path, monkeypatch):
+    store = SeenStore(tmp_path / "seen.json")
+    runtime = server.RuntimeStatus(store)
+    runtime.record_relay({"seen": 2, "notified": 1, "failed": 1, "pending": 0})
+    delivered_at = runtime.snapshot()["last_notification"]["at"]
+    future = datetime.now(UTC) + timedelta(hours=1)
+
+    class LaterDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return future
+
+    monkeypatch.setattr(server, "datetime", LaterDatetime)
+    runtime.record_relay({"seen": 2, "notified": 0, "duplicates": 2})
+    store.flush()
+    restarted = server.RuntimeStatus(SeenStore(store.path)).snapshot()
+    assert restarted["last_notification"]["at"] == delivered_at
+    assert restarted["last_notification"]["age_seconds"] >= 3599
+    assert restarted["last_successful_relay"]["summary"]["duplicates"] == 2
+
+
+def test_test_notification_does_not_record_an_item_notification(live_server):
+    request(live_server, "POST", path="/test-notification")
+    assert server.Handler.runtime_status.snapshot()["last_notification"] is None
+
+
+@pytest.mark.parametrize("destination", ["group", "private"])
+def test_status_reports_verification_disabled_refresh_and_alert_destination(
+    tmp_path, monkeypatch, destination
+):
+    store = SeenStore(tmp_path / "seen.json")
+    runtime = server.RuntimeStatus(store)
+    runtime.record_browser(browser_report(phase="waiting-verification", refresh_minutes=0))
+
+    class CommandHealth:
+        @staticmethod
+        def health():
+            return {"delivery_chat": destination}
+
+    monkeypatch.setattr(server.Handler, "telegram_commands", CommandHealth())
+    text = server._telegram_status_text(runtime, store)
+    assert "waiting-verification" in text
+    assert "Auto-refresh is disabled" in text
+    assert "resumes automatically" in text
+    assert f"Alerts destination: {destination}" in text
+    assert "Last item notification: unknown" in text
+
+
+def test_status_reports_disconnected_heartbeat(tmp_path, monkeypatch):
+    store = SeenStore(tmp_path / "seen.json")
+    runtime = server.RuntimeStatus(store)
+    runtime.record_browser(browser_report())
+    future = datetime.now(UTC) + timedelta(seconds=181)
+
+    class LaterDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return future
+
+    monkeypatch.setattr(server, "datetime", LaterDatetime)
+    assert "Browser heartbeat disconnected" in server._telegram_status_text(runtime, store)
+
+
+def test_browser_status_describes_user_activity_and_missing_tabs_accurately():
+    waiting = {**browser_report(phase="waiting-user"), "age_seconds": 0}
+    text = "\n".join(server._browser_status_lines(waiting))
+    assert "stop clicking or scrolling" in text
+    assert "sign-in" not in text
+    missing = {**browser_report(phase="unreachable", reachable=False), "age_seconds": 0}
+    text = "\n".join(server._browser_status_lines(missing))
+    assert "No reviewer tab is responding" in text
+    assert "connection problem with the local notifier" not in text
+
+
+@pytest.mark.parametrize("summary,reason", [
+    ({"seen": 3, "new": 0, "duplicates": 3, "notified": 0}, "only already-seen items"),
+    ({"seen": 3, "new": 2, "filtered": 2, "matched": 0, "notified": 0},
+     "all new items were filtered out"),
+])
+def test_status_explains_silent_batches_and_all_rules(tmp_path, monkeypatch, summary, reason):
+    monkeypatch.setenv("RULES_JSON", json.dumps({"rules": [
+        {"name": "expensive", "min_value_usd": 49}, {"name": "other", "keywords": ["tv"]},
+    ]}))
+    store = SeenStore(tmp_path / "seen.json")
+    runtime = server.RuntimeStatus(store)
+    runtime.record_relay(summary)
+    text = server._telegram_status_text(runtime, store)
+    assert reason in text
+    assert "/filters" in text
+    assert "2 active rules" in text
+    assert "first of" not in text
+    assert "Last item notification: unknown" in text
+
+
 def test_successful_relay_summary_survives_runtime_restart(live_server):
     post(live_server, {"items": [ITEM]})
 
@@ -388,6 +781,7 @@ def test_phone_status_text_reports_relay_filter_and_seen_count(monkeypatch, tmp_
 
     assert "Notifier process + Telegram: online" in text
     assert "Last successful reviewer relay:" in text
+    assert "Last successful item notification:" in text
     assert "36 seen, 1 new, 1 matched, 1 alerted" in text
     assert "Filter: $49.00+; unknown-value alerts off" in text
     assert "Recorded items: 1" in text
@@ -760,3 +1154,205 @@ def test_rescan_requires_the_token_and_extension_origin(live_server, monkeypatch
     with pytest.raises(urllib.error.HTTPError) as exc:
         request(live_server, "POST", path="/rescan", payload={}, token="wrong")
     assert exc.value.code == 403
+
+
+def scanner_settings_payload():
+    return {
+        "schemaVersion": 1, "auxiliaryDepartments": True, "auxiliaryKeywords": True,
+        "auxiliaryBrands": False, "auxiliaryKeywordQueries": ["Chair", "Pet"],
+        "groupScannerTabs": True, "rotateScannerTabs": True,
+        "verificationAssistEnabled": True, "verificationNativeEnabled": False,
+        "pathPattern": "^/reviews/claim-product",
+    }
+
+
+def scanner_status_payload():
+    return {
+        "schemaVersion": 1, "extensionVersion": "2.22.0", "exportedAt": 100_000,
+        "settings": scanner_settings_payload(),
+        "primary": {"tabId": None, "generation": 0, "phase": "unknown", "reachable": False,
+                    "page": 0, "totalPages": None, "visitedPages": 0, "lastActivityAt": 0,
+                    "nextActionAt": 0},
+        "lanes": [],
+        "verification": {"pausedUntil": 0, "count": 0, "lastAt": 0, "assistEnabled": True,
+                         "nativeEnabled": False, "statusCode": "watching", "attempt": 0,
+                         "attemptLimit": 10, "lastOutcome": "", "errorStage": "",
+                         "errorReason": "", "pressSent": None, "cleanupConfirmed": None,
+                         "retryAt": 0},
+        "sync": {"settingsOk": True, "settingsSyncedAt": 100_000, "commandsOk": True},
+        "commands": {"restartHome": None, "restartAdditional": None}, "errors": [],
+    }
+
+
+@pytest.mark.parametrize("path,key,payload,store", [
+    ("/scanner-settings", "settings", scanner_settings_payload(), "scanner_settings"),
+    ("/scanner-commands", "commands", {"schemaVersion": 1, "restartHomeId": "new_1",
+                                      "restartAdditionalId": None}, "scanner_commands"),
+])
+def test_scanner_control_roundtrip_observes_current_disk_and_keeps_relay_contract(
+    live_server, path, key, payload, store,
+):
+    assert get(live_server, path) == (200, {key: None})
+    assert request(live_server, "PUT", path, payload) == (200, {key: payload})
+    assert get(live_server, path) == (200, {key: payload})
+    updated = dict(payload)
+    updated["rotateScannerTabs" if key == "settings" else "restartHomeId"] = (
+        False if key == "settings" else "next_2"
+    )
+    getattr(server.Handler, store).path.write_text(json.dumps(updated), encoding="utf-8")
+    assert get(live_server, path) == (200, {key: updated})
+    assert get(live_server, "/relay-settings") == (200, {"settings": None})
+    assert len(server.Handler.store) == 0 and server.Handler.notifier.sent == []
+
+
+def test_scanner_status_roundtrip_is_safe_health_traffic_and_reads_current_file(live_server):
+    assert get(live_server, "/scanner-status") == (
+        200, {"receivedAt": 0, "report": None, "stale": True},
+    )
+    before = server.Handler.runtime_status.snapshot()["last_successful_relay"]
+    report = scanner_status_payload()
+    assert request(live_server, "POST", "/scanner-status", report) == (200, {"ok": True})
+    snapshot = get(live_server, "/scanner-status")[1]
+    assert snapshot["report"] == report and snapshot["stale"] is False
+    assert snapshot["receivedAt"] > 0
+    snapshot["report"]["primary"]["phase"] = "waiting-user"
+    snapshot.pop("stale")
+    server.Handler.scanner_status.path.write_text(json.dumps(snapshot), encoding="utf-8")
+    assert get(live_server, "/scanner-status")[1]["report"]["primary"]["phase"] == "waiting-user"
+    assert server.Handler.runtime_status.snapshot()["last_successful_relay"] == before
+    assert server.Handler.notifier.sent == []
+
+
+@pytest.mark.parametrize("path,method", [
+    ("/scanner-settings", "GET"), ("/scanner-settings", "PUT"),
+    ("/scanner-commands", "GET"), ("/scanner-commands", "PUT"),
+    ("/scanner-status", "GET"), ("/scanner-status", "POST"),
+])
+def test_all_scanner_routes_require_the_existing_token_and_reject_web_origins(
+    live_server, path, method,
+):
+    server.Handler.token = "existing-secret"
+    for headers in [{}, {"X-Ingest-Token": "existing-secret", "Origin": "https://evil.example"}]:
+        req = urllib.request.Request(f"{live_server}{path}", None if method == "GET" else b"{}",
+                                     {**headers, "Content-Type": "application/json"}, method=method)
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(req, timeout=5)
+        assert error.value.code == 403
+
+
+@pytest.mark.parametrize("path,method,maximum", [
+    ("/scanner-settings", "PUT", 16 * 1024), ("/scanner-commands", "PUT", 16 * 1024),
+    ("/scanner-status", "POST", 64 * 1024),
+])
+def test_scanner_mutations_require_json_and_reject_oversize_before_reading_body(
+    live_server, path, method, maximum,
+):
+    for headers, expected in [
+        ({"Content-Type": "text/plain"}, 415),
+        ({"Content-Type": "application/json", "Content-Length": str(maximum + 1)}, 413),
+    ]:
+        req = urllib.request.Request(f"{live_server}{path}", b"{}", headers, method=method)
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(req, timeout=5)
+        assert error.value.code == expected
+
+
+@pytest.mark.parametrize("path,method", [
+    ("/scanner-settings", "PUT"), ("/scanner-commands", "PUT"), ("/scanner-status", "POST"),
+])
+def test_scanner_route_validation_and_duplicate_keys_do_not_disclose_payloads(
+    live_server, path, method,
+):
+    for raw in [b'{"secret":"private-payload"}', b'{"schemaVersion":1,"schemaVersion":1}',
+                b"private-payload invalid JSON", b"\xff"]:
+        req = urllib.request.Request(f"{live_server}{path}", raw,
+                                     {"Content-Type": "application/json"}, method=method)
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(req, timeout=5)
+        assert error.value.code == 400
+        assert b"private" not in error.value.read()
+
+
+@pytest.mark.parametrize("path,method,store,payload", [
+    ("/scanner-settings", "PUT", "scanner_settings", scanner_settings_payload()),
+    ("/scanner-commands", "PUT", "scanner_commands",
+     {"schemaVersion": 1, "restartHomeId": None, "restartAdditionalId": "next-1"}),
+    ("/scanner-status", "POST", "scanner_status", scanner_status_payload()),
+])
+def test_scanner_store_io_failures_return_generic_errors_without_mutating_files(
+    live_server, monkeypatch, path, method, store, payload,
+):
+    target = getattr(server.Handler, store)
+    original = target.path.read_bytes() if target.path.exists() else None
+
+    def fail_write(*args):
+        raise OSError("private filesystem path and details")
+
+    monkeypatch.setattr(target, "_write", fail_write)
+    with pytest.raises(urllib.error.HTTPError) as error:
+        request(live_server, method, path, payload)
+    assert error.value.code == 500
+    assert b"private" not in error.value.read()
+    assert (target.path.read_bytes() if target.path.exists() else None) == original
+
+
+@pytest.mark.parametrize("path,store", [
+    ("/scanner-settings", "scanner_settings"), ("/scanner-commands", "scanner_commands"),
+    ("/scanner-status", "scanner_status"),
+])
+def test_scanner_get_rejects_invalid_current_files_with_fixed_errors(live_server, path, store):
+    getattr(server.Handler, store).path.write_text("private invalid json", encoding="utf-8")
+    with pytest.raises(urllib.error.HTTPError) as error:
+        get(live_server, path)
+    assert error.value.code == 400
+    assert b"private" not in error.value.read()
+
+
+@pytest.mark.parametrize("path,store,method", [
+    ("/scanner-settings", "scanner_settings", "read"),
+    ("/scanner-commands", "scanner_commands", "read"),
+    ("/scanner-status", "scanner_status", "snapshot"),
+])
+def test_scanner_get_io_errors_are_fixed_and_payload_free(
+    live_server, monkeypatch, path, store, method,
+):
+    def denied_read():
+        raise PermissionError("private path and OS details")
+
+    monkeypatch.setattr(getattr(server.Handler, store), method, denied_read)
+    with pytest.raises(urllib.error.HTTPError) as error:
+        get(live_server, path)
+    assert error.value.code == 500
+    assert b"private" not in error.value.read()
+
+
+def test_scanner_settings_accept_existing_extension_origin_and_correct_token(live_server):
+    server.Handler.token = "existing-secret"
+    req = urllib.request.Request(
+        f"{live_server}/scanner-settings", json.dumps(scanner_settings_payload()).encode(),
+        {"Content-Type": "application/json", "Origin": "chrome-extension://current-extension",
+         "X-Ingest-Token": "existing-secret"}, method="PUT",
+    )
+    with urllib.request.urlopen(req, timeout=5) as response:
+        assert response.status == 200
+        assert json.load(response) == {"settings": scanner_settings_payload()}
+
+
+def test_scanner_status_mirrors_safe_optional_verification_visibility_metadata(live_server):
+    report = scanner_status_payload()
+    report["verification"].update(tabActive=False, tabFrozen=True, windowFocused=None)
+    assert request(live_server, "POST", "/scanner-status", report) == (200, {"ok": True})
+    assert get(live_server, "/scanner-status")[1]["report"] == report
+
+
+def test_scanner_status_mirrors_safe_optional_lane_failure_code(live_server):
+    report = scanner_status_payload()
+    report["lanes"] = [{
+        "lane": "departments", "tabId": 2, "generation": 1, "status": "partial",
+        "targetLabel": "", "completedTargets": 1, "totalTargets": 1, "pages": 0,
+        "failures": 1, "truncatedTargets": 0, "coverageLimitedTargets": 0, "nextAt": 0,
+        "round": 1, "lastErrorCode": "target-error", "owned": True, "enabled": True,
+        "lastFailureCode": "missing-panel",
+    }]
+    assert request(live_server, "POST", "/scanner-status", report) == (200, {"ok": True})
+    assert get(live_server, "/scanner-status")[1]["report"] == report

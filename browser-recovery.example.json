@@ -1,0 +1,9 @@
+{
+  "enabled": true,
+  "chromeProfileDirectory": "auto",
+  "staleHeartbeatSeconds": 180,
+  "launchCooldownSeconds": 600,
+  "pollSeconds": 30,
+  "maxChromeLaunchesPerHour": 3,
+  "startDockerDesktop": true
+}

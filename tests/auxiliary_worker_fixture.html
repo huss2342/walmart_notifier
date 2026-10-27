@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Simulated reviewer worker</title>
+<style>
+  body { font: 13px/1.4 system-ui; margin: .75rem; min-height: 1100px; }
+  label { display: block; } section { border-bottom: 1px solid #ddd; padding: .5rem; }
+  nav { margin-top: 700px; } nav button { margin: .2rem; }
+  [hidden] { display: none !important; }
+</style>
+<h1>Simulated reviewer results</h1>
+<div aria-label="Sort and Filter section">
+  <div data-testid="filter_chip_cat_id"><button id="departmentTrigger" aria-expanded="false">Department</button></div>
+  <div id="departmentPanel" data-dca-ctx="filterPopover" hidden>
+    <fieldset id="departmentOptions"><legend>Departments</legend></fieldset>
+    <button id="showMore">Show More</button>
+  </div>
+  <div data-testid="filter_chip_brand"><button id="brandTrigger" aria-expanded="false">Brand</button></div>
+  <div id="brandPanel" data-dca-ctx="filterPopover" hidden>
+    <label data-facet-option="brand--NIDA"><input type="checkbox" name="NIDA" value="NIDA">NIDA</label>
+  </div>
+</div>
+<div id="cards"></div>
+<nav id="pager" aria-label="Pagination"></nav>
+<script>
+  'use strict';
+  const bridge = parent.fixtureBridge;
+  const tabId = Number(frameElement.dataset.tabId);
+  const nativeTimer = window.setTimeout.bind(window);
+  // Test-only timing compression; all production selection, DOM validation,
+  // navigation, checkpoints, collection and acknowledgement functions remain.
+  window.setTimeout = (callback, milliseconds, ...args) => nativeTimer(callback,
+    Math.min(100, Math.max(0, Number(milliseconds) || 0)), ...args);
+  Date.now = () => bridge.now();
+  addEventListener('error', event => bridge.error(event.message));
+  addEventListener('unhandledrejection', event => bridge.error(event.reason?.stack || event.reason));
+  window.chrome = { storage: bridge.api.storage, runtime: {
+    id: 'isolated-browser-fixture',
+    onMessage: { addListener: listener => bridge.register(tabId, listener), removeListener() {} },
+    sendMessage: message => bridge.send(tabId, message)
+  } };
+
+  const params = () => new URL(location.href).searchParams;
+  function scope() { return params().get('q') || params().get('catId') || 'root'; }
+  function pages() { return scope() === '1' ? 25 : scope() === 'root' ? 1 : 2; }
+  let lazyPager = scope() === '1';
+  let expanded = false;
+  function option(value, destination, checked = false) {
+    const label = document.createElement('label');
+    const input = document.createElement('input');
+    input.type = 'radio'; input.name = 'Departments'; input.value = value; input.checked = checked;
+    input.addEventListener('click', () => {
+      if (!checked) changeResults(url => { url.searchParams.delete('page'); url.searchParams.set('catId', destination); });
+    });
+    label.append(input, document.createTextNode(value));
+    return label;
+  }
+  function renderOptions() {
+    const target = document.getElementById('departmentOptions');
+    target.replaceChildren();
+    const category = params().get('catId');
+    if (category === '1') {
+      target.appendChild(option('Furniture', '1', true));
+      if (expanded) target.appendChild(option('Chairs', '1_11'));
+    } else if (category === '1_11') {
+      target.appendChild(option('Chairs', '1_11', true));
+    } else {
+      target.appendChild(option('All departments', '', true));
+      target.appendChild(option('Furniture', '1'));
+      if (expanded && !bridge.rootDiscovered()) target.appendChild(option('Broken department', '99'));
+    }
+    document.getElementById('showMore').hidden = expanded || category === '1_11' ||
+      (!category && bridge.rootDiscovered());
+  }
+  document.getElementById('departmentTrigger').addEventListener('click', () => {
+    const panel = document.getElementById('departmentPanel'); panel.hidden = !panel.hidden;
+    document.getElementById('departmentTrigger').setAttribute('aria-expanded', String(!panel.hidden));
+    renderOptions();
+  });
+  document.getElementById('showMore').addEventListener('click', () => {
+    expanded = true; bridge.event(tabId, 'show-more'); renderOptions();
+  });
+  document.getElementById('brandTrigger').addEventListener('click', () => {
+    const panel = document.getElementById('brandPanel'); panel.hidden = !panel.hidden;
+    document.getElementById('brandTrigger').setAttribute('aria-expanded', String(!panel.hidden));
+  });
+  function renderPager() {
+    const pager = document.getElementById('pager'); pager.replaceChildren();
+    if (lazyPager) return;
+    for (let page = 1; page <= pages(); page++) {
+      const button = document.createElement('button');
+      button.dataset.automationId = 'page-number'; button.textContent = String(page);
+      button.setAttribute('aria-label', `Go to Page ${page}`);
+      if (page === Number(params().get('page') || 1)) button.setAttribute('aria-current', 'page');
+      button.addEventListener('click', () => changeResults(url => url.searchParams.set('page', String(page))));
+      pager.appendChild(button);
+    }
+  }
+  function renderCards() {
+    const page = Number(params().get('page') || 1);
+    const ids = { root: 20000000, '1': 30000000, '1_11': 40000000, Furniture: 50000000, Pet: 60000000 };
+    const cards = document.getElementById('cards'); cards.replaceChildren();
+    for (const [id, title] of [[10000001, 'Shared item across scans'], [(ids[scope()] || 70000000) + page, `${scope()} fixture product page ${page}`]]) {
+      const card = document.createElement('section'); const anchor = document.createElement('a');
+      anchor.href = `/ip/${id}`; anchor.textContent = title;
+      const price = document.createElement('p'); price.textContent = 'Free (Valued at $49.99)';
+      card.append(anchor, price); cards.appendChild(card);
+    }
+  }
+  function changeResults(modify) {
+    const url = new URL(location.href); modify(url);
+    bridge.rendering(tabId, true, 'pending');
+    history.pushState({}, '', url); bridge.locationChanged(tabId, location.href);
+    document.getElementById('departmentPanel').hidden = true;
+    document.getElementById('departmentTrigger').setAttribute('aria-expanded', 'false');
+    // Deliberately retain old cards while the URL already names the new scope.
+    nativeTimer(() => {
+      expanded = false; lazyPager = scope() === '1' && Number(params().get('page') || 1) === 1;
+      renderOptions(); renderCards(); renderPager();
+      bridge.rendering(tabId, false, 'fresh-cards');
+    }, 180);
+  }
+  addEventListener('scroll', () => {
+    if (lazyPager && scrollY > 300) {
+      lazyPager = false; renderPager(); bridge.event(tabId, 'lazy-pager');
+    }
+  });
+  renderOptions(); renderCards(); renderPager();
+  bridge.locationChanged(tabId, location.href);
+</script>
+<script src="/sweep-modes.js"></script>
+<script src="/runtime-policy.js"></script>
+<script src="/page-controls.js"></script>
+<script src="/page-scroll.js"></script>
+<script src="/live-observer.js"></script>
+<script src="/facet-controls.js"></script>
+<script src="/content.js"></script>
+<script>
+  pageDelayDetails = async () => ({ delayMs: 40, intervalMs: 40, elapsedMs: 0 });
+  window.fixtureSnapshot = () => ({ active: role.active, phase, navigationPending, relaying });
+  window.fixtureDiscoverBrands = () => ReviewerFacetControls.discover({ document, kind: 'brand',
+    currentUrl: location.href, pause: ms => new Promise(resolve => setTimeout(resolve, ms)) });
+</script>
+</html>

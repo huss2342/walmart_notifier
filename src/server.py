@@ -18,6 +18,7 @@ import hmac
 import ipaddress
 import json
 import logging
+import math
 import os
 import sys
 import threading
@@ -27,7 +28,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from discord_bridge.rolling_logs import RollingLogHandler  # noqa: E402
+
+from browser_diagnostics import BrowserDiagnosticsStore  # noqa: E402
 from config import (  # noqa: E402
     clear_user_rules,
     load_rules,
@@ -39,9 +44,22 @@ from config import (  # noqa: E402
 from filters import first_match  # noqa: E402
 from models import Item  # noqa: E402
 from notifiers import build_notifier  # noqa: E402
+from notifiers.discord import DiscordNotifier  # noqa: E402
 from notifiers.telegram import TelegramNotifier  # noqa: E402
 from pipeline import process  # noqa: E402
+from relay_settings import RelaySettingsStore  # noqa: E402
 from relay_watchdog import RelayWatchdog  # noqa: E402
+from scanner_control import (  # noqa: E402
+    MAX_COMMANDS_BYTES,
+    MAX_SETTINGS_BYTES,
+    MAX_STATUS_BYTES,
+    ScannerCommandsStore,
+    ScannerSettingsStore,
+    ScannerStatusStore,
+)
+from scanner_control import (
+    parse_json as parse_scanner_json,
+)
 from sources.webhook_source import parse_json_ingest_payload  # noqa: E402
 from state import SeenStore, default_path  # noqa: E402
 from telegram_commands import (  # noqa: E402
@@ -55,6 +73,12 @@ MAX_INGEST_BYTES = 4_000_000
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
 LAST_RELAY_MARKER = "runtime:last-successful-relay"
+LAST_NOTIFICATION_MARKER = "runtime:last-item-notification"
+BROWSER_HEARTBEAT_STALE_SECONDS = 180
+BROWSER_PHASES = frozenset({
+    "passive", "waiting-verification", "ready", "sweeping", "waiting-user",
+    "ingest-retry", "complete", "unreachable",
+})
 # A loosened filter can match thousands of recorded items; cap the burst.
 RESCAN_ALERT_LIMIT = 25
 
@@ -68,7 +92,11 @@ class RuntimeStatus:
         self.started_monotonic = time.monotonic()
         self._lock = threading.RLock()
         self._last_successful_relay = self._load_last_relay()
+        self._last_notification = self._load_last_notification()
         self._last_attempt: dict | None = None
+        # Browser reports are deliberately process-local. A saved ready phase
+        # would misrepresent a closed browser after a server restart.
+        self._browser: dict | None = None
 
     def _load_last_relay(self) -> dict | None:
         raw = self.store.get_marker(LAST_RELAY_MARKER)
@@ -81,6 +109,23 @@ class RuntimeStatus:
             return None
         return _validated_relay_record(value)
 
+    def _load_last_notification(self) -> dict | None:
+        raw = self.store.get_marker(LAST_NOTIFICATION_MARKER)
+        if not raw:
+            return None
+        try:
+            return _validated_timestamp_record(json.loads(raw))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            log.warning("Ignoring an invalid saved item-notification status.")
+            return None
+
+    def _persist_record(self, marker: str, record: dict) -> None:
+        try:
+            self.store.set_marker(marker, json.dumps(record, separators=(",", ":")))
+        except Exception as exc:
+            # Status persistence must never turn a delivered alert into a retry.
+            log.error("Could not persist runtime status (%s).", type(exc).__name__)
+
     def record_relay(self, summary: dict) -> None:
         record = {
             "at": datetime.now(UTC).isoformat(timespec="seconds"),
@@ -88,18 +133,27 @@ class RuntimeStatus:
         }
         with self._lock:
             self._last_attempt = record
+            if (record["summary"].get("notified") or 0) > 0:
+                self._last_notification = {"at": record["at"]}
+                self._persist_record(LAST_NOTIFICATION_MARKER, self._last_notification)
             if record["summary"].get("failed") or record["summary"].get("pending"):
                 return
             self._last_successful_relay = record
-        try:
-            self.store.set_marker(
-                LAST_RELAY_MARKER,
-                json.dumps(record, separators=(",", ":")),
-            )
-        except Exception as exc:
-            # Status persistence is useful but must never turn an otherwise
-            # successful ingest into a retry or duplicate notification.
-            log.error("Could not persist relay status (%s).", type(exc).__name__)
+            self._persist_record(LAST_RELAY_MARKER, record)
+
+    def record_browser(self, report: object) -> None:
+        sanitized = _validated_browser_report(report)
+        with self._lock:
+            self._browser = {
+                **sanitized,
+                "at": datetime.now(UTC).isoformat(timespec="seconds"),
+            }
+
+    def record_notification(self) -> None:
+        """Background Discord delivery is distinct from accepting a relay."""
+        with self._lock:
+            self._last_notification = {"at": datetime.now(UTC).isoformat(timespec="seconds")}
+            self._persist_record(LAST_NOTIFICATION_MARKER, self._last_notification)
 
     def record_failure(self, error_type: str) -> None:
         with self._lock:
@@ -112,12 +166,55 @@ class RuntimeStatus:
         with self._lock:
             last_success = _with_age(self._last_successful_relay)
             last_attempt = _with_age(self._last_attempt)
+            last_notification = _with_age(self._last_notification)
+            browser = _with_age(self._browser)
         return {
             "started_at": self.started_at.isoformat(timespec="seconds"),
             "uptime_seconds": max(0, int(time.monotonic() - self.started_monotonic)),
             "last_successful_relay": last_success,
             "last_relay_attempt": last_attempt,
+            "last_notification": last_notification,
+            "browser": browser,
         }
+
+
+def _finite_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def _validated_browser_report(value: object) -> dict:
+    required = {"phase", "tab_count", "reachable", "refresh_minutes", "paused_until"}
+    optional = {"last_sweep_pages", "last_sweep_at"}
+    if not isinstance(value, dict):
+        raise ValueError("browser report must be a JSON object")
+    if not required.issubset(value) or value.keys() - required - optional:
+        raise ValueError("browser report has missing or unsupported fields")
+    if not isinstance(value["phase"], str) or value["phase"] not in BROWSER_PHASES:
+        raise ValueError("unsupported browser phase")
+    if not isinstance(value["reachable"], bool):
+        raise ValueError("reachable must be a boolean")
+    report = {**value, "last_sweep_pages": value.get("last_sweep_pages", 0),
+              "last_sweep_at": value.get("last_sweep_at", 0)}
+    # High Value has 62 searches, each capped at 100 pages by the extension.
+    for key, maximum in (("tab_count", 100), ("last_sweep_pages", 6200)):
+        count = report[key]
+        if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= maximum:
+            raise ValueError(f"{key} must be an integer from 0 to {maximum}")
+    bounds = {
+        "refresh_minutes": 120,
+        "paused_until": datetime.now(UTC).timestamp() * 1000 + 7 * 86400 * 1000,
+        "last_sweep_at": math.inf,
+    }
+    for key, maximum in bounds.items():
+        number = report[key]
+        if not _finite_number(number) or not 0 <= number <= maximum:
+            raise ValueError(f"invalid {key}")
+    return report
 
 
 def _safe_summary(summary: object) -> dict[str, int | float | None]:
@@ -131,6 +228,7 @@ def _safe_summary(summary: object) -> dict[str, int | float | None]:
         "failed",
         "pending",
         "seeded",
+        "queued",
         "value_known",
         "value_unknown",
         "min_value_usd",
@@ -143,14 +241,12 @@ def _safe_summary(summary: object) -> dict[str, int | float | None]:
         if key not in summary:
             continue
         value = summary[key]
-        if value is None or (
-            not isinstance(value, bool) and isinstance(value, (int, float))
-        ):
+        if value is None or _finite_number(value):
             result[key] = value
     return result
 
 
-def _validated_relay_record(value: object) -> dict | None:
+def _validated_timestamp_record(value: object) -> dict | None:
     if not isinstance(value, dict) or not isinstance(value.get("at"), str):
         return None
     try:
@@ -159,10 +255,17 @@ def _validated_relay_record(value: object) -> dict | None:
         return None
     if stamp.tzinfo is None:
         return None
+    return {"at": stamp.isoformat(timespec="seconds")}
+
+
+def _validated_relay_record(value: object) -> dict | None:
+    record = _validated_timestamp_record(value)
+    if record is None:
+        return None
     summary = _safe_summary(value.get("summary"))
     if not summary:
         return None
-    return {"at": stamp.isoformat(timespec="seconds"), "summary": summary}
+    return {**record, "summary": summary}
 
 
 def _with_age(record: dict | None) -> dict | None:
@@ -190,6 +293,8 @@ def _duration(seconds: object) -> str:
 
 def _rule_status_text() -> str:
     rules = load_rules()
+    if len(rules) > 1:
+        return f"Filters: {len(rules)} active rules; use /filters for the full list"
     rule = rules[0]
     if rule.min_value_usd is None:
         value_range = "no minimum"
@@ -198,8 +303,41 @@ def _rule_status_text() -> str:
     else:
         value_range = f"${rule.min_value_usd:,.2f}-${rule.max_value_usd:,.2f}"
     unknown = "on" if rule.alert_on_unknown_value else "off"
-    suffix = f" (first of {len(rules)} rules)" if len(rules) > 1 else ""
-    return f"Filter: {value_range}; unknown-value alerts {unknown}{suffix}"
+    return f"Filter: {value_range}; unknown-value alerts {unknown}; details: /filters"
+
+
+def _browser_status_lines(browser: object) -> list[str]:
+    if not isinstance(browser, dict):
+        return [
+            "⚠️ Browser heartbeat: not received; "
+            "open the reviewer tab with the extension enabled"
+        ]
+    phase = browser["phase"]
+    lines = [f"Browser phase: {phase}; reviewer tabs: {browser['tab_count']}"]
+    if browser.get("age_seconds", 0) > BROWSER_HEARTBEAT_STALE_SECONDS:
+        lines.append(
+            "⚠️ Browser heartbeat disconnected; check that Chrome and the extension are running"
+        )
+    elif not browser["reachable"] and phase != "waiting-verification":
+        lines.append(
+            "⚠️ No reviewer tab is responding; reopen the reviewer page or reload the extension"
+        )
+    if not browser["tab_count"]:
+        lines.append("⚠️ Open the Walmart reviewer tab to receive item updates")
+    if browser["refresh_minutes"] == 0:
+        lines.append(
+            "⚠️ Auto-refresh is disabled; enable it in the extension for regular item checks"
+        )
+    if phase == "waiting-verification":
+        lines.append(
+            "⚠️ Solve Walmart's verification in the reviewer tab; automation resumes automatically "
+            "when the reviewer page is ready again"
+        )
+    elif phase == "waiting-user":
+        lines.append("Scanning waits until you stop clicking or scrolling for 30 seconds")
+    elif phase == "ingest-retry":
+        lines.append("⚠️ Item delivery is retrying; check the latest relay error below")
+    return lines
 
 
 def _telegram_status_text(runtime: RuntimeStatus, store: SeenStore) -> str:
@@ -208,6 +346,20 @@ def _telegram_status_text(runtime: RuntimeStatus, store: SeenStore) -> str:
         "✅ Notifier process + Telegram: online",
         f"Uptime: {_duration(snapshot['uptime_seconds'])}",
     ]
+    commands = Handler.telegram_commands
+    if commands is not None:
+        destination = commands.health().get("delivery_chat")
+        if destination in ("private", "group"):
+            lines.append(f"Alerts destination: {destination}")
+    lines.extend(_browser_status_lines(snapshot.get("browser")))
+    notification = snapshot.get("last_notification")
+    if isinstance(notification, dict):
+        lines.append(
+            f"Last successful item notification: {notification['at']} "
+            f"({_duration(notification.get('age_seconds'))} ago)"
+        )
+    else:
+        lines.append("Last item notification: unknown (tracking begins with this version)")
     last = snapshot.get("last_successful_relay")
     if isinstance(last, dict):
         age = _duration(last.get("age_seconds"))
@@ -220,6 +372,18 @@ def _telegram_status_text(runtime: RuntimeStatus, store: SeenStore) -> str:
                 f"{summary.get('matched', 0)} matched, "
                 f"{summary.get('notified', 0)} alerted"
             )
+            if not summary.get("notified"):
+                seen, new = summary.get("seen", 0), summary.get("new", 0)
+                if seen and not new and summary.get("duplicates", 0) == seen:
+                    lines.append(
+                        "Quiet because the latest batch contained "
+                        "only already-seen items (duplicates)"
+                    )
+                elif new and not summary.get("matched") and summary.get("filtered", 0) == new:
+                    lines.append(
+                        "Quiet because all new items were filtered out; "
+                        "use /filters to inspect the rules"
+                    )
     else:
         lines.append("⚠️ No successful reviewer relay has been recorded yet")
 
@@ -250,6 +414,11 @@ class Handler(BaseHTTPRequestHandler):
     # half-configured install logged the same failure on every single relay.
     notifier: object
     runtime_status: RuntimeStatus
+    browser_diagnostics: BrowserDiagnosticsStore
+    relay_settings: RelaySettingsStore
+    scanner_settings: ScannerSettingsStore
+    scanner_commands: ScannerCommandsStore
+    scanner_status: ScannerStatusStore
     telegram_commands: TelegramCommandPoller | None = None
 
     # --- helpers ------------------------------------------------------------
@@ -316,8 +485,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         path = self.path.split("?")[0].rstrip("/") or "/"
-        if path in ("/", "/health", "/rules") and not self._authorized():
+        scanner_paths = ("/scanner-settings", "/scanner-commands", "/scanner-status")
+        protected = ("/", "/health", "/rules", "/browser-diagnostics", "/relay-settings",
+                     *scanner_paths)
+        if path in protected and not self._authorized():
             self._reply(403, "forbidden")
+            return
+        if path in scanner_paths:
+            if not self._trusted_origin():
+                self._reply(403, "forbidden origin")
+                return
+            self._read_scanner_control(path)
             return
         if path in ("/", "/health"):
             self._reply(200, {
@@ -326,6 +504,9 @@ class Handler(BaseHTTPRequestHandler):
                 "notifier": type(self.notifier).__name__,
                 "notifier_configured": type(self.notifier).__name__ != "NullNotifier",
                 "notifier_diagnostic": self._notifier_diagnostic(),
+                "discord": (
+                    self.notifier.health() if isinstance(self.notifier, DiscordNotifier) else None
+                ),
                 "seed_mode": seed_mode(),
                 "seen_items": len(self.store),
                 "observed_values": self.store.observed_value_stats(),
@@ -336,6 +517,22 @@ class Handler(BaseHTTPRequestHandler):
                     else disabled_command_health()
                 ),
             })
+            return
+
+        if path == "/browser-diagnostics":
+            self._reply(200, self.browser_diagnostics.snapshot())
+            return
+
+        if path == "/relay-settings":
+            try:
+                settings = self.relay_settings.read()
+            except (TypeError, ValueError, RecursionError):
+                self._reply(400, {"error": "Invalid relay-settings.json; using browser settings."})
+                return
+            except OSError:
+                self._reply(500, {"error": "Could not read relay-settings.json."})
+                return
+            self._reply(200, {"settings": settings})
             return
 
         if path == "/rules":
@@ -350,7 +547,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PUT(self) -> None:  # noqa: N802
         """Save rules edited in the extension's options page."""
-        if self.path.split("?")[0].rstrip("/") != "/rules":
+        path = self.path.split("?")[0].rstrip("/")
+        if path not in ("/rules", "/relay-settings", "/scanner-settings", "/scanner-commands"):
             self._reply(404, "not found")
             return
         if not self._authorized():
@@ -360,6 +558,25 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(403, "forbidden origin")
             return
         if not self._require_json():
+            return
+
+        if path in ("/scanner-settings", "/scanner-commands"):
+            self._save_scanner_control(path)
+            return
+
+        if path == "/relay-settings":
+            body = self._read_body(16 * 1024)
+            if body is None:
+                return
+            try:
+                settings = self.relay_settings.save(json.loads(body.decode("utf-8")))
+            except (TypeError, ValueError, RecursionError):
+                self._reply(400, {"error": "Invalid scan settings."})
+                return
+            except OSError:
+                self._reply(500, {"error": "Could not save relay-settings.json."})
+                return
+            self._reply(200, {"settings": settings})
             return
 
         body = self._read_body()
@@ -400,8 +617,10 @@ class Handler(BaseHTTPRequestHandler):
             "source": source,
         })
 
-    def _read_body(self) -> bytes | None:
+    def _read_body(self, maximum: int | None = None) -> bytes | None:
         """Read the request body, replying with an error and returning None."""
+        if maximum is None:
+            maximum = MAX_INGEST_BYTES
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
@@ -410,14 +629,15 @@ class Handler(BaseHTTPRequestHandler):
         if length < 0:
             self._reply(400, "bad content-length")
             return None
-        if length > MAX_INGEST_BYTES:
+        if length > maximum:
             self._reply(413, "payload too large")
             return None
         return self.rfile.read(length) if length else b""
 
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.split("?")[0].rstrip("/")
-        if path not in ("/ingest", "/test-notification", "/bot-check", "/rescan"):
+        if path not in ("/ingest", "/test-notification", "/bot-check", "/rescan", "/relay-status",
+                        "/browser-diagnostics", "/scanner-status"):
             self._reply(404, "not found")
             return
         if not self._authorized():
@@ -425,6 +645,19 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self._trusted_origin():
             self._reply(403, "forbidden origin")
+            return
+
+        if path == "/scanner-status":
+            if self._require_json():
+                self._save_scanner_control(path)
+            return
+
+        if path == "/relay-status":
+            self._receive_browser_status()
+            return
+
+        if path == "/browser-diagnostics":
+            self._receive_browser_diagnostics()
             return
 
         if path == "/test-notification":
@@ -456,11 +689,25 @@ class Handler(BaseHTTPRequestHandler):
         # Rules are re-read per request on purpose: editing src/rules.json
         # takes effect on the next relay, with no restart.
         try:
-            summary = process(
-                items, load_rules(), self.store, self.notifier, seed_only=seed_mode()
-            )
+            if isinstance(self.notifier, DiscordNotifier):
+                summary = self.notifier.ingest(items, seed_only=seed_mode())
+                # Preserve local observation diagnostics without using personal
+                # dedupe as an admission gate for the independent Discord queue.
+                for item in items:
+                    self.store.mark_seen(item.item_id, item.title, item.value_usd)
+            else:
+                summary = process(
+                    items, load_rules(), self.store, self.notifier, seed_only=seed_mode()
+                )
         except Exception as exc:
             self.runtime_status.record_failure(type(exc).__name__)
+            if isinstance(self.notifier, DiscordNotifier):
+                if isinstance(exc, ValueError):
+                    self._reply(400, {"error": "invalid Discord product observation"})
+                    return
+                log.error("Discord intake failed (%s); retry required.", type(exc).__name__)
+                self._reply(503, {"error": "durable intake unavailable; retry"})
+                return
             log.exception("Ingest processing failed.")
             self._reply(500, {
                 "error": "ingest processing failed",
@@ -477,6 +724,80 @@ class Handler(BaseHTTPRequestHandler):
         else:
             log.debug("Ingest: %s", json.dumps(summary.as_dict()))
         self._reply(200, summary.as_dict())
+
+    def _receive_browser_status(self) -> None:
+        if not self._require_json():
+            return
+        body = self._read_body()
+        if body is None:
+            return
+        try:
+            self.runtime_status.record_browser(json.loads(body.decode("utf-8")))
+        except (TypeError, ValueError) as exc:
+            self._reply(400, {"error": str(exc)})
+            return
+        # Heartbeats must not renew the item-relay silence watchdog or imply
+        # successful item notifications merely because the browser is awake.
+        self._reply(200, {"ok": True})
+
+    def _scanner_control_store(self, path: str) -> tuple:
+        if path == "/scanner-settings":
+            return self.scanner_settings, "settings", MAX_SETTINGS_BYTES
+        if path == "/scanner-commands":
+            return self.scanner_commands, "commands", MAX_COMMANDS_BYTES
+        return self.scanner_status, "status", MAX_STATUS_BYTES
+
+    def _read_scanner_control(self, path: str) -> None:
+        store, key, _ = self._scanner_control_store(path)
+        try:
+            payload = store.snapshot() if key == "status" else {key: store.read()}
+        except (TypeError, ValueError, RecursionError):
+            self._reply(400, {"error": f"Invalid scanner {key}."})
+            return
+        except OSError:
+            self._reply(500, {"error": f"Could not read scanner {key}."})
+            return
+        self._reply(200, payload)
+
+    def _save_scanner_control(self, path: str) -> None:
+        store, key, maximum = self._scanner_control_store(path)
+        body = self._read_body(maximum)
+        if body is None:
+            return
+        try:
+            incoming = parse_scanner_json(body)
+            if key == "status":
+                store.record_report(incoming)
+                payload = {"ok": True}
+            else:
+                payload = {key: store.save(incoming)}
+        except (TypeError, ValueError, RecursionError):
+            self._reply(400, {"error": f"Invalid scanner {key}."})
+            return
+        except OSError:
+            self._reply(500, {"error": f"Could not save scanner {key}."})
+            return
+        # Control and health traffic must never imply item relay/delivery or
+        # reset its silence watchdog; only the scanner owns command execution.
+        self._reply(200, payload)
+
+    def _receive_browser_diagnostics(self) -> None:
+        if not self._require_json():
+            return
+        body = self._read_body(128 * 1024)
+        if body is None:
+            return
+        try:
+            self.browser_diagnostics.record_report(json.loads(body.decode("utf-8")))
+        except (TypeError, ValueError, RecursionError):
+            self._reply(400, {"error": "Invalid browser diagnostic report."})
+            return
+        except OSError as exc:
+            log.error("Could not persist browser diagnostics (%s).", type(exc).__name__)
+            self._reply(500, {"error": "Could not persist browser diagnostics."})
+            return
+        # Diagnostic traffic must not reset relay staleness or send alerts.
+        self._reply(200, {"ok": True})
 
     def _rescan(self) -> None:
         """Re-apply the current rules to already-recorded items.
@@ -503,6 +824,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._reply(400, {"error": "body must be a JSON object"})
                 return
         limit = max(0, min(limit, RESCAN_ALERT_LIMIT))
+
+        if apply and isinstance(self.notifier, DiscordNotifier):
+            self._reply(409, {
+                "error": "Discord accepts fresh observations; historical rescans cannot publish."
+            })
+            return
 
         rules = load_rules()
         matches: list[tuple[str, dict]] = []
@@ -715,9 +1042,31 @@ def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
     Handler.token = token
     Handler.notifier = build_notifier()
     Handler.runtime_status = RuntimeStatus(Handler.store)
+    Handler.browser_diagnostics = BrowserDiagnosticsStore(
+        Handler.store.path.with_name("browser-diagnostics.json")
+        if Handler.store.path else ":memory:"
+    )
+    Handler.relay_settings = RelaySettingsStore(
+        Handler.store.path.with_name("relay-settings.json")
+        if Handler.store.path else ":memory:"
+    )
+    Handler.scanner_settings = ScannerSettingsStore(
+        Handler.store.path.with_name("scanner-settings.json")
+        if Handler.store.path else ":memory:"
+    )
+    Handler.scanner_commands = ScannerCommandsStore(
+        Handler.store.path.with_name("scanner-commands.json")
+        if Handler.store.path else ":memory:"
+    )
+    Handler.scanner_status = ScannerStatusStore(
+        Handler.store.path.with_name("scanner-status.json")
+        if Handler.store.path else ":memory:"
+    )
     Handler.telegram_commands = None
 
     notifier = Handler.notifier
+    if isinstance(notifier, DiscordNotifier):
+        notifier.start(on_sent=Handler.runtime_status.record_notification)
     watchdog = RelayWatchdog.from_env(Handler.runtime_status, notifier, dict(os.environ))
     watchdog.start()
     rules = load_rules()
@@ -781,6 +1130,8 @@ def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
         print("\nStopping.")
     finally:
         watchdog.stop()
+        if isinstance(notifier, DiscordNotifier):
+            notifier.stop()
         if command_poller is not None:
             command_poller.stop()
         Handler.store.close()
@@ -801,7 +1152,20 @@ def main() -> None:
         format="%(asctime)s %(levelname)-7s %(message)s",
         datefmt="%H:%M:%S",
     )
-    serve(args.host, args.port, args.state)
+    log_directory = Path(args.state).parent if args.state else default_path().parent
+    file_handler = RollingLogHandler(
+        log_directory / "notifier.log", max_bytes=2 * 1024 * 1024,
+        total_bytes=16 * 1024 * 1024,
+    )
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s"))
+    # Delivery events already have their own durable, sanitized JSONL archive.
+    file_handler.addFilter(lambda record: record.name != "discord_bridge.monitoring")
+    logging.getLogger().addHandler(file_handler)
+    try:
+        serve(args.host, args.port, args.state)
+    finally:
+        logging.getLogger().removeHandler(file_handler)
+        file_handler.close()
 
 
 if __name__ == "__main__":

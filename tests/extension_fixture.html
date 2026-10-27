@@ -1,0 +1,334 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Reviewer extension browser regression</title>
+<style>body {font: 16px system-ui; margin: 2rem} #px-captcha {padding: 2rem; background: #eee}</style>
+<h1>Reviewer extension browser regression</h1>
+<p id="result" role="status">Running…</p>
+<div id="cards"><section><a href="/ip/10000001">Old reviewer item</a><p>Free (Valued at $25)</p></section></div>
+<!-- Named marker wrappers contain numbered anchors with inert placeholder hrefs. -->
+<ol id="fixture-pager"><li data-automation-id="page-number"><a role="link" tabindex="0" data-page="1">1</a></li>
+<li data-automation-id="page-number"><a href="javascript:void(0)" role="link" tabindex="0" data-page="2">2</a></li></ol>
+<script src="/fixture-stubs.js"></script>
+<script src="/sweep-modes.js"></script>
+<script src="/runtime-policy.js"></script>
+<script src="/page-controls.js"></script>
+<script src="/page-scroll.js"></script>
+<script src="/live-observer.js"></script>
+<script src="/facet-controls.js"></script>
+<script src="/content.js"></script>
+<script>
+(async () => {
+  const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const assert = (condition, message) => { if (!condition) throw new Error(message); };
+  const result = document.getElementById('result');
+  try {
+    await wait(50); // Let the initial passive role request finish.
+    Object.assign(role, { active: true, tabId: 1, primaryTabId: 1, generation: 9 });
+    const next = document.querySelector('a[data-page="2"]');
+    const preparationPager = document.getElementById('fixture-pager');
+    preparationPager.style.marginTop = '1800px';
+    preparationPager.style.marginBottom = '1000px';
+    const motionSamples = [];
+    const recordMotion = () => motionSamples.push(window.scrollY);
+    window.addEventListener('scroll', recordMotion, { passive: true });
+    fixtureStorage.refreshMinutes = 5;
+    lastNavigationAt = Date.now() - 6_000;
+    const originalRandom = Math.random;
+    Math.random = () => 0; // Exercise the bounded settling correction in real DOM.
+    await continueSweep({ generation: 9, mode: 'none', total: 19, visited: [1],
+      endRetries: {}, startedAt: Date.now() - 6_000 }, 9);
+    Math.random = originalRandom;
+    const originalDeadline = nextActionAt;
+    await wait(950);
+    window.removeEventListener('scroll', recordMotion);
+    const preparedRect = next.getBoundingClientRect();
+    assert(preparedRect.top >= 0 && preparedRect.bottom <= window.innerHeight,
+      'Offscreen pager was not brought into view');
+    assert(nextActionAt === originalDeadline && phase === 'waiting-navigation',
+      'Scrolling changed the navigation deadline or looked like user activity');
+    assert(motionSamples.length > 10, 'Pager movement did not animate across frames');
+    const correction = Math.max(...motionSamples) - window.scrollY;
+    assert(correction > 0 && correction <= 18,
+      'The small upward settling correction was missing or out of bounds');
+    cancelPageWork();
+    preparationPager.style.marginTop = '';
+    preparationPager.style.marginBottom = '';
+    const paginationCards = document.getElementById('cards');
+    paginationCards.style.minHeight = '1400px';
+    programmaticScrollUntil = Date.now() + 250;
+    window.scrollTo({ top: 0, behavior: 'instant' });
+    next.addEventListener('click', event => {
+      event.preventDefault();
+      history.pushState({}, '', '?page=2');
+      // Site-driven restoration produces a trusted scroll event after our own
+      // short animation guard expires. It must keep old cards locked until the
+      // delayed result renders, without looking like direct user input.
+      setTimeout(() => window.scrollTo({ top: 200, behavior: 'instant' }), 350);
+      setTimeout(() => {
+        document.getElementById('cards').innerHTML =
+          '<section><a href="/ip/10000002">New reviewer item</a><p>Free (Valued at $35)</p></section>';
+      }, 1700);
+    });
+    navigatePage(2, 9);
+    await wait(550);
+    assert(phase === 'waiting-page-change',
+      'Site scroll restoration interrupted navigation or accepted old cards after the URL changed');
+    await wait(1700);
+    assert(!navigationPending, 'Client-side pagination did not unlock after changed cards');
+    assert(collect()[0].item_id === 'ip-10000002', 'New card was not collected');
+    cancelPageWork();
+    programmaticScrollUntil = Date.now() + 250;
+    paginationCards.style.minHeight = '';
+    const pager = document.getElementById('fixture-pager');
+    next.setAttribute('aria-current', 'page');
+    const numberThree = document.createElement('a');
+    numberThree.href = '#';
+    numberThree.setAttribute('aria-label', 'Go to Page 3');
+    numberThree.textContent = '3';
+    pager.appendChild(numberThree);
+    const nextAction = document.createElement('a');
+    nextAction.href = '#';
+    nextAction.setAttribute('role', 'button');
+    nextAction.setAttribute('aria-label', 'Next Page');
+    nextAction.textContent = 'Next';
+    pager.appendChild(nextAction);
+    let delegatedClicks = 0;
+    pager.addEventListener('click', event => {
+      if (event.target !== nextAction) return;
+      event.preventDefault();
+      delegatedClicks += 1;
+      history.pushState({}, '', '?page=3&affinityOverride=default');
+      setTimeout(() => {
+        next.removeAttribute('aria-current');
+        numberThree.setAttribute('aria-current', 'page');
+        document.getElementById('cards').innerHTML =
+          '<section><a href="/ip/10000005">Delegated next-page item</a><p>Free (Valued at $35)</p></section>';
+      }, 700);
+    });
+    assert(findPageControl(pageUrl(3), 3) === nextAction, 'Native Next was not preferred for an adjacent page');
+    navigatePage(3, 9);
+    await wait(550);
+    assert(phase === 'waiting-page-change', 'Native Next accepted stale cards');
+    await wait(700);
+    assert(delegatedClicks === 1 && !navigationPending && collect()[0].item_id === 'ip-10000005',
+      'The delegated native Next handler did not finish correctly');
+    cancelPageWork();
+    const first = document.querySelector('a[data-page="1"]');
+    let firstClicks = 0;
+    first.addEventListener('click', event => {
+      event.preventDefault();
+      firstClicks += 1;
+      history.pushState({}, '', location.pathname);
+      setTimeout(() => {
+        document.getElementById('cards').innerHTML =
+          '<section><a href="/ip/10000006">Fresh scan first-page item</a><p>Free (Valued at $40)</p></section>';
+      }, 700);
+    });
+    fixtureListeners[0]({ type: 'reviewer:set-role', active: false, tabId: 1,
+      primaryTabId: 1, generation: 10 }, {}, () => {});
+    const restartReply = await new Promise(resolve => fixtureListeners[0]({
+      type: 'reviewer:restart-native', active: true, tabId: 1,
+      primaryTabId: 1, generation: 10, target: new URL(location.pathname, location.href).href
+    }, {}, resolve));
+    assert(restartReply.ok && restartReply.navigation === 'native', 'Native restart was rejected');
+    await wait(550);
+    assert(phase === 'waiting-page-change', 'Native restart accepted stale last-page cards');
+    await wait(700);
+    assert(firstClicks === 1 && !navigationPending && currentPage() === 1 &&
+      collect()[0].item_id === 'ip-10000006', 'Native restart did not render fresh page-one content');
+    cancelPageWork();
+    Object.assign(role, { active: true, tabId: 1, primaryTabId: 1, generation: 9 });
+    const measuredNow = Date.now();
+    const timing = pageNavigationDelay({ refreshMinutes: 5, pageDelaySeconds: 15 },
+      { mode: 'none', total: 17 }, measuredNow - 6_000, measuredNow, 0.5);
+    assert(timing.delayMs === 9_000 && timing.intervalMs === 15_000,
+      'Rendering and delivery were not credited toward the pacing interval');
+    history.replaceState({}, '', '?page=2');
+    numberThree.remove();
+    nextAction.remove();
+    next.setAttribute('aria-current', 'page');
+    rememberAcknowledged(collect());
+    let advancedEarly = false;
+    queueWhenIdle(() => { advancedEarly = true; }, 60_000);
+    startObserver();
+    const updatesBefore = fixtureMessages.filter(msg => msg.type === 'reviewer:page').length;
+    const fresh = document.createElement('section');
+    fresh.innerHTML = '<a href="/ip/10000003">Fresh live item</a><p>Free (Valued at $45)</p>';
+    document.getElementById('cards').appendChild(fresh);
+    await wait(1_300);
+    const relays = fixtureMessages.filter(msg => msg.type === 'reviewer:page');
+    assert(relays.length === updatesBefore + 1 && relays.at(-1).items.length === 1 &&
+      relays.at(-1).items[0].item_id === 'ip-10000003', 'A new live card was not relayed independently');
+    assert(phase === 'waiting-navigation' && !advancedEarly,
+      'Late-card observation changed the queued navigation');
+    cancelPageWork();
+    phase = 'complete';
+    const afterScan = document.createElement('section');
+    afterScan.innerHTML = '<a href="/ip/10000004">Fresh completed-page item</a><p>Free (Valued at $55)</p>';
+    document.getElementById('cards').appendChild(afterScan);
+    await wait(1_300);
+    assert(fixtureMessages.filter(msg => msg.type === 'reviewer:page').length === updatesBefore + 2,
+      'Completed-page live observation did not relay the new card');
+    assert(phase === 'complete', 'Live observation restarted the completed sweep');
+    const populatedCards = document.getElementById('cards').innerHTML;
+    document.getElementById('cards').innerHTML = '';
+    const emptyPanel = document.createElement('div');
+    emptyPanel.id = 'search-item-stack-no-results-header';
+    emptyPanel.textContent = 'There were no search results for';
+    document.body.appendChild(emptyPanel);
+    history.replaceState({}, '', '?page=6');
+    const catalogueLastPage = document.createElement('li');
+    catalogueLastPage.textContent = '18';
+    pager.appendChild(catalogueLastPage);
+    fixtureStorage['sweep:1'] = {
+      generation: 9, mode: 'none', total: 18, visited: [1, 2, 3, 4, 5],
+      endRetries: {}, startedAt: Date.now()
+    };
+    emptySince = 0;
+    const fallbacksBefore = fixtureMessages.filter(msg => msg.type === 'reviewer:pagination-fallback').length;
+    await relay();
+    assert(phase === 'waiting-content' && fixtureStorage['sweep:1'].mode === 'none' &&
+      fixtureMessages.filter(msg => msg.type === 'reviewer:pagination-fallback').length === fallbacksBefore,
+      'A transient page-six no-results panel immediately changed the search');
+    emptyPanel.remove();
+    document.getElementById('cards').innerHTML = populatedCards;
+    await relay();
+    assert(fixtureStorage['sweep:1'].visited.includes(6) && fixtureStorage['sweep:1'].mode === 'none',
+      'Recovered cards did not continue ordinary pagination');
+    cancelPageWork();
+    document.getElementById('cards').innerHTML = '';
+    document.body.appendChild(emptyPanel);
+    fixtureStorage['sweep:1'].endRetries[6] = 2;
+    // Model the fresh document after its rendering window and confirmation reload.
+    emptySince = Date.now() - 31_000;
+    endConfirmationsInDocument.clear();
+    await handleEndPage(9);
+    assert(phase === 'waiting-navigation' && fixtureStorage['sweep:1'].mode === 'high-value' &&
+      fixtureStorage['sweep:1'].query === 'Accessories' && fixtureStorage.sweepMode === 'none',
+      'A confirmed unusable page did not switch to a temporary category sweep');
+    cancelPageWork();
+    // Model the fresh document after the one permitted confirmation reload.
+    catalogueLastPage.remove();
+    endConfirmationsInDocument.clear();
+    history.replaceState({}, '', '?q=Wood&page=2');
+    fixtureStorage['sweep:1'].query = 'Wood';
+    fixtureStorage['sweep:1'].total = 2;
+    fixtureStorage['sweep:1'].visited = [1];
+    fixtureStorage['sweep:1'].endRetries[2] = 2;
+    await handleEndPage(9);
+    assert(phase === 'complete' && fixtureStorage.lastSweepPages === 2 &&
+      !fixtureStorage['sweep:1'], 'A confirmed empty Wood tail did not finish the fallback');
+    history.replaceState({}, '', '?page=2');
+    assert((await readSweep(10)).mode === 'none', 'A new round retained the temporary alphabet mode');
+    emptyPanel.remove();
+    document.getElementById('cards').innerHTML = populatedCards;
+    for (const target of ['?queryNups=Cat', '/orders']) {
+      let escapedScope = false;
+      Object.assign(role, { active: true, tabId: 1, primaryTabId: 1, generation: 9 });
+      queueWhenIdle(() => { escapedScope = true; }, 150);
+      history.pushState({}, '', target);
+      await wait(300);
+      assert(!escapedScope && !role.active, 'Queued work escaped the catalogue scope');
+      cancelPageWork();
+      history.replaceState({}, '', '/reviews/claim-product?page=2');
+    }
+    Object.assign(role, { active: true, tabId: 1, primaryTabId: 1, generation: 9 });
+    phase = 'complete';
+    let navigated = false;
+    queueWhenIdle(() => { navigated = true; }, 300);
+    const overlay = document.createElement('div');
+    overlay.id = 'px-captcha';
+    overlay.textContent = 'Robot or human? PRESS & HOLD';
+    document.body.appendChild(overlay);
+    await wait(450);
+    assert(!navigated, 'Verification did not cancel pending navigation');
+    assert(fixtureMessages.filter(msg => msg.type === 'reviewer:verification').length === 1,
+      'Verification must be reported exactly once');
+    let probe;
+    fixtureListeners[0]({ type: 'reviewer:probe' }, {}, value => { probe = value; });
+    assert(probe.botCheck && !probe.reviewerReady, 'Cached cards passed verification readiness');
+    fixtureListeners[0]({ type: 'reviewer:set-role', active: false, tabId: 1,
+      primaryTabId: null, generation: 10 }, {}, () => {});
+    assert(phase === 'waiting-verification', 'Worker demotion lost the verification resume state');
+    const rolesBeforeClear = fixtureMessages.filter(msg => msg.type === 'reviewer:role').length;
+    overlay.hidden = true;
+    overlay.textContent = '';
+    await wait(250);
+    assert(fixtureMessages.filter(msg => msg.type === 'reviewer:role').length > rolesBeforeClear,
+      'Cleared verification waited for the 30-second role poll');
+    assert(!verificationReason(), 'A hidden challenge marker must not block normal content');
+    for (const signal of ['message', 'storage']) {
+      Object.assign(role, { active: true, tabId: 1, primaryTabId: 1, generation: 10 });
+      let peerNavigated = false;
+      queueWhenIdle(() => { peerNavigated = true; }, 150);
+      if (signal === 'message') {
+        fixtureListeners[0]({ type: 'reviewer:pause' }, {}, () => {});
+      } else {
+        for (const listener of fixtureStorageListeners) listener({ botCheck: {
+          newValue: { pausedUntil: Date.now() - 60_000 } } }, 'local');
+      }
+      applyRole({ active: true, tabId: 1, primaryTabId: 1, generation: 10 });
+      await wait(250);
+      assert(!peerNavigated && !actionTimer && phase === 'waiting-verification',
+        `${signal} shared pause did not cancel peer navigation or rejected a late role incorrectly`);
+      role.active = false;
+      for (const listener of fixtureStorageListeners) listener({ botCheck: {
+        newValue: { pausedUntil: 0 } } }, 'local');
+      await wait(0);
+    }
+    stopObserver();
+    cancelPageWork();
+    const cards = document.getElementById('cards');
+    cards.innerHTML = Array.from({ length: 100 }, (_, index) =>
+      `<section><a href="/ip/${10000000 + index}">Benchmark reviewer item ${index}</a>` +
+      '<p>Free (Valued at $25)</p></section>').join('');
+    const acknowledged = new Set(Array.from({ length: 99 }, (_, index) => `ip-${10000000 + index}`));
+    const measure = optimized => {
+      let extracted = 0;
+      const start = performance.now();
+      for (let iteration = 0; iteration < 25; iteration += 1) {
+        extracted += (optimized ? collect(acknowledged) :
+          collect().filter(item => !acknowledged.has(item.item_id))).length;
+      }
+      const duration = performance.now() - start;
+      assert(extracted === 25, 'Performance path lost or duplicated a fresh item');
+      return duration;
+    };
+    measure(false);
+    measure(true);
+    const before = [];
+    const after = [];
+    for (let sample = 0; sample < 7; sample += 1) {
+      // Counterbalance order so warming/JIT is not always assigned to one path.
+      if (sample % 2) { after.push(measure(true)); before.push(measure(false)); }
+      else { before.push(measure(false)); after.push(measure(true)); }
+    }
+    const median = values => [...values].sort((a, b) => a - b)[3];
+    const perfResult = document.createElement('p');
+    perfResult.id = 'fixture-performance-result';
+    perfResult.textContent = JSON.stringify({ cards: 100, acknowledged: 99,
+      iterations: 25, samples: 7, fullParseMedianMs: median(before),
+      earlySkipMedianMs: median(after), fullParseSamplesMs: before, earlySkipSamplesMs: after });
+    document.body.appendChild(perfResult);
+    let invalidCalls = 0;
+    chrome.runtime.sendMessage = () => { invalidCalls++; throw new Error('Extension context invalidated.'); };
+    diagnostic('page-loaded');
+    assert(!role.active && phase === 'extension-reloaded' && !rolePollTimer &&
+      !relayTimer && !actionTimer && !verificationTimer && !roleRetryTimer &&
+      interactionListeners.length === 0, 'Invalidated extension did not shut down page work');
+    let staleNavigation = false;
+    queueWhenIdle(() => { staleNavigation = true; }, 0);
+    cards.appendChild(document.createElement('span'));
+    await relay();
+    await requestRole();
+    await wait(150);
+    assert(invalidCalls === 1 && !staleNavigation && !verificationTimer,
+      'Old observers, retries or navigation woke the invalidated context');
+    result.textContent = 'PASS: shared message/storage pauses cancel peer navigation and reject late roles, including after cooldown expiry. Varied scrolling, category fallback, extension reload cleanup, scope guards, pacing, verification and live relay also pass.';
+  } catch (error) {
+    result.textContent = `FAIL: ${error.message} (visibility=${document.visibilityState}, ` +
+      `phase=${phase}, idleMs=${Date.now() - lastInteraction}, scrollY=${window.scrollY})`;
+    console.error(error);
+  }
+})();
+</script>

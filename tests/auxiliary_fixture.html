@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Auxiliary scans: isolated browser integration</title>
+<style>
+  body { font: 15px/1.5 system-ui, sans-serif; margin: 1.5rem; color: #17212b; }
+  #result { padding: 1rem; background: #eef3f7; font-weight: 600; }
+  #frames { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
+  iframe { width: 100%; height: 320px; border: 1px solid #ccd3da; box-sizing: border-box; }
+  pre { white-space: pre-wrap; }
+  @media (max-width: 700px) { #frames { grid-template-columns: 1fr; } }
+</style>
+<h1>Auxiliary scans browser integration</h1>
+<p>This loopback fixture runs the production manager, content collector, facet controls,
+  pagination and observer. Chrome APIs and ingestion are in-memory fakes. Scan timers
+  are compressed to at most 100 ms; page pacing is 40 ms. Results render after a real
+  180 ms delay, after the URL changes. No Walmart or notifier requests are made.</p>
+<p id="result" role="status" aria-live="polite">Running…</p>
+<div id="frames" aria-label="Simulated extension worker tabs"></div>
+<pre id="details"></pre>
+<script src="/sweep-modes.js"></script>
+<script src="/auxiliary-scans.js"></script>
+<script>
+(() => {
+  'use strict';
+  const realNow = Date.now.bind(Date);
+  let clockOffset = 0;
+  Date.now = () => realNow() + clockOffset;
+  const clone = value => JSON.parse(JSON.stringify(value));
+  const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+  const assert = (condition, message) => { if (!condition) throw new Error(message); };
+  const home = new URL('/reviews/claim-product', location.href).href;
+  const homeSentinel = { generation: 77, mode: 'none', visited: [1, 2, 3, 4, 5, 6, 7], total: 19 };
+  const localData = { auxiliaryDepartments: true, auxiliaryKeywords: true, auxiliaryBrands: false,
+    auxiliaryKeywordQueries: ['Furniture', 'Pet'], sweepMode: 'high-value', refreshMinutes: 0,
+    pageDelaySeconds: 5, pathPattern: '^/reviews/claim-product',
+    'sweep:1': clone(homeSentinel), lastPage: 7, lastSweepStartedAt: 123456, lastSweepDone: 654321 };
+  const sessionData = {};
+  const tabs = new Map();
+  const seen = new Set();
+  const posts = [];
+  const messages = [];
+  const events = [];
+  const errors = [];
+  const checkpoints = [];
+  let nextTabId = 10;
+  let paused = false;
+  let inFlight = 0;
+  let rootDiscovered = false;
+  let showMoreClicks = 0;
+  let selectionGuardChecks = 0;
+  let lazyPagerReveals = 0;
+  let managerRecreated = false;
+  let pauseVerified = false;
+  let duplicateObservations = 0;
+  let manager;
+
+  function storage(data) {
+    return { async get(keys) {
+      return clone(Object.fromEntries((keys || Object.keys(data)).filter(key => key in data).map(key => [key, data[key]])));
+    }, async set(value) { Object.assign(data, clone(value)); }, async remove(keys) {
+      for (const key of Array.isArray(keys) ? keys : [keys]) delete data[key];
+    } };
+  }
+  const api = { storage: { local: storage(localData), session: storage(sessionData) },
+    alarms: { async get() { return {}; }, async create() {}, async clear() {} },
+    tabs: {
+      async create() {
+        const id = ++nextTabId;
+        const frame = document.createElement('iframe');
+        frame.title = `Managed reviewer worker ${id}`;
+        frame.dataset.tabId = String(id);
+        const tab = { id, frame, url: 'about:blank', status: 'complete', listeners: [], renderPending: false };
+        tabs.set(id, tab); document.getElementById('frames').appendChild(frame);
+        return { id, url: tab.url, status: tab.status };
+      },
+      async get(id) {
+        const tab = tabs.get(id); if (!tab) throw new Error('Fixture tab closed.');
+        return { id, url: tab.url, status: tab.status };
+      },
+      async update(id, options) {
+        const tab = tabs.get(id); if (!tab) throw new Error('Fixture tab closed.');
+        tab.url = options.url; tab.listeners = []; tab.renderPending = false; tab.status = 'loading';
+        tab.frame.src = options.url;
+        return { id, url: tab.url, status: tab.status };
+      },
+      async sendMessage(id, message) {
+        const tab = tabs.get(id); if (!tab?.listeners.length) throw new Error('Fixture content not loaded.');
+        return new Promise((resolve, reject) => {
+          try {
+            let asyncResponse = false;
+            for (const listener of tab.listeners) asyncResponse = listener(message, {}, resolve) === true || asyncResponse;
+            if (!asyncResponse && message.type !== 'reviewer:set-role' && message.type !== 'reviewer:probe') resolve(undefined);
+          } catch (error) { reject(error); }
+        });
+      }
+    } };
+
+  const makeManager = () => ReviewerAuxiliaryScans.create(api, { home,
+    config: async () => clone(localData), paused: async () => paused,
+    diagnostic: async (event, detail) => events.push({ event, ...clone(detail) }),
+    probe: id => api.tabs.sendMessage(id, { type: 'reviewer:probe' }),
+    async post(items, page, canPost) {
+      assert(await canPost(), 'Inactive worker reached the post boundary.');
+      const ids = items.map(item => item.item_id);
+      for (const id of ids) { if (seen.has(id)) duplicateObservations += 1; else seen.add(id); }
+      posts.push({ ids, page, at: Date.now() });
+      return { ok: true, new: ids.length, queued: ids.length };
+    }
+  });
+
+  window.fixtureBridge = {
+    api, now: () => Date.now(), rootDiscovered: () => rootDiscovered,
+    register(id, listener) {
+      const tab = tabs.get(id); tab.listeners.push(listener); tab.status = 'complete';
+    },
+    locationChanged(id, url) { tabs.get(id).url = url; },
+    rendering(id, pending, kind) {
+      tabs.get(id).renderPending = pending;
+      if (!pending) events.push({ event: 'fixture-rendered', tabId: id, kind });
+    },
+    event(id, name) {
+      if (name === 'show-more') showMoreClicks += 1;
+      if (name === 'lazy-pager') lazyPagerReveals += 1;
+      events.push({ event: name, tabId: id });
+    },
+    error(message) { errors.push(String(message)); },
+    async send(id, message) {
+      const tab = tabs.get(id);
+      inFlight += 1;
+      try {
+        messages.push({ type: message.type, tabId: id, page: message.page, url: tab.url });
+        if (message.type === 'reviewer:diagnostic') return { ok: true };
+        if (message.type === 'reviewer:aux-selected') {
+          assert(!tab.renderPending, 'Selected URL was authorized while its old cards were still rendered.');
+          selectionGuardChecks += 1;
+        }
+        const answer = await manager.handle(message, { tab: { id, url: tab.url } });
+        if (message.type === 'reviewer:aux-discovered' && !new URL(tab.url).search) rootDiscovered = true;
+        if (message.type === 'reviewer:checkpoint' && answer?.ok) {
+          const state = clone(localData.reviewerAuxiliaryScans);
+          for (const lane of Object.values(state.lanes)) {
+            if (lane.checkpoint?.visited?.length) checkpoints.push(clone(lane.checkpoint));
+          }
+        }
+        return answer || { ok: true };
+      } finally { inFlight -= 1; }
+    }
+  };
+  manager = makeManager();
+  window.fixtureReport = { state: 'running', pacingSimulated: true };
+
+  async function run() {
+    const started = realNow();
+    await manager.tick();
+    while (realNow() - started < 40000) {
+      await wait(60);
+      if (errors.length) throw new Error(errors.join('; '));
+      let status = await manager.status();
+      const lanes = status.lanes;
+      const snapshots = [...tabs.values()].map(tab => {
+        try { return tab.frame.contentWindow.fixtureSnapshot?.() || {}; } catch { return {}; }
+      });
+      const rendering = [...tabs.values()].some(tab => tab.renderPending) ||
+        snapshots.some(snapshot => snapshot.navigationPending || snapshot.relaying);
+      if (!managerRecreated && checkpoints.length && !inFlight && !rendering) {
+        const saved = JSON.stringify(await manager.status());
+        manager = makeManager();
+        assert(JSON.stringify(await manager.status()) === saved, 'Manager recreation lost durable scan progress.');
+        managerRecreated = true;
+      }
+      const keywordTabId = lanes.find(lane => lane.lane === 'keywords')?.tabId;
+      const keywordPosted = messages.some(message => message.type === 'reviewer:page' && message.tabId === keywordTabId);
+      // Root discovery intentionally precedes its first department page. Pause
+      // as soon as both actual collectors are active and a keyword has posted;
+      // cancelling an in-flight render/selection is part of this assertion.
+      if (!pauseVerified && keywordPosted && lanes.length === 2 && snapshots.length === 2 &&
+          lanes.every(lane => lane.status === 'scanning') && snapshots.every(snapshot => snapshot.active === true)) {
+        paused = true; await manager.pause();
+        const count = posts.length;
+        assert((await manager.status()).lanes.every(lane => lane.status === 'paused'), 'Shared pause did not revoke both lanes.');
+        await wait(180);
+        assert(posts.length === count, 'An auxiliary worker posted during the shared verification pause.');
+        assert([...tabs.values()].every(tab => tab.frame.contentWindow.fixtureSnapshot?.().active === false),
+          'Shared pause left an active content collector.');
+        pauseVerified = true; paused = false; await manager.tick();
+        status = await manager.status();
+      }
+      document.getElementById('details').textContent = JSON.stringify({ lanes: status.lanes,
+        posts: posts.length, distinctItems: seen.size, errors }, null, 2);
+      if (status.lanes.length === 2 && status.lanes.every(lane => ['complete', 'partial'].includes(lane.status))) break;
+      // Clock jumps represent waiting between targets only. Never jump while
+      // either real DOM is changing, collecting, or confirming a navigation.
+      if (!rendering && !inFlight) {
+        const next = status.lanes.filter(lane => lane.status === 'waiting' && lane.nextAt > Date.now())
+          .map(lane => lane.nextAt);
+        if (next.length) clockOffset += Math.max(0, Math.min(...next) - Date.now() + 1);
+      }
+      await manager.tick();
+    }
+    const status = await manager.status();
+    const departments = status.lanes.find(lane => lane.lane === 'departments');
+    const keywords = status.lanes.find(lane => lane.lane === 'keywords');
+    assert(departments?.status === 'partial' && departments.failures === 1,
+      'The missing department should finish as one isolated target failure.');
+    assert(keywords?.status === 'complete' && keywords.pages === 4 && keywords.completedTargets === 2,
+      'Both keyword targets did not read both result pages.');
+    assert(departments.pages === 27, 'Furniture cap pages or adaptive Chairs pages were skipped.');
+    assert(localData.reviewerAuxiliaryScans.lanes.departments.targets.some(target => target.label === 'Chairs'),
+      'The lazy 25-page pager did not trigger subdepartment discovery.');
+    assert(showMoreClicks > 0, 'Real Show More discovery was not exercised.');
+    assert(selectionGuardChecks >= 2, 'Fresh-card selection guards were not exercised.');
+    assert(lazyPagerReveals > 0, 'The production collector never revealed the lazy pager.');
+    assert(duplicateObservations > 0, 'Shared item deduplication was not exercised.');
+    assert(checkpoints.length > 0 && managerRecreated, 'Durable checkpoints were not retained across manager recreation.');
+    assert(pauseVerified, 'Both running lanes were not tested through shared verification pause.');
+    assert(JSON.stringify(localData['sweep:1']) === JSON.stringify(homeSentinel) && localData.lastPage === 7 &&
+      localData.lastSweepStartedAt === 123456 && localData.lastSweepDone === 654321, 'Auxiliary work changed homepage state.');
+    const deptTab = tabs.get(departments.tabId);
+    const brands = await deptTab.frame.contentWindow.fixtureDiscoverBrands();
+    assert(brands.some(candidate => candidate.label === 'NIDA'), 'Rendered Walmart brand marker was not recognized.');
+    window.fixtureReport = { state: 'PASS', pacingSimulated: true, elapsedMs: realNow() - started,
+      posts: posts.length, distinctItems: seen.size, duplicateObservations, showMoreClicks,
+      selectionGuardChecks, lazyPagerReveals, managerRecreated, pauseVerified, checkpoints: checkpoints.length,
+      lanes: status.lanes, errors };
+    document.getElementById('result').textContent = 'PASS: department discovery, lazy cap split, all 31 pages, two keyword searches, shared dedupe, isolated failure, durable resume and shared pause.';
+    document.getElementById('result').style.background = '#dff2e6';
+    document.getElementById('details').textContent = JSON.stringify(window.fixtureReport, null, 2);
+  }
+  run().catch(error => {
+    window.fixtureReport = { state: 'FAIL', error: String(error?.stack || error), messages: messages.slice(-12),
+      events: events.slice(-15), localData: clone(localData), pacingSimulated: true };
+    document.getElementById('result').textContent = `FAIL: ${error.message}`;
+    document.getElementById('result').style.background = '#fbe4e2';
+    document.getElementById('details').textContent = JSON.stringify(window.fixtureReport, null, 2);
+  });
+})();
+</script>
+</html>

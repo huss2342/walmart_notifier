@@ -358,3 +358,249 @@ def test_telegram_http_failure_never_logs_token_or_chat_id(monkeypatch, caplog):
 
 def test_telegram_markdown_escape_includes_existing_backslashes():
     assert _escape(r"a\b_c") == r"a\\b\_c"
+
+
+class TelegramResponse:
+    def __init__(self, status_code=200, payload=None):
+        self.status_code = status_code
+        self.payload = {"ok": True} if payload is None else payload
+
+    def json(self):
+        return self.payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError("private request URL must not be logged", response=self)
+
+
+def test_telegram_one_rate_limit_suppresses_one_hundred_sends_until_expiry(monkeypatch):
+    import notifiers.telegram as telegram_module
+
+    clock = [1000.0]
+    calls = []
+    responses = iter([
+        TelegramResponse(429, {"ok": False, "parameters": {"retry_after": 45}}),
+        TelegramResponse(),
+    ])
+
+    def post(*args, **kwargs):
+        calls.append(kwargs["json"]["chat_id"])
+        return next(responses)
+
+    monkeypatch.setattr(telegram_module.requests, "post", post)
+    monkeypatch.setattr(telegram_module.time, "monotonic", lambda: clock[0])
+    notifier = TelegramNotifier("private-token", "group")
+    assert notifier.send_text("first") is False
+    assert all(notifier.send_text("retry") is False for _ in range(100))
+    assert calls == ["group"]
+    clock[0] += 44.99
+    assert notifier.send_text("still waiting") is False
+    clock[0] += 0.01
+    assert notifier.send_text("retry after expiry") is True
+    assert calls == ["group", "group"]
+    assert notifier.last_diagnostic == ""
+
+
+def test_telegram_group_cooldown_does_not_block_owner_private_chat_or_erase_item_diagnostic(
+    monkeypatch,
+):
+    import notifiers.telegram as telegram_module
+
+    calls = []
+
+    def post(*args, **kwargs):
+        destination = kwargs["json"]["chat_id"]
+        calls.append(destination)
+        if destination == "group":
+            return TelegramResponse(429, {"ok": False, "parameters": {"retry_after": 60}})
+        return TelegramResponse()
+
+    monkeypatch.setattr(telegram_module.requests, "post", post)
+    notifier = TelegramNotifier("private-token", "owner")
+    notifier.set_chat_id("group")
+    assert notifier.send_text("group alert") is False
+    alert_diagnostic = notifier.last_diagnostic
+    assert notifier.send_text("owner status", chat_id="owner", update_diagnostic=False) is True
+    assert notifier.last_diagnostic == alert_diagnostic
+    notifier.last_diagnostic = "previous alert diagnostic"
+    assert notifier.send_text("group status", update_diagnostic=False) is False
+    assert notifier.last_diagnostic == "previous alert diagnostic"
+    assert calls == ["group", "owner"]
+
+
+@pytest.mark.parametrize("hint", [None, True, False, 0, -1, 86401, 5.5, "60", [], {},
+                                 float("nan"), float("inf")])
+def test_telegram_malformed_retry_hint_uses_thirty_second_fallback(monkeypatch, hint):
+    import notifiers.telegram as telegram_module
+
+    clock = [1000.0]
+    calls = []
+
+    def post(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            return TelegramResponse(429, {"ok": False, "parameters": {"retry_after": hint}})
+        return TelegramResponse()
+
+    monkeypatch.setattr(telegram_module.requests, "post", post)
+    monkeypatch.setattr(telegram_module.time, "monotonic", lambda: clock[0])
+    notifier = TelegramNotifier("token", "group")
+    assert notifier.send_text("first") is False
+    clock[0] += 29
+    assert notifier.send_text("waiting") is False
+    assert len(calls) == 1
+    clock[0] += 1
+    assert notifier.send_text("ready") is True
+
+
+def test_telegram_http_200_json_rate_limit_uses_provider_hint(monkeypatch):
+    import notifiers.telegram as telegram_module
+
+    clock = [1000.0]
+    calls = []
+
+    def post(*args, **kwargs):
+        calls.append(1)
+        return TelegramResponse(200, {
+            "ok": False, "error_code": 429, "parameters": {"retry_after": 86400},
+        })
+
+    monkeypatch.setattr(telegram_module.requests, "post", post)
+    monkeypatch.setattr(telegram_module.time, "monotonic", lambda: clock[0])
+    notifier = TelegramNotifier("token", "group")
+    assert notifier.send_text("first") is False
+    clock[0] += 86399
+    assert notifier.send_text("waiting") is False
+    assert len(calls) == 1
+
+
+def test_telegram_rate_limit_logs_do_not_include_provider_description_or_message_context(
+    monkeypatch, caplog,
+):
+    import notifiers.telegram as telegram_module
+
+    payload = {
+        "ok": False, "error_code": 429, "parameters": {"retry_after": 5},
+        "description": "https://private.example/private-token owner group PRIVATE PRODUCT",
+    }
+    monkeypatch.setattr(telegram_module.requests, "post",
+                        lambda *args, **kwargs: TelegramResponse(429, payload))
+    notifier = TelegramNotifier("private-token", "owner")
+    notifier.last_diagnostic = "preserve this"
+    assert notifier.send_text("PRIVATE PRODUCT", chat_id="group", update_diagnostic=False,
+                              log_context="PRIVATE PRODUCT") is False
+    assert notifier.last_diagnostic == "preserve this"
+    assert notifier.send_text("PRIVATE PRODUCT", chat_id="group") is False
+    for forbidden in ("private-token", "owner", "group", "PRIVATE PRODUCT", "https://"):
+        assert forbidden not in caplog.text
+        assert forbidden not in notifier.last_diagnostic
+
+
+def test_telegram_pipeline_rate_limit_keeps_all_items_retryable_then_delivers(monkeypatch):
+    import notifiers.telegram as telegram_module
+    from filters import Rule
+    from pipeline import process
+    from state import SeenStore
+
+    clock = [1000.0]
+    calls = []
+
+    def post(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            return TelegramResponse(429, {"ok": False, "parameters": {"retry_after": 10}})
+        return TelegramResponse()
+
+    monkeypatch.setattr(telegram_module.requests, "post", post)
+    monkeypatch.setattr(telegram_module.time, "monotonic", lambda: clock[0])
+    notifier = TelegramNotifier("token", "group")
+    store = SeenStore(":memory:")
+    items = [Item(item_id=f"item-{i}", title="Example", value_usd=25) for i in range(100)]
+    first = process(items, [Rule()], store, notifier)
+    assert first.failed == 100
+    assert first.notified == 0
+    assert len(calls) == 1
+    assert all(store.is_new(item.item_id) for item in items)
+    clock[0] += 10
+    retried = process(items, [Rule()], store, notifier)
+    assert retried.notified == 100
+    assert all(not store.is_new(item.item_id) for item in items)
+
+
+def test_telegram_inflight_concurrent_rate_limits_keep_longest_deadline_without_network_lock(
+    monkeypatch,
+):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    import notifiers.telegram as telegram_module
+
+    clock = [1000.0]
+    barrier = Barrier(2)
+    calls = []
+
+    def post(*args, **kwargs):
+        text = kwargs["json"]["text"]
+        calls.append(text)
+        if text == "after expiry":
+            return TelegramResponse()
+        barrier.wait(timeout=3)
+        return TelegramResponse(429, {
+            "ok": False, "parameters": {"retry_after": int(text)},
+        })
+
+    monkeypatch.setattr(telegram_module.requests, "post", post)
+    monkeypatch.setattr(telegram_module.time, "monotonic", lambda: clock[0])
+    notifier = TelegramNotifier("token", "group")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        assert list(executor.map(notifier.send_text, ["30", "120"])) == [False, False]
+    clock[0] += 31
+    assert notifier.send_text("still waiting") is False
+    assert len(calls) == 2
+    clock[0] += 89
+    assert notifier.send_text("after expiry") is True
+
+
+def test_telegram_cooldown_memory_is_bounded_and_expired_entries_are_reaped(monkeypatch):
+    import notifiers.telegram as telegram_module
+
+    clock = [1000.0]
+
+    def post(*args, **kwargs):
+        if kwargs["json"]["text"] == "success":
+            return TelegramResponse()
+        return TelegramResponse(429, {"ok": False, "parameters": {"retry_after": 30}})
+
+    monkeypatch.setattr(telegram_module.requests, "post", post)
+    monkeypatch.setattr(telegram_module.time, "monotonic", lambda: clock[0])
+    notifier = TelegramNotifier("token", "owner")
+    for index in range(100):
+        assert notifier.send_text("limited", chat_id=f"chat-{index}") is False
+        assert len(notifier._rate_limited_until) <= 32
+    clock[0] += 30
+    assert notifier.send_text("success", chat_id="owner") is True
+    assert notifier._rate_limited_until == {}
+
+
+@pytest.mark.parametrize("parameters", [None, "private raw data", [], {}])
+def test_telegram_missing_or_invalid_parameters_use_fallback(monkeypatch, parameters):
+    import notifiers.telegram as telegram_module
+
+    clock = [1000.0]
+    calls = []
+
+    def post(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            return TelegramResponse(429, {"ok": False, "parameters": parameters})
+        return TelegramResponse()
+
+    monkeypatch.setattr(telegram_module.requests, "post", post)
+    monkeypatch.setattr(telegram_module.time, "monotonic", lambda: clock[0])
+    notifier = TelegramNotifier("token", "group")
+    assert notifier.send_text("first") is False
+    clock[0] += 29
+    assert notifier.send_text("waiting") is False
+    clock[0] += 1
+    assert notifier.send_text("ready") is True
+    assert len(calls) == 2

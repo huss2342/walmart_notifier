@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Focus before navigation test</title>
+<style>body {font: 18px system-ui; max-width: 850px; margin: 36px auto; padding: 20px; color: #163047; background: #eef4f8} #result {padding: 20px; background: white; border-radius: 12px} pre {white-space: pre-wrap; font-size: 14px}</style>
+<h1>Focus before navigation</h1>
+<p>Production page lifecycle, real DOM and scrolling; Chrome focus replies and window focus are simulated. No Walmart or notifier requests.</p>
+<p id="result" role="status">Running…</p><pre id="details"></pre>
+<div id="cards"><section><a href="/ip/10000001">First fixture item</a><p>Free (Valued at $25)</p></section></div>
+<ol><li data-automation-id="page-number"><a id="fixture-next" href="?page=2">2</a></li></ol>
+<script src="/fixture-stubs.js"></script>
+<script src="/sweep-modes.js"></script><script src="/runtime-policy.js"></script>
+<script src="/page-controls.js"></script><script src="/live-observer.js"></script>
+<script src="/page-scroll.js"></script>
+<script src="/content.js"></script>
+<script>
+(async () => {
+  const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const assert = (value, text) => { if (!value) throw new Error(text); };
+  const events = [];
+  let changes = 0;
+  const activate = () => {
+    cancelPageWork();
+    Object.assign(role, { active: true, tabId: 1, primaryTabId: 1, generation: 9, auxiliary: null });
+    reviewerPathPattern = '^/reviews/navigation-focus';
+    lastInteraction = 0;
+  };
+  try {
+    await wait(80);
+    activate();
+    chrome.runtime.sendMessage = async message => {
+      if (message.type !== 'reviewer:focus') return { ok: true };
+      assert(message.purpose === 'page-navigation', 'Missing navigation focus purpose');
+      events.push('focus requested');
+      await wait(80);
+      events.push('focus granted');
+      return { ok: true, enabled: true, granted: true, until: Date.now() + 3000 };
+    };
+    const first = navigateWithFocus(() => { events.push('page changed'); changes++; }, 9);
+    assert(changes === 0, 'Page changed before focus response');
+    await first;
+    assert(events.join('|') === 'focus requested|focus granted|page changed', 'Incorrect action order');
+    activate();
+    let attempts = 0;
+    chrome.runtime.sendMessage = async message => {
+      if (message.type !== 'reviewer:focus') return { ok: true };
+      if (++attempts === 1) return { ok: true, enabled: true, granted: false, reason: 'busy', retryAfterMs: 1000 };
+      return { ok: true, enabled: true, granted: true, until: Date.now() + 3000 };
+    };
+    await navigateWithFocus(() => { changes++; events.push('busy turn resumed'); }, 9);
+    assert(changes === 1 && actionTimer, 'Busy navigation did not retain its retry');
+    await wait(1150);
+    assert(changes === 2 && attempts === 2, 'Busy navigation did not resume');
+    activate();
+    chrome.runtime.sendMessage = async message => {
+      if (message.type !== 'reviewer:focus') return { ok: true };
+      await wait(80);
+      return { ok: true, enabled: true, granted: true, until: Date.now() + 3000 };
+    };
+    const stale = navigateWithFocus(() => { changes++; }, 9);
+    applyRole({ active: false, tabId: 1, generation: 10 });
+    await stale;
+    assert(changes === 2, 'Late focus revived a stale navigation');
+    events.push('late stale focus rejected');
+    activate();
+    chrome.runtime.sendMessage = async message => {
+      fixtureMessages.push(message);
+      return message.type === 'reviewer:focus' ? { ok: true, enabled: false, reason: 'disabled' } : { ok: true };
+    };
+    let clicks = 0;
+    document.getElementById('fixture-next').addEventListener('click', event => {
+      event.preventDefault();
+      if (++clicks === 2) {
+        history.pushState({}, '', '?page=2');
+        document.getElementById('cards').innerHTML =
+          '<section><a href="/ip/10000002">Fresh fixture item</a><p>Free (Valued at $30)</p></section>';
+      }
+    });
+    const realNow = Date.now, realDelay = pageDelayMs;
+    let offset = 0;
+    // Accelerate only the no-op detector/retry wait; VM regressions separately
+    // verify the unmodified15-second floor. Real DOM controls are still clicked.
+    Date.now = () => realNow() + offset;
+    pageDelayMs = async () => 10;
+    try {
+      navigatePage(2, 9);
+      offset = 6_000;
+      await wait(1400);
+      assert(clicks === 2 && phase === 'waiting-content', 'No-op did not recover through exactly one retry');
+      assert(!fixtureMessages.some(message => message.event === 'navigation-fallback'), 'Retry still caused a full load');
+      events.push('no-op recovered through one paced retry, no full load');
+    } finally {
+      Date.now = realNow; pageDelayMs = realDelay; cancelPageWork();
+    }
+    const cycle = { refreshMinutes: 5, lastSweepStartedAt: 100_000, lastSweepDone: 200_000 };
+    const deadline = sweepRestartAt(cycle, 210_000);
+    assert(deadline > 400_000 && deadline <= 430_000 && sweepRestartAt(cycle, 220_000) === deadline,
+      'Cycle jitter drifted or shortened the interval');
+    events.push('cycle jitter is bounded and deadline remains stable');
+    activate();
+    chrome.runtime.sendMessage = async message => message.type === 'reviewer:focus'
+      ? { ok: true, enabled: true, granted: false, reason: 'window-unfocused' } : { ok: true };
+    assert(await scrollResultsPage(9) === false && !resultsReadingConfirmed(9),
+      'Denied focus incorrectly completed a reading pass');
+    events.push('denied focus holds current page');
+    cancelPageWork();
+    const originalFocus = Object.getOwnPropertyDescriptor(document, 'hasFocus');
+    Object.defineProperty(document, 'hasFocus', { configurable: true, value: () => true });
+    try {
+      document.getElementById('cards').style.minHeight = '1800px';
+      document.querySelector('ol').style.marginBottom = '1000px';
+      chrome.runtime.sendMessage = async message => message.type === 'reviewer:focus'
+        ? { ok: true, enabled: true, granted: true, until: Date.now() + 10_000 } : { ok: true };
+      assert(await scrollResultsPage(9) === true && resultsReadingConfirmed(9),
+        'Granted visible page did not finish its real downward reading pass');
+      assert(scrollY > 0, 'Reading did not move down the document');
+      events.push('granted reading scrolls to a settled bottom');
+      const bottomPosition = scrollY;
+      await preparePageNavigation(2, 9, 9000);
+      await wait(1000);
+      assert(scrollY < bottomPosition && resultsReadingConfirmed(9),
+        'Preparing a pager above the true bottom invalidated completed reading');
+      let preparedNavigation = false;
+      await navigateWithFocus(() => { preparedNavigation = true; }, 9);
+      assert(preparedNavigation, 'Owned pager preparation blocked navigation');
+      events.push('upward pager preparation preserves completed reading');
+      document.getElementById('cards').append(Object.assign(document.createElement('section'),
+        { innerHTML: '<a href="/ip/10000003">Late fixture item</a><p>Free (Valued at $40)</p>' }));
+      await navigateWithFocus(() => { changes++; }, 9);
+      assert(changes === 2 && phase === 'waiting-content', 'Changed cards bypassed the final reading guard');
+      events.push('late cards invalidate reading before navigation');
+    } finally {
+      if (originalFocus) Object.defineProperty(document, 'hasFocus', originalFocus);
+      else delete document.hasFocus;
+      cancelPageWork();
+      document.getElementById('cards').style.minHeight = '';
+      document.querySelector('ol').style.marginBottom = '';
+      window.scrollTo({ top: 0, behavior: 'instant' });
+    }
+    document.getElementById('result').textContent = 'PASS: denied focus holds the page; granted reading reaches a settled bottom; pager positioning preserves reading; late cards block navigation. Focus order, paced retry and stable jitter also pass.';
+    document.getElementById('details').textContent = JSON.stringify({ changes, events }, null, 2);
+  } catch (error) {
+    document.getElementById('result').textContent = `FAIL: ${error.message}`;
+  } finally {
+    role.active = false;
+    cancelPageWork(); stopObserver(); clearInterval(rolePollTimer);
+  }
+})();
+</script></html>

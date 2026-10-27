@@ -1,2 +1,3 @@
 # The server itself is stdlib only. requests is here for the push notifiers.
 requests>=2.32.0
+discord.py>=2.6,<3

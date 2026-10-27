@@ -1,0 +1,276 @@
+{
+  "props": {
+    "pageProps": {
+      "initialSearchQueryVariables": {
+        "query": "",
+        "catId": "",
+        "facet": "",
+        "page": 14
+      },
+      "initialData": {
+        "contentLayout": {
+          "modules": [
+            {
+              "type": "SearchSortFilterModule",
+              "configs": {
+                "allSortAndFilterFacets": [
+                  {
+                    "name": "Departments",
+                    "type": "cat_id",
+                    "values": [
+                      {
+                        "id": "1085632",
+                        "name": "Seasonal",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=1085632"
+                      },
+                      {
+                        "id": "5438",
+                        "name": "Clothing, Shoes & Accessories",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=5438"
+                      },
+                      {
+                        "id": "91083",
+                        "name": "Auto & Tires",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=91083"
+                      },
+                      {
+                        "id": "4191733",
+                        "name": "Subscriptions",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=4191733"
+                      },
+                      {
+                        "id": "1072864",
+                        "name": "Home Improvement",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=1072864"
+                      },
+                      {
+                        "id": "1085666",
+                        "name": "Beauty",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=1085666"
+                      },
+                      {
+                        "id": "1094765",
+                        "name": "Gifts & Registry",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=1094765"
+                      },
+                      {
+                        "id": "1105910",
+                        "name": "Cell Phones",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=1105910"
+                      },
+                      {
+                        "id": "1115193",
+                        "name": "Household Essentials",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=1115193"
+                      },
+                      {
+                        "id": "2636",
+                        "name": "Video Games",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=2636"
+                      },
+                      {
+                        "id": "2637",
+                        "name": "Party & Occasions",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=2637"
+                      },
+                      {
+                        "id": "3891",
+                        "name": "Jewelry & Watches",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=3891"
+                      },
+                      {
+                        "id": "3920",
+                        "name": "Books",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=3920"
+                      },
+                      {
+                        "id": "3944",
+                        "name": "Electronics",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=3944"
+                      },
+                      {
+                        "id": "4044",
+                        "name": "Home",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=4044"
+                      },
+                      {
+                        "id": "4096",
+                        "name": "Movies & TV Shows",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=4096"
+                      },
+                      {
+                        "id": "4125",
+                        "name": "Sports & Outdoors",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=4125"
+                      },
+                      {
+                        "id": "4171",
+                        "name": "Toys",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=4171"
+                      },
+                      {
+                        "id": "5427",
+                        "name": "Baby",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=5427"
+                      },
+                      {
+                        "id": "5428",
+                        "name": "Patio & Garden",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=5428"
+                      },
+                      {
+                        "id": "5440",
+                        "name": "Pets",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=5440"
+                      },
+                      {
+                        "id": "976759",
+                        "name": "Food",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=976759"
+                      },
+                      {
+                        "id": "976760",
+                        "name": "Health and Medicine",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=976760"
+                      },
+                      {
+                        "id": "1229749",
+                        "name": "Office Supplies",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=1229749"
+                      },
+                      {
+                        "id": "1005862",
+                        "name": "Personal Care",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=1005862"
+                      },
+                      {
+                        "id": "1334134",
+                        "name": "Arts Crafts & Sewing",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=1334134"
+                      },
+                      {
+                        "id": "14503",
+                        "name": "Feature",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=14503"
+                      },
+                      {
+                        "id": "6197502",
+                        "name": "Industrial & Scientific",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=6197502"
+                      },
+                      {
+                        "id": "6163033",
+                        "name": "Services",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=6163033"
+                      },
+                      {
+                        "id": "6048744",
+                        "name": "Shop with Purpose",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=6048744"
+                      },
+                      {
+                        "id": "3734780",
+                        "name": "Shop by Brand",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=3734780"
+                      },
+                      {
+                        "id": "9748312",
+                        "name": "Personalized Gifts",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=9748312"
+                      },
+                      {
+                        "id": "5920738",
+                        "name": "Shop by Movie",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=5920738"
+                      },
+                      {
+                        "id": "5967908",
+                        "name": "Collectibles",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=5967908"
+                      },
+                      {
+                        "id": "7796869",
+                        "name": "Musical Instruments",
+                        "type": "cat_id",
+                        "isSelected": null,
+                        "url": "cat_id=7796869"
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

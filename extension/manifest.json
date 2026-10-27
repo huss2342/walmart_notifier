@@ -2,12 +2,17 @@
   "manifest_version": 3,
   "minimum_chrome_version": "120",
   "name": "Reviewer Item Relay",
-  "version": "2.3.0",
+  "version": "2.24.1",
   "description": "Relays items from your own signed-in reviewer page to the notifier running on this machine.",
   "permissions": [
     "storage",
-    "alarms"
+    "alarms",
+    "activeTab",
+    "downloads",
+    "debugger",
+    "tabGroups"
   ],
+  "optional_permissions": ["nativeMessaging", "scripting"],
   "host_permissions": [
     "https://www.walmart.com/*",
     "http://127.0.0.1/*",
@@ -18,10 +23,22 @@
   },
   "content_scripts": [
     {
+      "matches": ["https://www.walmart.com/*"],
+      "js": ["page-controls.js", "verification-watch.js"],
+      "run_at": "document_start"
+    },
+    {
       "matches": [
-        "https://www.walmart.com/reviews/*"
+        "https://www.walmart.com/reviews/*",
+        "https://www.walmart.com/blocked*"
       ],
       "js": [
+        "sweep-modes.js",
+        "runtime-policy.js",
+        "page-scroll.js",
+        "live-observer.js",
+        "facet-controls.js",
+        "department-data.js",
         "content.js"
       ],
       "run_at": "document_idle"

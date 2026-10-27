@@ -7,3 +7,7 @@ __pycache__/
 # Local runtime state and secrets
 notifier.env
 data/
+
+# Per-machine coding-tool settings and backups
+/opencode.json
+/opencode.json.runpod-backup

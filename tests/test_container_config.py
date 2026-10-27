@@ -21,4 +21,7 @@ def test_runtime_secrets_and_state_are_excluded_from_the_build_context():
         if line.strip() and not line.lstrip().startswith("#")
     ]
 
-    assert dockerignore == ["**", "!src/", "!src/**"]
+    assert dockerignore == ["**", "!src/", "!src/**", "!discord_bridge/", "!discord_bridge/*.py"]
+    assert "COPY --chown=notifier:notifier discord_bridge/ /app/discord_bridge/" in (
+        ROOT / "Dockerfile"
+    ).read_text(encoding="utf-8")

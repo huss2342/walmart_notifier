@@ -14,6 +14,7 @@ RUN python -m pip install --no-cache-dir --no-compile -r /tmp/requirements.txt \
        --home-dir /nonexistent --shell /usr/sbin/nologin notifier
 
 COPY --chown=notifier:notifier src/ /app/src/
+COPY --chown=notifier:notifier discord_bridge/ /app/discord_bridge/
 RUN mkdir /app/data && chown notifier:notifier /app/data
 
 USER notifier:notifier

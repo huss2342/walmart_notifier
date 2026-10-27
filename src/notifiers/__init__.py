@@ -22,6 +22,11 @@ _REGISTRY: dict[str, type[Notifier]] = {
 def build_notifier(provider: str | None = None) -> Notifier:
     """Instantiate the configured provider from environment variables."""
     name = (provider or os.environ.get("NOTIFY_PROVIDER") or "ntfy").strip().lower()
+    if name == "discord":
+        # Lazy import keeps other notification providers independent of Discord.
+        from .discord import DiscordNotifier
+
+        return DiscordNotifier.from_env()
     cls = _REGISTRY.get(name)
     if cls is None:
         log.error("Unknown NOTIFY_PROVIDER %r; notifications disabled.", name)

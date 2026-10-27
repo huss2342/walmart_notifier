@@ -35,7 +35,7 @@ if (Test-Path $envFile) {
 
 if ($Seed) { $env:SEED_MODE = 'true' }
 
-if (-not $env:NTFY_TOPIC -and $env:NOTIFY_PROVIDER -ne 'pushover' -and $env:NOTIFY_PROVIDER -ne 'telegram') {
+if (-not $env:NTFY_TOPIC -and $env:NOTIFY_PROVIDER -notin @('pushover', 'telegram', 'discord')) {
     Write-Host "NTFY_TOPIC is not set - nothing will reach your phone." -ForegroundColor Red
     Write-Host "Generate one with:  python -c `"import secrets; print(secrets.token_hex(16))`"" -ForegroundColor Red
 }

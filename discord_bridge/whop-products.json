@@ -1,0 +1,32 @@
+{
+  "status": "draft-local-only",
+  "currency": "USD",
+  "provider": "Whop built-in Discord integration",
+  "products": [
+    {
+      "name": "Reviewer Alerts Starter",
+      "monthly_price_cents": 500,
+      "discord_role_key": "starter",
+      "description": "Private reviewer-item alerts with observed retail values below $40, released five minutes after detection. For existing eligible Walmart reviewers. Availability and claims are not guaranteed.",
+      "delay_seconds": 300,
+      "value_ceiling_cents_exclusive": 4000
+    },
+    {
+      "name": "Reviewer Alerts Pro",
+      "monthly_price_cents": 2000,
+      "discord_role_key": "pro",
+      "description": "Private reviewer-item alerts across all observed retail values, with no intentional delay after detection. Browse by price or item type. For existing eligible Walmart reviewers. Availability and claims are not guaranteed.",
+      "delay_seconds": 0,
+      "value_ceiling_cents_exclusive": null
+    }
+  ],
+  "integration_settings": {
+    "visibility": "product-gated",
+    "cancellation_action": "remove-only-purchased-tier-role-at-access-expiry",
+    "past_due_role": "none-with-paid-access",
+    "event_log_channel_key": "audit",
+    "whop_role_above": ["starter", "pro"],
+    "whop_role_below": ["owner", "trusted-staff"],
+    "member_billing_data_in_this_project": false
+  }
+}
