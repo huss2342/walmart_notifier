@@ -2,6 +2,35 @@
 
 Updated November 2, 2026 (America/Chicago).
 
+## Member trial information (November 2)
+
+Owner requested a member slash command in general before announcing trials.
+`/mytrial` is read-only and accepts no member argument; fresh caller membership
+and that caller's durable record produce a private reply with status, exact local
+expiry/time remaining, and truthful separate-Pro wording. No DMs, role writes or
+trial changes. `/trial` owner command permissions stay at 0. Only general grants
+everyone Use Application Commands; canonical provision/create/audit agree.
+Fresh provisioning temporarily also requires that bit on the setup bot so it
+can create that overwrite; runtime bot permissions remain unchanged. Unconfigured
+general channels do not break the existing request/trial Gateway.
+
+Independent SDK/privacy review approved; 17 new tests cover own-only/other-user
+injection, active/expired/revoked/none, slow provider crossing expiry, mismatched
+identity, schema visibility, general ACL and preservation of existing commands.
+Full suite **2,792 passed / one existing platform skip**, Ruff passed. Candidate
+has 57 matching packaged sources and passed Linux SDK/SQLite/member-status smoke.
+Activation/live verification receipts: `data/mytrial-20261102/`.
+Live at **15:15:36 CST**, image **4b66f477c43e**, preserving runtime/settings.
+Single-command registration preserved existing command IDs, metadata and
+permissions; full audit passed with general-only command allowance. Real Chrome
+ran `/mytrial` in general and displayed the caller's own unrecorded/separate-Pro
+status with **Only you can see this**. Active/expired/revoked paths use real SDK
+and SQLite tests plus actual-image read-only lookup smoke. All **14 trial records
+and 3 saved requests present before this release** are unchanged. No announcement
+was posted; owner will publish the supplied concise copy. No bot runtime
+permission expansion was needed; owner UI changed only general's everyone
+Use Application Commands allow. Final independent security review approved.
+
 ## Consolidated main release (November 2; runtime verified)
 
 Owner explicitly authorized committing/pushing all pending work to main, making

@@ -28,7 +28,6 @@ from .layout import (
     PROVISION_PERMISSIONS,
     READER_PERMISSIONS,
     ROLE_NAMES,
-    SETUP_PERMISSIONS,
     VIEW_CHANNEL,
     permission_overwrites,
 )
@@ -275,7 +274,7 @@ def _role_findings(
                     "Create Invite/View Channels are permitted."
                 )
         elif role_id in bot_roles:
-            allowed = BOT_RUNTIME_PERMISSIONS | (SETUP_PERMISSIONS if allow_setup else 0)
+            allowed = PROVISION_PERMISSIONS if allow_setup else BOT_RUNTIME_PERMISSIONS
             if "trial" in state["roles"]:
                 allowed |= MANAGE_ROLES
             if permissions & ~allowed:
@@ -425,6 +424,7 @@ def _resource_findings(
             state["roles"],
             category,
             application_commands=spec.key in {"item-requests", "trial-management"},
+            public_commands=spec.key == "general",
         )
         try:
             if _acl(channel.get("permission_overwrites")) != _acl(expected_acl):
@@ -695,7 +695,8 @@ def provision(
                 "name": category.name if is_category else channel_specs[action["key"]].name,
                 "type": 4 if is_category else 0,
                 "permission_overwrites": permission_overwrites(
-                    guild_id, bot_user_id, state["roles"], category
+                    guild_id, bot_user_id, state["roles"], category,
+                    public_commands=not is_category and action["key"] == "general",
                 ),
             }
             if not is_category:

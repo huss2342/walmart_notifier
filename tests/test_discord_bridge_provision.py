@@ -11,7 +11,6 @@ from discord_bridge.layout import (
     BOT_RUNTIME_PERMISSIONS,
     CREATE_INVITE,
     PROVISION_PERMISSIONS,
-    SETUP_PERMISSIONS,
     server_manifest,
 )
 from discord_bridge.provision import ProvisionError, audit, bind_membership, provision
@@ -288,7 +287,11 @@ def test_only_two_community_channels_allow_text_but_no_media_threads_apps_or_pri
     for memberships in ([], [starter], [pro], [starter, pro]):
         for channel_id in (*state["categories"].values(), *state["channels"].values()):
             permissions = client.permissions(channel_id, memberships)
-            assert not permissions & prohibited
+            forbidden = prohibited
+            if channel_id == state["channels"]["general"]:
+                forbidden &= ~USE_APPLICATION_COMMANDS
+                assert permissions & USE_APPLICATION_COMMANDS
+            assert not permissions & forbidden
             assert bool(permissions & SEND) is (channel_id in chat)
     for channel_id in state["channels"].values():
         bot = client.permissions(channel_id, [BOT_ROLE], BOT)
@@ -691,6 +694,7 @@ def test_security_settings_never_lower_stronger_verification(tmp_path):
 
 
 def test_channel_creation_obeys_discord_nonadministrator_overwrite_restrictions(tmp_path):
+    from discord_bridge.layout import PROVISION_PERMISSIONS
     class DiscordOverwriteRules(FakeDiscord):
         def request(self, method, path, payload=None):
             if method == "POST" and path.endswith("/channels"):
@@ -705,7 +709,7 @@ def test_channel_creation_obeys_discord_nonadministrator_overwrite_restrictions(
             return super().request(method, path, payload)
 
     client = DiscordOverwriteRules()
-    client.roles[1]["permissions"] = str(SETUP_PERMISSIONS | BOT_RUNTIME_PERMISSIONS)
+    client.roles[1]["permissions"] = str(PROVISION_PERMISSIONS)
     result = provision(client, GUILD, BOT, tmp_path / "state.json", apply=True)
     assert len(result["state"]["channels"]) == 31
     assert len(result["state"]["categories"]) == 7

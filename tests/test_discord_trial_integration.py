@@ -32,7 +32,8 @@ def trial_server(tmp_path):
     for channel in client.channels:
         category = by_id.get(channel["id"]) or by_id[channel["parent_id"]]
         channel["permission_overwrites"] = permission_overwrites(
-            GUILD, state["bot_user_id"], state["roles"], category
+            GUILD, state["bot_user_id"], state["roles"], category,
+            public_commands=channel["id"] == state["channels"]["general"],
         )
     return client, path, state
 

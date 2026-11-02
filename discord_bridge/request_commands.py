@@ -837,7 +837,9 @@ class RequestGateway:
             build_request_command_group(handler), guild=discord.Object(id=int(handler.guild))
         )
         trial_handler = None
+        mytrial_handler = None
         if self._trial_service is not None:
+            from .mytrial_commands import MyTrialCommands, build_mytrial_command
             from .trial_commands import TrialCommands, build_trial_command_group
 
             trial_handler = TrialCommands(
@@ -847,6 +849,12 @@ class RequestGateway:
                 build_trial_command_group(trial_handler),
                 guild=discord.Object(id=int(handler.guild)),
             )
+            if _id(self.state.get('channels', {}).get('general')):
+                mytrial_handler = MyTrialCommands(
+                    self.client, self.state, self._trial_service, event_sink=self._events,
+                )
+                tree.add_command(build_mytrial_command(mytrial_handler),
+                                 guild=discord.Object(id=int(handler.guild)))
 
         async def mark_ready():
             if self._stop.is_set() or gateway.is_closed():
@@ -893,6 +901,11 @@ class RequestGateway:
             )
 
         async def command_error(interaction, error):
+            if mytrial_handler is not None and (getattr(interaction, 'data', None) or {}).get(
+                'name'
+            ) == 'mytrial':
+                await mytrial_handler.error(interaction, error)
+                return
             await (trial_handler if is_trial(interaction) else handler).error(interaction, error)
 
         tree.on_error = command_error
@@ -943,6 +956,15 @@ class RequestGateway:
                 await handler.expired_controls(interaction)
 
         async def interaction_check(interaction):
+            if mytrial_handler is not None and (getattr(interaction, 'data', None) or {}).get(
+                'name'
+            ) == 'mytrial':
+                if not await mytrial_handler.guard(interaction):
+                    return False
+                if self._connected and not self._stop.is_set() and not gateway.is_closed():
+                    return True
+                await mytrial_handler.error(interaction)
+                return False
             if is_trial(interaction):
                 if not await trial_handler.guard(interaction):
                     return False

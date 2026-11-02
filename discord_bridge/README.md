@@ -60,6 +60,15 @@ and evidence are in [the rollout record](../tasks/free-pro-launch-20261028.md).
 
 ## Temporary Pro access
 
+Members can run `/mytrial` in **#general** for a private reply with their own
+trial status, local expiration date and time remaining. It has no member option
+and never changes access or sends a DM. Separate Pro access is reported without
+inventing a subscription expiration. The general channel alone explicitly allows
+members to use application commands; `/trial` retains owner-only permissions.
+
+Suggested announcement: **Check your free trial anytime: run `/mytrial` in
+#general to see your status and expiration. Only you can see the reply.**
+
 The optional trial feature grants Pro feeds and personal requests directly in
 Discord, without a Whop account. **Pro Trial** is a separate role; expiry only
 removes temporary access. Members retaining Whop's paid **Pro** keep their access

@@ -47,7 +47,7 @@ BYPASS_SLOWMODE = 1 << 52
 READER_PERMISSIONS = VIEW_CHANNEL | READ_MESSAGE_HISTORY
 BOT_RUNTIME_PERMISSIONS = READER_PERMISSIONS | SEND_MESSAGES | EMBED_LINKS
 SETUP_PERMISSIONS = MANAGE_CHANNELS | MANAGE_GUILD | MANAGE_ROLES
-PROVISION_PERMISSIONS = SETUP_PERMISSIONS | BOT_RUNTIME_PERMISSIONS
+PROVISION_PERMISSIONS = SETUP_PERMISSIONS | BOT_RUNTIME_PERMISSIONS | USE_APPLICATION_COMMANDS
 # Discord only accepts overwrite bits the creating bot holds. Manage Roles in
 # an overwrite additionally requires Administrator, which we never request.
 # Other member actions stay unavailable through zero base permissions and the
@@ -214,13 +214,18 @@ def permission_overwrites(
     category: Category,
     *,
     application_commands: bool = False,
+    public_commands: bool = False,
 ) -> list[dict]:
     """Explicit ACLs avoid role-combination leaks and public creation windows."""
     public = category.audience == "everyone"
     if application_commands and category.audience not in {"pro", "operations"}:
         raise ValueError("Commands require a Pro-only or owner-only channel")
     chat = public and category.community
+    if public_commands and not chat:
+        raise ValueError("Public commands require a community chat channel")
     reader_allow = (READER_PERMISSIONS | (SEND_MESSAGES if chat else 0)) if public else 0
+    if public_commands:
+        reader_allow |= USE_APPLICATION_COMMANDS
     member_deny = (EMBED_LINKS if chat else MEMBER_ACTION_DENY) | (0 if public else VIEW_CHANNEL)
     if application_commands:
         member_deny |= USE_APPLICATION_COMMANDS
