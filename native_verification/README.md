@@ -23,6 +23,13 @@ zero parent windows, extra fields, non-finite geometry and frames over 16 KiB.
 Only `probe`, `prepare`, `press`, `status`, `release` and `close` are supported.
 There is no shell, keyboard, arbitrary window or network command.
 
+`protocol.json` is the canonical version, labels and conservative geometry
+contract (viewport dimensions at most 20,000 CSS pixels). The host and desktop
+load it directly; the browser asset is regenerated with
+`node tools/generate-native-protocol.mjs`. Use `--check` to verify the committed
+asset. Shared fixtures exercise both host and fake desktop boundaries. Preserve
+this JSON source alongside the Python modules when installing or moving the project.
+
 Preparation expires after two seconds. One connection can press once. A 40 ms
 poller checks input/focus/window/desktop changes and the 30 second maximum. A
 separate release-only watchdog is armed before the press, receives heartbeats

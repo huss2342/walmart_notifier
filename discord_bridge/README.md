@@ -5,28 +5,33 @@ A private delivery package integrated with the local collector through
 notifier from Telegram to Discord. Live sending is **off by default in code**;
 this workspace's local settings now explicitly select Discord and enable it.
 See [the current handoff](../tasks/ACTIVE.md) for verification and pending owner
-steps. On October 22 the owner explicitly approved opening the existing $5/$20
-Whop plans. Both now show Visible / Buy now / Unlimited, and their direct hosted
-checkout forms were verified. Actual purchase and membership lifecycle tests
-remain pending; publication is not proof of role activation or expiry.
+steps. On October 28 the owner selected Free and $30/month Pro with unlimited
+signups. The new Pro checkout is Visible / Buy now / Unlimited, without a trial
+or initial fee. Starter and the old $20 Pro pricing option are hidden and out of
+stock; both old direct checkouts were verified unavailable. Existing test
+purchases remain unchanged. Membership lifecycle was not retested by this change.
 
 The free feed releases **every captured item after 24 hours** in
-`#free-24h-alerts`, marked as historical and available to all server members.
-The selected paid plans are **Starter: $5/month** (positive observed retail value
-below $40, delayed 300 seconds) and **Pro: $20/month** (all observed values,
-no intentional delay). The delay starts when this bridge first accepts the
+`#🆓24h-delayed-alerts`, marked as historical and available to all server members.
+The paid plan is **Pro: $30/month** (all observed values, no intentional delay,
+category/value feeds and personal item requests). Starter's legacy role and
+channel IDs remain for audit/history compatibility, but it is no longer routed
+or delivered. Startup skips any old pending/leased Starter jobs and frozen
+dispatches with reason `route_retired`, preserving terminal history. Deleted
+Starter roles/channels/categories no longer block the active-feed audit; any surviving
+retired resources still undergo permission checks. The delay starts when this bridge first accepts the
 item at the local backend. Arbitrary incoming timestamps are deliberately ignored;
 the collector posts fresh page observations rather than importing its old ledger.
 
-For launch sizing and the proposed 20-member Pro pilot/waitlist, see the
-[capacity and priority plan](../tasks/discord-capacity-plan.md). This is a draft
-recommendation; no membership limit or third tier is configured.
+There is no member cap, waitlist or new admission restriction. Older capacity
+proposals are superseded by the owner's October 28 instruction. Current pricing
+and evidence are in [the rollout record](../tasks/free-pro-launch-20261028.md).
 
 ## Ready now
 
 - A manifest of two paid roles, seven channel categories and all price/type feeds.
-- One pinned #welcome tier/payment card with direct Starter and Pro checkout
-  buttons, and read-only #updates for owner announcements. Member instructions
+- One pinned #welcome payment card with the current $30 Pro checkout
+  button, and read-only #updates for owner announcements. Member instructions
   live in public read-only #how-to-use (stable key `how-it-works`). Stable internal
   keys remain unchanged; owner posting templates are in
   [discord-updates-templates.md](../tasks/discord-updates-templates.md).
@@ -52,6 +57,114 @@ recommendation; no membership limit or third tier is configured.
   missing or rejected images never block the alert. The thumbnail is part of the
   existing message, with no separate upload, scrape or API send.
 - Two draft Whop products in [whop-products.json](whop-products.json).
+
+## Temporary Pro access
+
+The optional trial feature grants Pro feeds and personal requests directly in
+Discord, without a Whop account. **Pro Trial** is a separate role; expiry only
+removes temporary access. Members retaining Whop's paid **Pro** keep their access
+and saved requests. When neither entitlement remains, the service deletes saved
+requests and cancels unsent personal alerts. An uncertain API response does not
+prove a member lost access.
+
+In the owner-only **#trial-management** channel:
+
+```text
+/trial grant duration:7d
+/trial extend duration:7d
+/trial revoke
+/trial grant member:@person duration:7d
+/trial grant member:@person until:2026-11-10T18:00:00-06:00
+/trial extend member:@person duration:7d
+/trial revoke member:@person
+/trial list
+/trial welcome enabled:true hours:24
+/trial welcome enabled:false
+/trial welcome
+```
+
+Only the current server owner can operate these commands; each action checks
+fresh ownership and replies privately. Omit `member` to open a private selector
+for up to 25 members. Choose people, review the selection and press **Confirm**;
+selection alone changes no access. **Cancel** or expiry closes the controls
+without changes. Each selected member receives an individual result, including
+pending synchronization or a rejected change; existing active trials are not
+overwritten by a grant. Use `extend` to add time. Controls expire after three
+minutes of inactivity and must be reopened after a bot restart.
+
+`duration` accepts hours or days. Supply
+either `duration` or `until`; exact dates require a timezone. Trial timestamps
+are displayed in the viewer's local Discord time. List results are paginated.
+Grant and extension confirmations include a short optional message to copy to
+the recipient. Trials send no automatic DMs, public announcements or extra
+member pings.
+
+The welcome offer starts **off**, with a recommended 24-hour duration. It supports
+1–168 hours and applies only to future new members after enabling. One welcome
+trial is permitted per recorded Discord ID; leaving/rejoining and turning the
+offer off/on do not reset it. Turning it off stops new grants while existing
+expirations and request cleanup keep running. Member-list polling requires the
+existing **Server Members Intent**. Expiry is reconciled about every 15 seconds
+while the service runs; restart catches up overdue removals. During a Discord
+outage, channel access cannot be removed until its API recovers, while personal
+request eligibility still checks the saved expiry.
+
+Setup is explicit. Create an unprivileged, nonmentionable **Pro Trial** role,
+place the collector bot **above Pro Trial and below paid Pro**, and add only
+**Manage Roles** to its runtime permissions. The trial bot cannot manage paid
+Pro at that hierarchy. Review the exact channel/ACL plan before applying it:
+
+```powershell
+.venv/Scripts/python.exe -m discord_bridge.trial_setup plan --role TRIAL_ROLE_ID
+.venv/Scripts/python.exe -m discord_bridge.trial_setup bind --role TRIAL_ROLE_ID --channel TRIAL_CHANNEL_ID
+# After preparing the exact role, channel and ACLs and reviewing the dry run:
+.venv/Scripts/python.exe -m discord_bridge.trial_setup bind --role TRIAL_ROLE_ID --channel TRIAL_CHANNEL_ID --apply
+.venv/Scripts/python.exe -m discord_bridge.trial_setup register
+.venv/Scripts/python.exe -m discord_bridge.trial_setup register --apply
+```
+
+`plan` returns the owner-only channel creation payload and exact Pro-channel ACL
+updates. `bind` audits the complete server before saving the two IDs locally;
+it does not create resources or edit permissions. `register --apply` upserts only
+`/trial`, preserving `/request` and its overrides. Restart the existing live
+request runtime after binding. Its separate `trials.sqlite3` persists grant
+intents, expiry, welcome settings and one-time eligibility alongside the existing
+collector database. Keep one active runtime per trial ledger. No live setup is
+performed by importing these modules.
+
+For existing manual Pro promises, grant the recorded member their actual
+remaining expiry first. Then remove only a confirmed **manual** Pro assignment;
+the trial bot never removes Pro and cannot infer whether an existing Pro role
+came from payment. See [the trial task](../tasks/owner-trials-20261102.md) for
+scope, duration research and activation status.
+
+## Referral discounts
+
+`DISCORD_REFERRALS_ENABLED=true` enables the existing Gateway's **Get my referral
+link** button and an independent outbound Whop polling worker. Private replies
+work for Free/trial/Pro members; no new slash-command permission, member role,
+public HTTP endpoint or paid hosting is needed. Whop Bot still controls paid
+access. Each successful first paid referred subscription gives its buyer 30%
+off that first payment and the referrer 30% off one next payment. Additional
+rewards queue future discounted months; there are no cash commissions.
+
+Private `data/discord_bridge/referral-config.json` binds guild/business, eligible
+product IDs, monthly plan IDs/prices and primary checkout. The API credential
+is read only from `whop-referrals.env` in that directory. Do not commit, print or
+put this key in a link. Scopes and unavoidable `member:manage` breadth, current
+verification and rollback are documented in
+[the rollout record](../tasks/referral-automation-20261030.md).
+
+`referrals.sqlite3` is separate from item/request queues. Credits and invoice
+use are unique, native Discord-to-Whop identity is verified, and unknown writes
+retain their exact intent/submission boundary across restart. The private
+button uses bounded dedicated threads; provider deadlines, Retry-After and
+credential-scoped idempotency are respected. Existing promotions, absent paid
+memberships and unresolved applications keep rewards pending. Authenticated
+health exposes readiness/error counts without customer details. A future
+monthly tier can add stable product/plan IDs and prices without a public name
+being used for billing identity; create that live tier and its access rules only
+when its benefits are defined.
 
 ## Personal greetings
 
@@ -129,8 +242,8 @@ work in the same expiry cohort. Newly arrived expensive Pro items lead the next
 eligible envelope. A persistent fair-route slot serves overdue/quieter paid feeds.
 Free history waits while paid work is due, so a slow Free request cannot block
 the next paid wave. Future tier-delayed jobs do not block Free. Batches do
-not mix fresh items with backlog expiring within 60 seconds. The Starter/free
-release times and 30-minute paid expiry are unchanged; sent or expired jobs are
+not mix fresh items with backlog expiring within 60 seconds. Free's 24-hour
+release and 30-minute paid expiry are unchanged; sent or expired jobs are
 not replayed.
 
 The exact message body, ordered members and nonce are saved before submission.
@@ -174,18 +287,45 @@ entered words, ignoring case and punctuation, and can also match accessories.
 Use a Walmart `/ip/` product link or item ID for an exact product watch.
 
 - `/request add item:air fryer` saves a watch and privately confirms acceptance.
+- `/request add item:recliner min_value:100` watches recliners valued at $100 or more.
+  The minimum is optional, uses USD with up to two decimal places, and includes
+  the exact boundary. Items with an unknown value cannot meet a minimum.
+- `/request add item:recliner, chair, reclining chairs min_value:100` adds three
+  separate watches with the same minimum. You can instead enter
+  `recliner, chair, reclining chairs $100+` in the item field. Each comma-separated
+  phrase matches independently; words within a phrase must all match.
+  A batch saves together or fails without adding any requests. Repeated phrases
+  within a batch count once. Later overlapping batches reuse saved phrases and
+  add only the new ones. Existing filters stay unchanged; an explicitly different
+  minimum for a reused phrase must be changed with Edit instead.
+  The total limit remains ten watches, including bulk additions.
 - `/request list` shows personal requests with a selector and Edit/Delete buttons.
 - `/request edit` and `/request delete` offer autocomplete for the member's own
-  requests. The list controls expire after five minutes; run the command again.
+  requests. Edit one watch at a time. Omitting `min_value` keeps its existing
+  minimum; use `min_value:0` to remove it, or a new value / `$100+` suffix to change
+  it. The Edit dialog also accepts a minimum (blank keeps it, zero clears it).
+  List controls expire after five minutes of inactivity and disable when possible.
+  Expired controls or edit forms, including controls from before a bot restart,
+  privately direct the member to run `/request list` again.
 - `/request test-dm` checks delivery and resumes watches after DMs are enabled.
+  It sends a test DM; it does not simulate a product match or reset product deduplication.
 
-Request commands work only in the bound `#item-requests` channel. Ordinary member
-messages are disabled there. All command replies are private. Item alerts are
+Existing watches survive updates; members can edit them without deleting their
+list. Each comma-separated phrase counts as one of the ten watches, so
+`ice maker, ice machine` counts as two. Shared words between different phrases
+are allowed. A phrase may contain multiple required words (up to 150 characters);
+the full add input is limited to 512 characters.
+
+Request commands work only in the bound `#item-requests` channel. Pro members
+have Send Messages there because Discord requires it for slash commands; this
+also allows ordinary messages. All command replies are private. Item alerts are
 **DM only**, with the product
 image when available, observed value and Walmart links. There is no channel
 fallback. The first request checks DMs; blocked delivery pauses alerts and shows
 instructions. Watches remain active until deleted. A successfully sent product
 is not repeated for the same member, even when several requests match it.
+There is no total notification cap or twenty-minute watch timeout. Individual
+unsent alerts expire after twenty minutes; new matching products remain eligible.
 Confirmed loss of the Pro role stops delivery. New requests require current Pro
 access, and every product DM checks the live role immediately before sending.
 
@@ -194,7 +334,9 @@ matching is committed with observation intake. Seed/import events do not alert;
 a later fresh live observation of an old item can match a new watch. Definitely
 unsent canceled/failed/expired work can re-arm on a fresh observation; uncertain
 sends require review rather than a blind repeated DM. Queued alerts expire after
-20 minutes. Delivery uses a bounded share of the existing REST transport; it does
+20 minutes. The latest observed value must still meet the minimum immediately
+before a queued alert is submitted. Existing watches have no minimum until edited.
+Delivery uses a bounded share of the existing REST transport; it does
 not guarantee item availability or a delivery deadline during bursts.
 
 The feature is off by default. Install `src/requirements.txt`, prepare the
@@ -208,8 +350,13 @@ channel with the owner account, bind its exact ID, and register only this comman
 .venv/Scripts/python.exe -m discord_bridge.request_setup register --apply
 ```
 
+For an existing installation, deploy the updated request modules and restart
+the collector, then preview and apply `request_setup register` again to expose
+the optional `min_value` slash option. Existing watches migrate automatically
+without a minimum. Registration does not run automatically on startup.
+
 The plan prints the exact parent and permission overwrites: only Pro gets View,
-History and Use Application Commands; the bot retains its normal posting access.
+History, Use Application Commands and Send Messages; the bot retains its normal posting access.
 Bind performs the full existing privacy audit before saving the explicitly
 specified channel ID. Existing servers without this optional channel continue
 to pass their normal audit. No new bot management privileges are required by the
@@ -222,8 +369,8 @@ All Channels and allow only `#item-requests`. These saved command permissions
 require the owner account; the bot token cannot edit them. The handler also
 silently acknowledges and removes interactions outside the exact bound channel,
 including owner/admin invocations that bypass Discord's command permissions.
-Owners and administrators can still send ordinary messages because Discord
-bypasses channel ACLs for them; ordinary members have no posting permission.
+Owners and administrators bypass channel ACLs. Pro members can send ordinary
+messages in the request channel as well as use commands.
 
 Set `DISCORD_REQUESTS_ENABLED=true` alongside `DISCORD_LIVE=true` and restart the
 collector (or standalone live bridge). The outbound Gateway listener requires no
@@ -276,7 +423,13 @@ and verification receipt are in [category-detection-20261023.md](../tasks/catego
 `/ingest` acknowledges durable queue acceptance using `queued`, while `notified`
 remains zero for that intake request. A background sender delivers due jobs and
 `/health` reports `discord.live_sending`, aggregate job states and its last
-delivery result. Privacy checks run before sending; failed checks retain jobs
+delivery result. `discord.worker` reports actual sender liveness, completed polls,
+the current cycle's elapsed time, last confirmed send, sanitized failure class and
+recovery time. An idle sender can be healthy without a recent matching product;
+a running thread alone does not prove it is making progress. A rejected missing
+personal-DM destination pauses that member's sends until `/request test-dm`
+confirms a working destination. Uncertain sends remain held for review.
+Privacy checks run before sending; failed checks retain jobs
 without publishing. System tests, bot-check and silence warnings go only to
 private `#collector-health`. Historical `/rescan` publication is refused in
 Discord mode to avoid replaying old personal history.
@@ -362,12 +515,10 @@ availability announcement. Input and output fields are described below.
 Whop is the selected candidate for payment plus membership-role management;
 there is no custom payment handler or customer billing database here.
 
-Create two **draft** recurring USD products using the exact prices/descriptions
-in [whop-products.json](whop-products.json). Use separate product-gated Discord
-access configurations: Starter maps only to Starter; Pro maps only to Pro.
-Pro already has access to the Starter feed, so do not grant both roles. Verify
-that upgrades remove any obsolete Starter assignment instead of leaving a paid
-role behind after a later cancellation.
+The existing Pro product and Discord experience remain in use. Its active
+$30/month checkout is recorded in [whop-products.json](whop-products.json).
+Pro maps only to Pro. Do not reopen retired Starter or the old $20 checkout.
+Legacy Starter bindings remain for compatibility; its feed is private operations.
 
 Whop's documented integration supports paid-role assignment, cancellation actions
 and past-due settings. Choose removal of the purchased role at effective access
@@ -484,6 +635,30 @@ this does not make the Walmart collector independently hosted.
 
 Stop the service with Ctrl+C. Queue jobs and the original delay clock survive
 restart. Do not queue the historical 70k-item ledger as a fresh live feed.
+
+## Implementation boundaries
+
+`policy.py` owns product categories, price bands, tier prices and release clocks.
+Managed feed definitions and observation routing share these definitions.
+`observations.py` validates the public observation contract; `messages.py` renders
+Discord payloads. Existing imports from `core.py` remain supported.
+
+The single-job `JobStore.claim/finish/retry` API adapts the canonical dispatch
+engine. It respects channel/global cooldowns and records delivery metrics. A
+single-job caller cannot claim an existing frozen multi-item envelope; that work
+remains available to `claim_batch` without splitting or changing its nonce.
+
+Personal watches use transactional exact-ID and Unicode token indexes. Existing
+watches are indexed once during schema initialization; database triggers keep
+add/edit/delete atomic with the index, including writes from a rollback image.
+Fresh observations still create their private outbox entries atomically with
+collector intake. No historical
+observations are replayed by the migration.
+
+`DeliveryOutcome` separates a transport-proven pre-submission failure from a
+rejected or potentially accepted write. Personal alerts retry the former safely;
+accepted or unknown writes stay protected from blind retries. Channel frozen
+body, cancellation, release timing and time-limited nonce policies still apply.
 
 ## Verification
 

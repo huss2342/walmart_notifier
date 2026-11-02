@@ -734,7 +734,7 @@ validated and hot-read; invalid configuration suppresses actions. Safe fixed
 decision labels go to a log targeting 60 days, rotating daily or at 256 KiB and
 compressing archives, with a 2-MiB total disk backstop that trims oldest first.
 Backend Python logs use the same policy with 2-MiB segments and a 16-MiB cap;
-Discord delivery JSONL uses 5-MiB segments and a 32-MiB cap. Writers use thread
+Discord delivery JSONL uses 10-MiB segments and a 64-MiB cap. Writers use thread
 and OS file locks, and failed compression leaves the original intact. Docker's
 30-MiB console cache and the seven-day/300-event browser diagnostic snapshot
 remain separate. Cleanup never modifies delivery or dedupe state. The helper

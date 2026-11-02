@@ -1,6 +1,908 @@
 # Active handoff: private Discord and Whop setup
 
-Updated October 26, 2026 (America/Chicago).
+Updated November 2, 2026 (America/Chicago).
+
+## Consolidated main release (November 2; runtime verified)
+
+Owner explicitly authorized committing/pushing all pending work to main, making
+main the default branch and updating all running code. History from the previous
+default branch is already preserved in main. Pending source is grouped into
+backend/native, browser/verification, and operating documentation commits.
+No secrets, runtime databases or private environment files are included.
+
+Full checks: **2,775 Python passed / one existing platform skip**, **1,014 JS
+passed**, Ruff, all 33 browser JS syntax checks, protocol generation and manifest
+JSON passed. Independent bounded review found no release/security blocker.
+Runtime comparison found only two stale packaged files: the accepted free-channel
+label in `discord_bridge/layout.py` and recovery logging in
+`src/browser_recovery.py`. Image **3e1b184f50a0** activated healthy at **14:49:08
+CST**, labeled with source revision **9a7609c**, over exact **794727e3ce50**.
+All **56 packaged Python/requirements files match the checkout**. Full Discord
+audit is now clean, including **🆓24h-delayed-alerts**. Seven paid members, two
+welcome grants, the 24h offer and all 13 saved requests are preserved, as are
+runtime/environment/mount/network/scanner/relay settings. No trial grants or
+recipient notices were sent by this release.
+
+Chrome is already loading canonical extension **2.26.13**, with fresh telemetry
+and a process started after every extension edit. The registered native helper
+is idle and loads canonical current Python/protocol on demand. Existing recovery
+task `ReviewerItemNotifierRecovery-121c23d6dd01` was restarted after backend health
+to load the newer shared logging dependency; task XML is unchanged. Browser tabs
+were preserved. Private deployment/source/database/branch/CI receipts live in
+`data/main-release-20261102/`; rollback tag is
+`reviewer-notifier:before-main-release-20261102` (full trial manager, 794727e3).
+See GitHub's latest main run for hosted CI; local gates above are executed evidence.
+
+## Owner-issued and welcome Pro trials (November 2; live and verified)
+
+Owner selected direct Discord grants without Whop signup, then added a temporary
+automatic welcome offer and deletion of saved requests after all Pro access ends.
+Recommended initial trial is 24 hours (adjustable to 4/8 or 1–168h); this is an
+informed starting point, not a measured conversion optimum. Owner-only `/trial`
+controls grant/extend/revoke/list and toggle the welcome offer. Separate Pro Trial
+role, durable one-time eligibility/expiry, fresh owner/member checks, paid-role
+preservation and serialized request deletion are live. Welcome is **on at 24h**;
+disabling new grants retains expiry processing. Grants are quiet: no automatic
+DMs/public pings; private confirmations include a short optional copyable note.
+
+**Multi-member follow-up is live:** omit `member` in `/trial grant duration:7d`,
+`/trial extend duration:7d` or `/trial revoke` for a private selector of up to 25
+people. Review and Confirm applies the batch; Cancel/timeout changes no access.
+Fresh owner checks and per-member durable IDs protect every action. Picker release image
+**794727e3ce50** is healthy, activated at **14:34 CST**, over exact 72832 baseline.
+Latest full verification: **2,775 passed / one existing platform skip**; Ruff,
+startup, actual-image offline Linux batch/SQLite smoke and independent **73-test**
+review passed. Real Chrome selected two people, showed a private review, then
+cancelled. All 13 requests, both existing grants, welcome settings, runtime and
+seven paid memberships are preserved. Slash-command ID/default permission `0`
+and other command permissions are unchanged. Only three picker modules changed.
+A concurrent separate edit renamed the free recap channel in Discord and local
+`layout.py`; preserved without deployment. Full audit reports only that display
+name drift (verified still text/type 0); all access/privacy checks pass. Deployed
+module hashes match the pinned released base plus the verified overlay.
+
+Initial release: **2,738 Python passed / one existing platform skip**; independent review
+approved after fixing three reproduced expiry/deletion races. Ruff, whitespace,
+packaged startup and actual-image offline Linux SQLite/SDK flow passed. Final
+affected regression suite **234 passed**, including real SDK dispatch. Final
+image was **72832f6c0f56**; all ten live module hashes matched verified source.
+Runtime/scanner/relay configuration and all **13 saved requests** are preserved.
+Owner explicitly approved setup; collector has only Manage Roles and sits below
+paid Pro, above Pro Trial. All temporary permissions were removed. New private
+#trial-management and `/trial` pass the full privacy audit; existing `/request`
+and seven paid memberships remain intact. Real owner status/enable replies were
+private. A natural new join received a trial with expiry exactly join + 24h.
+No synthetic member or payment was used. Initial private command-unavailable
+reply did not recur; safe interaction telemetry was added, cause unproven.
+Existing manual promises still require actual member IDs/dates before migration.
+Full sources, deployment/rollback, verification and remaining limits:
+[owner-trials-20261102.md](owner-trials-20261102.md).
+
+## Discovery repair and fourth tab (November 1; live and verified)
+
+The owner confirms all three linked items are shared-catalogue misses. This
+supersedes the earlier unconfirmed-lead wording below. The new authorized fourth
+tab is implemented in extension **2.26.13** using shared coordinator/content
+behaviors, full pages, existing traffic/verification handling and fair turns.
+General keyword append migration preserves existing scan progress. Independent
+reviews caught and resolved target-start starvation, optional legacy-cache state
+and Unicode trimming parity. **2,667 Python tests passed / one existing skip**,
+**1,014 JS tests passed**; actual package smoke, lint/protocol/startup/syntax and
+real Chrome fixture checks pass. Backend-only overlay **b5a19642db21** activated
+healthy **10:08:07 CST** over exact 5fd8a91dba3c, preserving full runtime/settings
+and all 12 watches. Live due/failed queue and logging errors are zero.
+Owner reloaded **2.26.13**; fresh reporting was verified before enabling priority
+at **14:05:56 CST**. Four owned tabs are live. The priority lane completed its
+first four searches with zero failed targets, and its first intake ACK took
+334 ms. General keywords expanded **100→105**, preserving the entire original
+prefix, existing round and checkpoints. All 12 watches remain unchanged.
+Walmart navigation stalls and native pager affinity changes still receive bounded
+recovery and honest unresolved status; Pet's checkpoint was retained after a
+scope-change deferral, and old failure counters were not cleared. Fresh read-only
+review found no reproduced source defect requiring a further code change.
+Activation receipts, live parser/intake/focus events and remaining limitations
+are recorded in the task. No social scraper
+or recurring comparison feature was added. Current evidence and exact next step:
+[scanner-discovery-20261101.md](scanner-discovery-20261101.md).
+
+## Log storage and high-value category analysis (November 1; log increase live)
+
+Owner clarified that Reddit/Facebook work means manual checks in signed-in
+Chrome; no social scraper, checker feature or recurring collection is requested.
+Seven current Reddit product links were checked against both retained histories:
+four were collected (three before their posts, one dining-chair variant about
+13 minutes later); three exact IDs were absent at check time. The owner's later
+shared-catalogue confirmation establishes these as misses. Source/permalink
+evidence is retained locally.
+
+Delivery/shared log defaults are now **10-MiB active / 64-MiB total**. Explicit
+browser/backend/operations/native/recovery bounds and retention algorithms are
+unchanged. **2,603 Python tests passed / one existing platform skip**; independent
+review, actual packaged offline send/trace/failure smoke, Ruff and whitespace
+passed. Two-module image **5fd8a91dba3c** activated healthy **09:00:01 CST** over
+exact **007848259ff4**, preserving full runtime/settings and all 12 watches.
+Live health confirms new limits, zero dropped logs and zero due/failed jobs.
+
+One-time read-only analysis of 43,457 distinct observed IDs supports Furniture
+as the first named category to prioritize: seven-day first-seen cohort has
+**28 Furniture IDs at $100+, eight at $200+, four of all five at $500+**.
+Price coverage, mixed “other” categories, classification mistakes, search bias
+and latest-value look-ahead remain explicit. Demand/resale are not measured.
+The fourth-tab proposal was subsequently authorized and implemented by the
+discovery task above, preserving all three broad scans and deep pages. No
+validated price/sort filter currently exists; “High Value” means keyword targeting.
+Evidence, analysis and proposed lane constraints:
+[high-value-coverage-20261101.md](high-value-coverage-20261101.md).
+
+## System logging overhaul (October 31; backend and 2.26.12 browser logging live)
+
+Owner authorized tracking data across the system. Added redacted, bounded HTTP/
+service/pipeline receipts; request identities joined to complete batch/product/
+job routing and asynchronous Discord outcomes; worker/Gateway/referral changes;
+native/recovery lifecycle; browser document/lane/target context, sequence IDs,
+durable sync receipts and explicit loss/error counters. Read-only
+`tools/log_audit.py` supplies summaries, p99 timings and item/request traces with
+optional ledger metadata, bounded reads and explicit incomplete-history flags.
+Logs cannot change committed intake or delivery outcomes. Search depth, timers,
+verification controls, privacy, saved watches and the prior traffic-wait fix
+remain intact.
+
+Final **2,602 Python passed / one existing platform skip**, **962 JavaScript
+passed**, lint/protocol/startup/syntax/whitespace, fresh independent reviews and
+actual-image offline HTTP→fake-send→trace/failure-isolation smoke pass. Burst
+profiling reduced 500-item routing telemetry from 2,001 writes to five records,
+retaining every ID, with about 11ms measured incremental overhead locally.
+
+Exact 20-module image **007848259ff4** activated healthy **12:01:53 CDT** over
+**b4c0c4bcd336**; all runtime configuration/settings preserved. The existing
+Windows recovery task was restarted with identical XML and emits healthy JSON.
+Live workers/Gateway healthy, zero due/failed channel jobs, zero dropped log
+events; all **12 watches unchanged by hash**. A natural intake linked to its exact
+job; no synthetic live messages were sent. Historical uncertain personal sends
+remain held. The broad archive audit explicitly hit its 128 MiB decoded cap;
+do not treat capped totals as complete.
+
+Browser **2.26.12** is now verified active: read-only coverage follow-up at
+**18:49 UTC / 13:49 CDT** observed 9,442 sequenced records, a durable receipt,
+zero gap events, zero sync/storage failures and zero unacknowledged overwrites.
+This supersedes the initial reload-pending note. The same snapshot had 36
+department and 100 keyword targets enabled, with seven department/four keyword
+targets currently unresolved; this does not establish product recall. Brands
+remain at the owner's off setting. Evidence: ignored
+`data/coverage-review-20261031.json`. Commands, retention and limits:
+[logging guide](../docs/logging.md). Full evidence/activation/rollback:
+[logging-overhaul-20261031.md](logging-overhaul-20261031.md).
+
+## Walmart high-traffic waiting (October 31; 2.26.11 reload pending)
+
+Owner supplied the “Hold tight for a moment / High traffic” screen and requested
+waiting and normal resume. Previous generic diagnostics cannot prove historical
+occurrences. Source **2.26.11** recognizes its paired visible copy, preserves
+checkpoints and waits without clicks/reloads/ordinary retry consumption while a
+correctly scoped receiver answers. DOM clearance resumes the original native or
+facet freshness watchdog; old cards, stale async work, input and verification
+remain guarded. Missing receivers retain finite recovery. All search targets,
+deep pagination and the prior 2.26.10 repair are preserved.
+
+**944 JavaScript**, **2,503 Python plus one existing platform skip**, seven real
+browser replay checks, lint/protocol/startup/syntax and independent review pass.
+Compatible three-module backend **b4c0c4bcd336** activated healthy **11:15:32 CDT**
+over exact **ab7e6c0ef42a**. All runtime config/settings and 12 personal watches
+preserved; live workers healthy, no Pro backlog or dropped logs. Chrome internal
+Extensions controls cannot be claimed:
+reload to **2.26.11**, refresh scanner tabs and keep saved sweeps/settings. Natural
+live traffic recurrence remains unobserved. Full evidence/behavior/activation:
+[high-traffic-wait-20261031.md](high-traffic-wait-20261031.md).
+
+## Discord delivery and scanner timing audit (October 31; 2.26.10 reload pending)
+
+Owner authorized checking delivery/errors/lag and immediate repairs, preserving
+or improving deep coverage. All 428 currently eligible products captured in the
+preceding day had confirmed Pro delivery. Existing messages on all 19 active
+feed routes and three personal alerts matched the ledger. No active Pro backlog,
+failed channel jobs, dropped monitoring events or last-hour errors; Pro 24-hour
+median 2.012s/p95 5.231s. Live workers healthy; all 12 watches unchanged by hash.
+
+Source **2.26.10** repairs a reproduced pending-navigation race that spent a
+second retry on the old rejected document. Eleven examples introduced 165s of
+aggregate scheduled target deferral over 12h. Finite 120s deadline, scope guards,
+checkpoints, normal pacing, every department and all 100 keywords are preserved.
+Independent review approved; **928 JavaScript tests** and **51 focused delivery
+checks** passed. Full Python: **2,487 passed, one existing platform skip**;
+lint/protocol/startup/syntax checks passed. Prior 2.26.9 activation is now
+confirmed by fresh live telemetry;
+that supersedes the October 30 pending-activation note below.
+
+Browser control unavailable: reload the extension to **2.26.10** and refresh
+scanner tabs while preserving sweeps/settings. Backend unchanged. Live speedup
+is unmeasured; render-timeout/HTTP520 targets stay explicitly unresolved.
+Evidence and limits: [reliability-audit-20261031.md](reliability-audit-20261031.md).
+
+## Referral automation (October 30; live)
+
+Owner authorized implementation, then explicitly approved the required
+five-permission Whop API credential. Two-sided 30% one-payment discounts now use
+personal native checkout codes, a durable reward queue and the existing Discord
+Gateway's private guide button. No cash affiliate, new port/hosting, member cap,
+Pro delay or paid-role manager. Native Pro / Remove Role mapping reconfirmed.
+
+Image **1d293c53b9f7** activated healthy at **23:21 CDT** over exact **2f76ba56305b**,
+only nine referral/integration modules. All runtime/scanner settings preserved
+except new referral flag. **2,473 Python tests passed, one existing platform
+skip; 246 focused checks passed**. Independent reviews, Ruff, whitespace and
+offline Linux smoke passed. Live Whop coupon and Chrome checkout confirm $21
+first payment then $30/month. Real button returned an owner-only private link.
+Polling/Gateway ready, zero exceptions; ledger integrity passes. Nine existing
+cards, six descriptions and Whop copy are active, no public posts/pings or DMs.
+
+Actual paid referral invoice/lifecycle events remain unobserved; no test charge
+or synthetic member was used. Keep unresolved rewards queued. The credential
+is ignored/private, owner+SYSTEM ACL, never printed. Rollback tag:
+`reviewer-notifier:before-referrals-20261030`. Full evidence and provider limits:
+[referral-automation-20261030.md](referral-automation-20261030.md).
+
+## Discord reliability housekeeping (October 30; deployed)
+
+Owner authorized checking correct delivery/lag/errors and immediate repairs.
+All 1,096 eligible unseeded products first captured in the prior day had confirmed
+Pro delivery; existing message readback passed on all 19 active feed routes and
+three personal alerts. No active delivery backlog. Last-hour Pro p95 5.165s.
+
+Fixed reproduced rejected stale-DM destination retries: missing destinations now
+require explicit `/request test-dm`; uncertain sends remain held. Added main
+sender liveness/poll/duration/failure/recovery health. Routing, filters, privacy,
+expiry, saved watches and scheduled Free delays preserved. Full Python suite
+2,487 passed/one existing skip; exact candidate 363 passed; Ruff/startup/whitespace,
+independent review and offline actual-image smoke passed.
+
+Image **ab7e6c0ef42a** activated healthy at **23:28:59 CDT**, two-module overlay
+over exact concurrent referral image **1d293c53b9f7**. Runtime configuration and
+all 12 watches preserved by hash. Live workers polling, natural send confirmed,
+no due/failed deliveries or dropped logs; referral release preserved. Separate
+auxiliary scanner coverage gaps remain visible and are not marked fixed here.
+Handoff: [discord-reliability-20261030.md](discord-reliability-20261030.md).
+
+## Referral offer copy (October 30; published as coming soon)
+
+Owner authorized placing the two-sided 30% one-payment offer in multiple
+existing surfaces. Edited nine existing Discord messages (welcome/setup/free
+cards and six Pro activation cards), six channel descriptions, and Whop's Pro
+description. IDs, pins/buttons and notification preferences preserved; no new
+messages, pings or DMs. Fixed old Starter/$20 copy in the free-feed topic.
+Independent readback and Chrome verification passed. No backend deployment,
+cash commissions, coupons or referral billing activation. The automatic
+activation renderer is unchanged; existing activation cards were edited only.
+Evidence: [referral-offer-placements-20261030.md](referral-offer-placements-20261030.md).
+
+## Overlapping requests and expired controls (October 30; deployed)
+
+Owner forwarded overlapping-keyword and Discord timeout reports. Bulk additions
+now reuse saved phrases and add only new ones within ten unique watches; explicit
+minimum conflicts remain atomic and require Edit. Existing filters/history stay
+intact. No list reset is needed; comma-separated phrases count separately.
+`/request test-dm` checks delivery without simulating a product match.
+
+Reproduced SDK dropping expired controls/forms without acknowledgement. Lists now
+bind their private message, disable timed-out controls and show refresh guidance;
+stale/pre-restart clicks and forms get private `/request list` guidance without
+replaying actions. Safe receipt/ack/reply/error telemetry is installed. Exact cause
+of the member's historical timeout remains unproved; fresh retry can now be traced.
+
+Three-module image **2f76ba56305b** activated healthy **22:28:30 CDT** over exact
+**ccf65816deaf**. Runtime configuration/settings preserved; all 12 saved watches
+unchanged by hash. Gateway/sender ready, zero dropped log events. **2,255 Python
+tests passed, one existing platform skip**; Ruff/startup/whitespace, independent
+review and offline actual-image smoke pass. No synthetic member messages/watches.
+Handoff: [request-interactions-20261030.md](request-interactions-20261030.md).
+
+
+## Coverage and performance repair (October 30; 2.26.9 reload pending)
+
+Owner authorized scanner coverage/performance fixes. Source 2.26.8 delivered
+render-budget, liveness, navigation-poll, HTTP, diagnostic and FIFO-handoff repairs.
+Owner reloaded it; live version, diagnostics and all three receivers were verified
+at 18:01 CDT. Home and department scans progressed. Keyword inspection found native
+Next adds `affinityOverride=store_led`, correctly rejected by the assigned scope.
+
+Source **2.26.9** narrowly recovers that known drift to the first missing bound
+page, then uses paced URL pagination only for that target. Input/verification,
+strict scope rejection, checkpoints and every configured target remain intact.
+No speculative target pruning or reordering. Final **919 JavaScript tests passed**;
+affected **614 Python checks passed** after the prior full **2,236 passed, one
+existing platform skip**. Ruff, syntax, protocol, startup and independent review passed.
+
+Backend **ccf65816deaf** activated healthy at 18:11:06 CDT over exact 0c9b5a503cce,
+one failure-code module only; all config/settings preserved. Real health and
+in-memory new-contract checks pass. Prior coordinated sender and min/bulk changes
+remain live. Browser policy blocks extension controls, so owner was asked to
+reload 2.26.9 and refresh scanner tabs without restarting sweeps or clearing history.
+New-version keyword recovery still needs live verification. All workers done.
+
+Handoff: [coverage-performance-release-20261030.md](coverage-performance-release-20261030.md).
+Evidence: `data/coverage-performance-fix-20261030/`.
+
+## Solar personal-alert investigation (October 30; deployed)
+
+Owner authorized investigating stopped solar alerts and improving diagnostics,
+then coordinating overlapping releases. No total alert cap or twenty-minute
+watch cutoff exists. Verified 37 solar DMs spanning about 29 minutes; the watch is now
+absent and exact deletion timing was not logged. Same member received other
+alerts afterward. New post-commit lifecycle/minimum/matching/dedup logs,
+correlated provider outcomes and idle queue summaries are live. Coordinated
+SQLite recovery, poll health and dispatch timing changes are included.
+
+Image **5418be51ee3b** activated healthy at **17:38:54 CDT** over exact newly deployed
+bulk/minimum image **6802e6561e23**. All runtime config and settings preserved.
+**290 candidate tests passed**, independent review approved, Linux isolated
+smoke passed; live personal sender/Gateway ready and new persistent diagnostics
+verified, monitor dropped events 0. No synthetic member messages or alert replay.
+Full scanner-suite rerun belongs to the coordinated performance chat.
+Evidence and limits: [solar-alert-investigation-20261030.md](solar-alert-investigation-20261030.md).
+
+## Pro request minima and bulk additions (October 30; deployed)
+
+Owner authorized optional minimum values and comma-separated bulk item requests.
+Implemented persistent per-watch minima, shared batch minima and `$100+` suffix,
+atomic additions within the existing ten-watch limit, private minimum display/edit
+controls, and latest-value validation before DM submission. Existing requests keep
+no minimum; member/product deduplication and Pro/channel privacy remain intact.
+Integrated request suite: **183 passed**. Repository Ruff, scoped formatting,
+whitespace and server startup/import checks pass. Independent review: APPROVE
+after fixing a reproduced oversized request-list reply. Full Python suite:
+**2,211 passed, 1 intentional platform skip** in 203.49 seconds; the subsequent
+183-test request run also covers the final list-length repair.
+Owner subsequently authorized deployment. Exact live-image overlay **6802e6561e23**
+is healthy; `/request` was updated in place with optional numeric `min_value` on
+add/edit. Command ID and all four permission overrides are preserved. Gateway is
+connected, request delivery running, live sending enabled, and database integrity
+passes with all 12 existing watches retained. Candidate-specific 183 tests and
+network-disabled Linux smoke passed; no synthetic member watches or test DMs.
+Environment, mounts, networking, security, user/command and scanner/relay settings
+all verified preserved. Rollback: `reviewer-notifier:before-request-filters-20261030`.
+Receipts and consistent DB backup: `data/request-minimum-bulk-deploy-20261030/`.
+Separate pending monitoring changes were excluded from this deployment. Any
+monitoring rollout prepared against the prior image must rebase to retain minima
+and bulk support. Member-facing guide drafts remain unpublished.
+Handoff: [discord-request-filters-20261030.md](discord-request-filters-20261030.md).
+
+## Pro request command access fixed (October 30)
+
+Owner explicitly authorized Send Messages for Pro in `#item-requests` after
+Alias encountered Discord's command permission denial. Live membership and
+command overrides already allowed Pro; Send Messages was missing. Enabled only
+that permission for the existing Pro overwrite through the owner UI. Discord
+requires it for slash commands, including private replies; ordinary Pro chat in
+this channel is now also allowed. Updated the canonical layout, README and
+request setup regression assertions. Focused request setup/provision tests pass.
+Live privacy audit passes; request Gateway is connected and delivery is running.
+Backend image **cc1cb2f2f8a** is a single layout-module overlay over exact live
+**6b060cb1d7c8**, healthy with runtime configuration and settings preserved.
+Receipt and screenshot: `data/request-send-permission-20261030/`. Alias still
+needs to retry the command; no action was performed as Alias.
+
+## Verified empty results and focus repair (October 30; browser activation pending)
+
+Owner authorized positively verifying empty auxiliary targets and fixing long
+focus-contention stalls. The restart at 12:09 CDT was manual; no recovery-policy
+change was requested. Source **2.26.7** verifies stable, visible, correctly bound
+first-page no-results and records explicit empty receipts/counts separately from
+unresolved targets. Blank/error/loading pages and interior gaps stay unresolved.
+The focus acquisition/FIFO race is repaired without changing browsing/input or
+verification guards, finite leases or normal pacing.
+
+Final checks: **877 JavaScript passed**, **2,166 Python passed plus one existing
+platform skip**, **15 real-browser local replay checks passed**, lint/syntax,
+protocol/startup/whitespace checks passed. Independent review approved after
+resolving a focus-turn timing issue. Backend **6b060cb1d7c8** activated healthy
+at **14:10:17 CDT**, one status-module overlay over exact `fdf363e44b6e`.
+Settings/environment/mounts/network/launch configuration preserved. Live relay
+age four seconds, zero overdue/failed deliveries, personal sender running.
+Unset DNS null/empty-array representation caused an initial safe rollback;
+confirmed as the only difference, normalized in comparison, then activated.
+
+Reload the extension to **2.26.7**, then refresh scanner tabs, preserving saved
+coverage/settings. Live behavior improvement has not yet been measured. Broader
+blank-page timeout/probe accounting and sender recovery proposals remain pending;
+this does not implement every October 29 proposal.
+
+Details, exact evidence and activation status:
+[scanner-reliability-20261030.md](scanner-reliability-20261030.md).
+
+## Deleted Starter role compatibility (October 29, live)
+
+Owner deleted the retired Starter role and authorized the code update. Runtime
+audit and membership-bot hierarchy checks now tolerate that role being absent.
+Pro remains required; any surviving Starter role still gets normal checks.
+Historical state/ledger bindings remain intact and the deleted tracked role is
+not recreated. Free/Pro routing and permission overwrites are unchanged.
+
+Reproduced five failures before the fix; 152 focused checks then passed. Full
+Python suite: 2156 passed, 1 existing platform skip; repository Ruff and server
+startup checks passed. Self-review confirmed only the two intended audit changes
+against the actual running module. Read-only live snapshot: old audit failed on
+Starter absence, patched audit passed with no findings.
+
+One-module image fdf363e44b6e activated at 16:35:12 CDT over exact e8a9f88c011b.
+Environment, host config, mounts, scanner/relay settings and launch configuration
+were preserved. Container healthy; live audit ok:true/findings:[]; membership
+worker configured with no error, live sending enabled and delivery unblocked.
+Receipts, exact module diff and rollback image reference are under
+data/starter-role-retirement-20261029. The rollback image restores the old
+missing-Starter audit blocker. No test messages or Discord resource writes.
+
+## Scanner logging and fix proposal (October 29; browser activation pending)
+
+Owner authorized I1 logging and investigation/proposals for the other findings.
+Extension source2.26.6 adds bounded structured page-state evidence; compatible
+backend one-module overlaye8a9f88c011b is healthy at13:44:18CDT over exact60bd0ba9a16b.
+Runtime config/environment/mounts/networks/scanner and relay settings are preserved.
+Browser2.26.5 must be reloaded to2.26.6 and scanner tabs refreshed before new
+events arrive. No scanner-policy, FIFO, timeout or delivery behavior fix applied.
+
+843JS checks,2148Python checks plus1existing platform skip and9realChrome local
+replay checks pass. Independent review has no required findings. Deployed schema
+validates all6stages in memory; live relay and delivery remain healthy. Source
+baselines,diffs,hashes,tests and activation receipt:data/page-state-logging-20261029/.
+Rollback:reviewer-notifier:before-page-state-20261029. Do not rebuild dirty checkout.
+
+Further investigation reproduced auxiliary timeout despite recent input/no focus,
+reachable wait probes consuming retries,FIFO acquisition starvation,and a second
+SQLite recovery failure escaping the personal sender loop. Isolated FIFO
+candidate progresses under all6request orders; no production behavioral patch
+installed. Historical Walmart rendering and exact SQLite subtypes remain unknown.
+Detailed release,proposal,evidence gates and next implementation order:
+[scanner-fix-proposal-20261029.md](scanner-fix-proposal-20261029.md).
+Original investigation:[scanner-investigation-20261029.md](scanner-investigation-20261029.md).
+Temporary replay resources closed; investigators finished.
+
+## Scanner performance repair (October 28, verified source 2.26.5)
+
+Owner approved fixing the follow-up performance findings. Source2.26.5 recognizes
+the actual plain-current/omitted-Next terminal pager, corrects clamped URLs before
+coverage receipts, rejects repeated unvisited-page content and reuses native Next
+on windowed plain-current pagers. Scrolling returns exact focus leases early;
+FIFO and user/verification guards remain. Bounded focus/clamp/repeat diagnostics
+are added. All department pages, three scanners,100 keywords,brands off and pacing
+are preserved; no global25-page cap.
+
+835JS checks,1984Python checks plus1existing platform skip,18real-browser replay
+checks pass. Independent review findings resolved; lint/syntax/protocol/startup
+and whitespace checks pass. Backend one-module overlay60bd0ba9a16b healthy at
+14:43:24CDT over exactf34a0192132d, all runtime configuration/settings preserved.
+Owner confirmed reload and refresh. Live reports now identify2.26.5; all three
+scanner documents are reachable and new telemetry is arriving. Initial user-input
+grace is preserved; subsequent live waits identify manual-tab-active while Chrome
+has a non-scanner tab selected. Full-round useful-throughput improvement and live
+early-release timings remain unmeasured until scanning resumes.
+Detailed behavior,evidence,rollback and activation steps:
+[scanner-performance-fix-20261028.md](scanner-performance-fix-20261028.md).
+
+## Starter routing stopped (October 28 follow-up, live)
+
+Owner requested that code stop sending to the retired Starter feed. New
+observations now route only to Pro channels and Free history. Removed Starter
+enqueue/delay/priority logic, excluded its cooldown lookup, and made startup
+skip pending/leased Starter jobs and frozen dispatches with reason route_retired.
+Confirmed: 9 queued Starter jobs skipped; zero active Starter jobs/dispatches.
+Completed history, non-Starter jobs/dispatches and Free/Pro clocks are preserved.
+
+Final audit found the Starter channel/category had also been deleted remotely.
+Their historical mapped IDs no longer make the audit fail solely because those
+retired resources are absent. Active resources retain exact checks; deleting an
+active Pro feed still blocks delivery. No channels were recreated or messages sent.
+
+First reproduced failures with new regression tests. Full Discord suite813 pass,
+then130 focused provision/retirement cases pass after adding3 deleted-resource
+cases. Ruff/whitespace pass. Self-review of exact deployment diffs; isolated,
+network-disabled migration of the real queue preserved all other jobs/dispatches
+and terminal Starter history. Live audit ok:true/findings:[], container healthy.
+
+Final image cca7c831d651, healthy at13:02CDT; four routing/queue files overlaid
+on exact0b344fbc6e6c, then provision.py alone on619ef0742962. Settings, full host
+configuration, environment, mounts and command preserved. Receipts and queue
+backup under data/starter-retirement-20261028; final audit deployment receipt
+under data/starter-retirement-audit-20261028. No scanner/extension changes.
+Rollback to a pre-retirement image can resume Starter; deleted-resource audit
+compatibility must also be preserved. Use the recorded release receipts.
+
+## Free and $30 Pro pricing (October 28, live)
+
+Owner authorized Free plus $30/month Pro, retiring Starter, updating existing
+Discord copy/channel names, with no member limit, waitlist, added restriction or
+new Discord posts. This supersedes old FP capacity/admission proposals.
+
+Whop Pro product prod_GsPF7my0RjJtU now uses plan_ADOMT0v8UqKSh:
+https://whop.com/checkout/plan_ADOMT0v8UqKSh . Visible / Buy now / Unlimited,
+no trial or initial fee. Existing sold plans cannot change renewal price, so a
+new option was required. Old Starter and $20 Pro plans are hidden and out of
+stock; direct checkouts verified unavailable. Public Products lists only $30
+Pro. Existing kahakaef test purchases are unchanged. A separate product-hide
+action was blocked by automatic approval review and canceled; no workaround
+was used. The closed pricing option achieves retirement.
+
+Edited only the four existing welcome/how-to-use/private-plan/free-card posts.
+Preserved IDs and pins; no sends or pings. Removed Starter buttons and tier
+switching copy, updated $30 checkout links and plan topics. Old Starter category
+is RETIRED FEED, channel retired-starter-feed, owner/bot only. Legacy role/channel IDs remain for compatibility; the follow-up above stops
+Starter routing and queue delivery completely. Free/Pro delivery, personal requests and notification settings
+remain unchanged.
+
+Activated healthy at 12:30 CDT, image0b344fbc6e6c over exact d6b015301148, only
+layout.py and policy.py. Environment, host config, mounts, scanner/relay settings
+and command preserved. Live container Discord audit ok:true/findings:[].
+Rollback tag reviewer-notifier:before-pricing-20261028 (coordinate channel ACL
+and name restoration before using an older layout).
+
+794 existing Discord cases passed in aggregate: full run 793 pass/one obsolete
+CLI expectation; updated CLI suite 3 pass. Focused permission suite108 pass;
+Ruff and whitespace checks pass. No new payment or entitlement lifecycle test.
+Details: [free-pro-launch-20261028.md](free-pro-launch-20261028.md). Private
+backup, receipts and screenshots: data/pricing-20261028 and
+data/discord_bridge/pricing-backup-20261028.json.
+
+## Discord routing and quiet Pro alerts (October 28, live)
+
+Owner requested better categorization and quiet Pro notifications except high
+values. Deployed only classification.py at 11:44 CDT, recognizing GPS/sports
+watches, electric bikes/bicycle accessories, artificial Christmas trees,
+crib/mattress sheets, beach towel clips and toy/ride-on trains. Graphic garment
+motifs preserve clothing; accessory recipients, pet apparel and toy/furniture
+purposes retain their routes. Speculative figurine/sculpture rules were removed
+after independent review. Final **794 Discord tests pass** (no skips), independent
+review approved, lint/whitespace and isolated/live ten-case routing checks pass.
+Final title-only audit: 34 changed outputs among 40,320 stored titles, not an
+accuracy measurement or rewrite of historical messages.
+
+Image d6b015301148 over exact cbba8caf18a8; healthy, read-only Discord audit
+ok:true/findings:[], runtime configuration/settings preserved. Classifier SHA
+fe329ffa7b9e671e87e11eeb3c6abd8ac739f741e5b76b69df271a6aba52c0c6.
+Rollback: reviewer-notifier:before-categories-20261028. No extension reload needed.
+
+Guild default was already mentions-only. Owner account had All Messages with
+most feeds individually muted, leaving $80–200 and $200+ notifying. Automatic
+approval review blocked the first $80–200 override attempt; owner then explicitly
+approved quieting it while retaining $200+. Applied Only @mentions on $80–200;
+verified $200+ still unmuted/inheriting All Messages. No message-level forced
+silence or role pings added. Local onboarding draft clarifies high-value opt-in;
+no live post or Whop changes. Detailed evidence and limitations:
+[discord-category-alerts-20261028.md](discord-category-alerts-20261028.md).
+
+## Scanner coverage repair (October 28, verified source 2.26.4)
+
+Owner approved the measured first implementation with “go for it”. Extension
+2.26.4 fixes captured image-alt variant recognition, terminal-page proof and
+end revalidation, durable per-target recovery, and honest complete/attempted/
+unresolved status. Every department page remains required; three scanners,
+100 keywords, brands off, pacing and the original verification helper remain.
+No product-detail requests or speculative scheduling changes were added.
+
+818 JS / 606 Python checks pass, no skips; real-browser replay10checks pass;
+121-page actual-script replay retains121pages/242initial+lateitems. Independent
+review findings fixed and verified. Backend two-module logging overlay healthy
+13:08:27 CDT, imagef34a0192132d over exactcca7c831d651; all runtime configuration
+and saved settings preserved. Last live report remains2.26.2. Owner was asked to
+reload the extension and refresh the three reviewer documents; live speed and
+full verified round measurement awaits that activation. No speedup claim yet.
+Full release/rollback/testing handoff:
+[scanner-coverage-release-20261028.md](scanner-coverage-release-20261028.md).
+
+## Scanner efficiency review (October 28, pre-implementation evidence)
+
+Fresh measurement and reproducible tests now support a concrete first fix; see
+[scanner-efficiency-evidence-20261028.md](scanner-efficiency-evidence-20261028.md).
+At 11:50–12:20 CDT: 60 department, 53 home and 12 keyword page-ready reads in
+30 minutes (4.17/min combined). Five-minute local sampling advanced keywords
+48→51 with failures3→4; Couch spent roughly three minutes in retries before skip.
+Successful department navigation median2.05s versus19.31s between ready pages;
+main ingest median0.13s. These are observations, not a full verified-round ETA.
+
+Live Sofa card 20761609702 was Free/$35.99 with alternate labels on image alt text,
+while cardFor/collect inspect only link aria-label. Captured public-card replay:
+current source30pass/4fail; in-memory two-expression candidate34pass/0fail,
+recovering the primary and excluding image-labeled variants while preserving
+stock/ambiguity guards. No production source changes or installed fix. Three
+separate probes reproduce windowed-pager/unknown-total premature-completion paths.
+First fix extraction, then terminal proof/durable coverage, then measure focus
+and scheduling candidates. Extra workers, brand expansion and removing keywords
+still lack a controlled benefit. One temporary manual reproduction tab was closed;
+sampler finished, no owned processes remain. No settings/pacing/helper changes.
+
+Owner clarified **every page of every department is mandatory**. Brands are
+optional only with measured time/discovery benefit. Withdrawn: five-page turns
+as the first speed optimization and treating a 25-page warning as a brand trigger.
+Use whole-department traversal with durable resume as the baseline. First prove
+terminal-page/completion integrity, then profile spare capacity and conditionally
+trial two owned department workers claiming whole targets from one durable queue.
+Primary speed metric is complete verified department round time, not first visits.
+Keep the 100 keywords. Brands stay off: prior BDQ trial added no eligible ID;
+future experiments must preserve all department pages and quantify benefits/cost.
+
+Source review found 25 is a heuristic warning, not a scan cap; saved evidence
+shows a 35-page pager. Actual local safety ceiling is 100. A code path with unknown
+total can stop at 100 populated pages and report complete without end evidence or
+a limited flag; this is a source finding, not an observed live incident. Visible
+pager totals also lack independent terminal-Next proof. completedTargets is a
+cursor including failed/discovery/skipped targets, while recognized failures/caps
+make final lane status partial. Completion integrity/unresolved-work accounting
+must be repaired before accepting any optimized implementation.
+
+Historical baseline: 107 page-ready events/22m20s (4.79 pages/minute) across all
+three tabs, not standalone department throughput. Reading leases are shared;
+another tab cannot be assumed to double capacity. The rerun model retains the
+same 65-page union in all schedules; five-page turns add nine target activations
+and only improve first visits. No scanner source, settings, tabs, external
+requests or deployment changed during this review. Revised acceptance criteria:
+[scanner-efficiency-design-20261028.md](scanner-efficiency-design-20261028.md).
+
+## Keyword coverage tuning and bounded brand trial (October 28, live settings)
+
+Owner asked whether dryer search findings were applied and authorized testing
+brand discovery/optimizing coverage. Confirmed live2.26.2, three active lanes,
+100 keywords,37 department targets and requested15s page delay. Measured one
+25-page department at10m49s;13 measured department scopes hit the observed25-page
+boundary. Auxiliary refresh waits until the whole target round completes.
+Full brand discovery appends to the same department queue, potentially toward
+2000 targets; it is not a fourth scanner and remains off.
+
+Bounded manual Chrome trials used only native reviewer search/filter controls:
+Large Appliance had2 direct OOS results; Large Appliance& had5 direct results,
+including3 card-available items. First rendered ID sets had37 each/34 overlap;
+the ampersand first-page-only items included a$69.99 butter churn and two fans.
+This proves session-specific ordering/coverage differences, not wildcard rules
+or whole-catalogue exclusivity. Dryer returned one herb-drying rack; Ktaxon one
+$12 Halloween decoration. A native BDQ brand filter returned the already-seen
+butter churn and no incremental ID. Maker had10 direct matches,7 card-available
+items captured by the bounded first-page summary. No pictured dryer was found.
+
+Applied only a keyword-order improvement: Maker82→3 and Appliance53→4, with the
+small ampersand trials ahead of stars. All100 prior terms remain; custom-list
+semantics and legacy High Value mode remain. Source defaults match; pending
+source version stays2.26.3 because it has not yet been activated. Saved settings
+were atomically backed up/read back; only auxiliaryKeywordQueries changed.
+Live status confirms all100 in the new order, keyword round15 and native q plus
+queryNups URL on Large Appliance page2. Search settings need no extension reload.
+The previous card-logging source update still awaits its separate reload.
+
+Verification: RED priority regression →43 focused checks; full **778JS pass**,
+zero failures/skips. No backend deployment, pacing, verifier, stock admission,
+department schedule or broad brand toggle changed. Manual trial tab closed.
+Backup: data/search-priority-before-20261028T160018Z.json. Detailed findings:
+[search-coverage-tuning-20261028.md](search-coverage-tuning-20261028.md).
+
+## Card logging and live three-tab recovery (October 28, source2.26.3)
+
+Owner requested stronger forensic logging and investigation of two scanner tabs,
+missing keyword searches and a large page11 catalogue. Live2.26.2 still had the
+old count18 pause with no primary lease and lost auxiliary session ownership.
+Both remaining pages were clear. Refreshing those two existing documents once
+allowed the existing recovery path to clear the pause, reclaim the primary and
+create department/keyword workers. Confirmed all three advancing; keywords moved
+Kitchen Appliance → Ride On → Smart Ring → Tablet. Closed retired department0752
+after the replacement0764 was positively owned. No scheduling, pacing, verifier,
+eligibility, search settings or recovery policy changes were needed. Main page11
+was preserved progress in the broad catalogue; Walmart supplied its many cards.
+
+Source **2.26.3** adds bounded card-extraction counts and up to12 prioritized,
+typed public-ID/Free/OOS/retail-value decision samples. Readiness/probe reads stay
+silent. Previously dropped auxiliary events now survive the strict sanitizer,
+with fixed failure codes instead of raw error text. No titles, URLs, queries,
+HTML, quota or account data enter diagnostics. Backend archives fresh validated
+events before snapshot replacement in browser-diagnostic-events.jsonl, with
+restart/heartbeat dedupe and2MiBsegments/16MiBtotal/60day target retention.
+Partial-write failures roll back before retry to preserve JSONL framing.
+
+Verification: **776/776 JS tests**,571 server/diagnostic/storage/control tests,
+then250 focused archive/diagnostic tests after the final write-failure repair;
+Ruff, native protocol, whitespace and real-browser regression fixture pass.
+Actual extension sanitizer → Python validator roundtrip and isolated network-none
+container smoke pass. Independent review approved after resolving sanitizer type
+alignment and partial-write findings. Original verifier hashes are unchanged.
+
+Backend logging is **activated and healthy at10:42CDT**, imagecbba8caf18a8,
+as a three-file overlay on exact prior398418cabf1a. Environment values, full host
+config, mounts, settings, user, command and stop policy were preserved. An initial
+over-strict environment-array order check stopped activation; rollback remained
+healthy, its temporary Compose name was repaired, and the second activation
+verified semantic environment equality. No values or protections changed.
+Live archive contains parseable naturally mirrored events. Rollback image:
+reviewer-notifier:before-card-evidence-20261028. Evidence is ignored under
+data/card-evidence-20261028 and data/qa-card-evidence-*.
+
+**Chrome remains on2.26.2 until the owner reloads the extension for2.26.3 and
+refreshes the reviewer tabs.** All three currently work; this reload activates
+only the new extension logging. The backend archive is already active. Owned
+fixture server/tab were closed. See
+[card-evidence-and-scanner-recovery-20261028.md](card-evidence-and-scanner-recovery-20261028.md).
+
+## Owner-authorized card-only restoration (October 28, source2.26.2)
+
+After clarification, owner explicitly said 'yes restore' and directed checking
+Free/Out of stock on the card itself. Source **2.26.2** removes the individual
+product loader entirely, including runtime import/module, product caches/cooldown,
+soft-deferral/admission state and partial product acknowledgements. Original local
+message deadlines and ingest retry timing are restored. Catalogue extraction now
+requires a positive visible Free label beside its valuation; free shipping alone
+does not qualify. Variant-link/ambiguous-card rejection and pre-ingest OOS filtering
+remain, as do keyword routing and the15minute alert reservation guard.
+
+All14 audited verification/native/tool files are byte-for-byte unchanged by this
+restoration; the complete visible-challenge pause/recovery/notification section
+and loopback postBatch are exact to the pre-restore snapshot. Independent reviewer
+approves and independently passed367 extraction/runtime tests. Full suite:
+**767JS tests pass**, zero failures/skips, including40 cards→one loopback ingest
+and zero Walmart product requests. Tests for the withdrawn loader were removed
+with that feature, not skipped. Snapshot remains ignored under
+data/card-only-restore-before-20261028; evidence: qa-card-only-restoration-20261028.txt.
+Real-browser regression fixture also passes with zero console warnings/errors.
+Ruff, syntax, protocol and scoped whitespace checks pass. Owned fixture tab and
+server are closed; user scanner tabs remain open.
+
+**Owner reload/tab refresh remains to activate2.26.2.** Latest live version2.26.1
+has the earlier persisted count18 pause. Main page11 is clean, but the Health and
+Medicine page14 has a real visible Robot or human? dialog; it was not operated or
+cleared. This shared pause explains stationary/reused tabs. No settings, backend,
+verification input, pacing or tab-management source was changed in restoration.
+
+## Verification preservation and scan-load audit (October 28)
+
+Owner activated2.26.1 and questioned extra robot prompts, unchanged old tabs and
+preservation of prior verification code. Independent read-only audits establish
+the existing engine/controller/watch code and settings remain intact; dirty
+verification/native files predate this task. Active assist remains enabled,
+native remains disabled, last result unsupported. Main catalogue page11 is clean;
+Health and Medicine page14 has an actual visible Robot or human? dialog. No
+verification input was performed. The saved count18 pause and invalidated/lost
+session ownership explain no active primary/new scanner tabs. Session-only cleanup
+ownership also fails to close some retired tabs after an extension reload.
+
+The added individual-product requests are a material traffic change:20 uncached
+candidates can add20 GETs before rule/dedupe filtering, outside the saved page delay.
+Tests did not measure challenge frequency. Owner was offered removal of only those
+extra loads, retaining keyword/variant/OOS fixes and the existing verifier; that
+defers exact page-level Free/Claim proof. After an explanation, they explicitly
+authorized restoration; see the current2.26.2 section above. No saved settings
+changed. Details:
+[verification-preservation-audit-20261028.md](verification-preservation-audit-20261028.md).
+
+## Bot-check alert loop repaired (October 28, supersedes2.26.0 reload below)
+
+Owner reported escalating60→1440minute notification spam after activating2.26.0.
+Confirmed18 challenge/resume cycles09:32–09:37Central: background product GETs
+received a blocked response, then incorrectly attributed it to the clean primary
+tab. Normal recovery immediately cleared that fake episode, enabling another.
+Backend sent each separate report; provider retry alone did not explain the burst.
+
+Source **2.26.1** removes the guessed-tab challenge callback. A separate5minute
+product-request circuit persists in Chrome session storage and produces no
+shared pause, verification input or manual-alert request. Unconfirmed items remain
+closed to ingest; bounded admission retries can continue past them. Genuine visible
+challenges retain existing pause/recovery. Alert attempts are durably reserved
+before HTTP and capped at one per15minutes, including failed/ambiguous requests
+and worker recreation. Both independent reviews approve. **797JS tests pass**,
+zero failures/skips; syntax, Ruff, protocol and scoped whitespace checks pass.
+Evidence: ignored `data/qa-bot-alert-loop-final-20261028.txt`.
+
+**Owner must reload Reviewer Item Relay once more and refresh scanner tabs to
+activate2.26.1.** Fresh mirror still2.26.0/count18/waiting-verification. Historical
+inflated count was not blindly reset; actual visible challenges were not cleared
+or operated. No settings mutation, backend deployment, notification, CAPTCHA input
+or temporary browser/server resource was created during repair.
+
+## Search coverage, offer confirmation and retired tabs (October 28)
+
+Source **2.26.0** implements the owner-requested search, false-variant and old-tab
+fixes. Chrome native search uses `queryNups`: Large Appliance returned3 direct
+matches, its star form5 and ampersand form6 in the observed session. Fresh search
+URLs now populate both native fields, and the saved100-term list prioritizes
+10 broad/suffix discovery searches while preserving all specific item terms.
+Fresh live2.25.1 status mirrors all100 updated terms and runs Large Appliance
+with keyword failures0. Existing q-only checkpoints finish their owned scope;
+fresh rounds use the new route after activation.
+
+Variant swatches and ambiguous/missing cards cannot emit candidates. Before
+local ingest, exact product sampling pages must confirm selected ID, stock, Free
+main price and enabled Claim item. Product checks are bounded/cached; partial
+acknowledgements preserve progress and backend delivery retries. Two unreadable
+attempts soft-defer an item2minutes without persistent dedupe. This checks server
+HTML; client-only offers can be skipped. Both independent reviews approved after
+fixing starvation, retry acknowledgement and inert-markup findings. Five existing
+gray old tabs were closed; three live scanners remain. Future positively owned
+retired tabs close automatically under fresh ownership/pause checks.
+
+Final verification: **790 JS tests pass**, zero failures/skips; real-browser
+regression fixture passes with zero console warnings/errors. Ruff, all extension
+syntax, native protocol and scoped whitespace checks pass. Temporary test/research
+tabs and owned fixture server are closed. Backend Python source is unchanged.
+
+**One owner extension reload and scanner-tab refresh remains to activate2.26.0.**
+No backend restart is needed or performed. Runtime is still2.25.1. Keyword saved
+settings are already active. The Soonaway e-bike currently shows normal$649.99/
+Add to cart; Ride On21064716574 was already collected/sent to pro-all at07:05:50
+Central. Exact Domars watch/Ktaxon dryer were not found in the collector by title.
+Full verification and limits: [search-offer-validation-20261028.md](search-offer-validation-20261028.md).
+
+## High-value search coverage (October 27)
+
+Owner authorized the discussed high-value additions and investigation of missed
+Reddit finds. Saved scanner settings now contain100 terms (original65 preserved,
+35 specific products first). Live2.25.1 mirrored all100 and automatically
+completed Smartwatch→Smart Watch with failures0. Defaults match in source2.25.2.
+Fixed reproduced auxiliary pacing bug: individual keyword/department targets no
+longer allocate the homepage refresh budget again (two-page target90s→configured
+15s nominal interval). All738 JS tests pass; post-version integrated29 pass,
+syntax/protocol checks pass; independent scoped review approved.
+**One manual extension reload remains to activate2.25.2 pacing**; browser tool
+cannot claim Chrome's internal extension page. Keywords are already live; no
+backend restart needed. Oukitel BT103/V3 were collected during the October26
+Discord outage, but their immediate destinations expired unsent. Do not replay
+historical jobs. Exact owner-reported watch remains unidentified without its link.
+Research, evidence and changes: [high-value-search-20261027.md](high-value-search-20261027.md).
+
+## Shorter item notifications (October 27)
+
+Owner requested removal of repetitive notification boilerplate. Feed cards and
+personal watch DMs now omit "No intentional delay", account eligibility/
+availability disclaimers and the constructed-link/cross-account warning. Category,
+timestamps, images, product/review links, mention protection and nonce behavior
+remain; Starter's actual delay and Free's historical labeling remain accurate.
+Queue timing and frozen retry payloads are unchanged. Only messages.py and
+request_delivery.py were overlaid onto the exact prior production image.
+103 relevant delivery/rendering regressions pass, Ruff passes, and an isolated
+Linux formatter smoke passes with no network or production data. Initial
+sandboxed pytest hit the established Windows temporary-directory ACL issue;
+the approved isolated rerun passed103/103 in11.49 seconds.
+Notifier recreated at06:28:18 Central, healthy on image398418cabf1a; environment,
+full host configuration, mounts, user, command/entrypoint, working directory and
+saved scanner/relay settings match the fresh baseline. Natural delivery resumed
+at06:28:33; failed items0. Rollback image:
+reviewer-notifier:before-notification-copy-20261027. Sanitized deployment evidence
+and the thin Dockerfile are ignored under data/notification-copy-20261027/.
+
+## Background collection correction (October 26)
+
+Owner clarified that ordinary collection must continue when Chrome is behind
+another app; selecting the scanner tab before clicking/scrolling is strongly
+preferred. The earlier foreground prerequisite was an implementation assumption,
+not an owner requirement, and is superseded by this clarification. Source
+**2.25.1** selects scanner tabs inside background Chrome without foregrounding
+the OS window. Granted reading/navigation/facet turns no longer depend on
+document focus/visibility; scrolling has timer fallbacks for suspended frames.
+Actual selection revocation cancels work with per-lease identity, while switching
+applications preserves established turns. Focus transitions invalidate pending
+acquisitions to preserve an unrelated manual tab when the owner returns to Chrome.
+Measured scheduler sleep preserves a target; genuine active unsettled reads retain
+bounded recovery. Saved settings and the running backend are unchanged.
+All **734 JS tests pass**; Ruff, syntax/contract checks and fresh independent
+review pass. The real DOM/scroll fixture passes with document focus false and
+animation-frame callbacks suppressed (Chrome grants/focus are simulated).
+Live mirror still reports2.25.0: owner must reload the extension once to activate
+2.25.1, then confirm background lane advancement. No backend restart is needed.
+Final verification and extension activation status are recorded in
+[production-consolidation-20261026.md](production-consolidation-20261026.md).
+
+## Consolidation deployment before the focus clarification (October 26)
+
+Historical record: its foreground requirement is superseded by the correction
+above.
+
+Owner authorized all review improvements and reported relay silence, empty
+results, delayed third tab and broken pagination focus. Source **2.25.0** now
+includes bounded document requests/generation ownership, empty-tail rechecks,
+immediate parked scanner slots with paced loads, safe focus mutation deadlines,
+storage recovery/rescan context, shared clients/contracts and Discord queue/watch
+consolidation. Saved production settings are unchanged. Full checks: **1,805
+Python passed/one expected skip; 707 JS passed; independent review approved**.
+Owner explicitly approved restart; only the notifier was recreated at23:03
+Central. New source-only image is healthy, with every recorded environment,
+mount, port, command and security comparison passing and settings hashes unchanged.
+Consistent database backups and the rollback image remain available. Natural
+Discord delivery resumed; Pro/Starter due0. Live extension **2.25.0**, settings
+sync and three owned scanner slots are confirmed. The real-browser focus fixture
+passes; final foreground scrolling/pagination checks remain because live scanners
+report Chrome window-unfocused. Initial restart approval rejection was resolved
+by the owner's explicit authorization; the retained focus rule still requires
+the owner to bring Chrome forward. Resume from
+[production-consolidation-20261026.md](production-consolidation-20261026.md).
 
 ## Discord delivery restored after category renames (October 26)
 
@@ -736,7 +1638,7 @@ supersedes the earlier preparation-only boundary below. The running local
   verified, no user/role/everyone pings. Source copy updated in onboarding draft.
 - Owner requested a pinned membership promotion in the free feed and a channel
   icon accent. Added one gold upgrade card with the existing $5/$20 direct
-  checkout buttons and Compare plans. Display names now 🆓-free-24h-alerts and
+  checkout buttons and Compare plans. Display names now 🆓24h-delayed-alerts and
   💳-welcome; stable IDs/route keys and the exact ACLs remain the same. Owner UI
   handled names/pinning, bot retained minimal posting permissions. Updated and
   deployed display manifest; focused provisioning tests pass. Source copy and

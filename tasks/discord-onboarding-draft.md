@@ -1,92 +1,41 @@
-# Server onboarding copy
+# Existing Discord onboarding copy
 
-Updated October 23, 2026. Existing messages were edited in the dedicated Reviewer Alerts server
-after its bot permissions and privacy audit passed. Receipt IDs are in ignored
-`data/discord_bridge/onboarding-posts.json`.
-This latest copy supersedes earlier hidden/waitlist setup language. The owner
-approved real paid signups; successful purchase/access lifecycle tests remain pending.
-Visible channel accents are now `💳-welcome` and `🆓-free-24h-alerts`; references
-below use their short labels. Live posts link by channel ID and render the current name.
+Updated October 28, 2026. Four existing posts edited, no new posts or pings.
+Free and $30/month Pro are the current offers. Starter is retired.
 
-## Free-feed pinned membership card
-
-**⭐ Want earlier alerts?**
-
-Gold embed, title: **Choose the membership that fits you**.
-
-Free: every item, delayed 24 hours.
-Starter · $5/month: $0.01–$39.99 items, all categories, after five minutes.
-Pro · $20/month: all values, no added delay, category and value feeds.
-
-Footer: USD, billed monthly. Manage or cancel in Whop. Delays start at detection;
-delivery times vary. Availability and claims are not guaranteed.
-
-Buttons: Starter · $5/month and Pro · $20/month use the same direct checkout
-URLs as #welcome; Compare plans links to #welcome. One pinned post, no pings.
-
-## #welcome
-
+## welcome
 **Choose your membership**
 
-The bot displays this compact comparison inside a native Discord embed:
-
 **Subscribe to Reviewer Alerts**
+**Free · $0**
+Every detected item after **24 hours**. Historical listings; no payment needed.
 
-```text
-Plan      /month   Alert delay
-Free          $0    24 hours
-Starter       $5   5 minutes
-Pro          $20    No added*
-```
+**Pro · $30/month**
+New-item alerts across **all values**, with **no added delay**. Browse by category or value, and set personal item requests so you spend less time checking Walmart.
 
-**Starter:** $0.01–$39.99 items, all categories.
-**Pro:** All values; category and value feeds.
-**Free:** Every item after 24 hours; no payment needed.
+**Subscribe → activate**
+Subscribe to Pro below. After payment, open **Activate Discord access** → **Reviewer Alerts Pro** → its Discord app → **Connect Discord / Claim Access**. Sign in with the email used at checkout.
 
-**How to subscribe**
-Choose a plan below. After payment, open **Activate Discord access** → your plan’s
-Discord app → **Connect Discord / Claim Access**. Sign in with the email used at
-checkout. Payment alone does not identify the recipient Discord account.
+**Pro personal item requests**
+Watch up to **10 items** in <#1563632592232783962> with `/request add`. Add several phrases with commas, such as `recliner, chair, reclining chairs`, and optionally set `min_value:100` for items worth $100 or more (or append `$100+` to the item text). Manage them with `/request list`; edit a minimum or use zero to clear it. Watches stay active until deleted, with one DM per product even when several watches match. Matching alerts arrive by **DM only**; server DMs must be enabled.
 
-**Changing tiers?**
-Starter and Pro are separate subscriptions. Before buying the other plan, cancel
-your current plan’s renewal using **Manage subscription** to avoid paying for both.
-The new plan is billed separately.
+**Refer a friend · you both save 30%**
+Give a friend **30% off their first month**. When they subscribe, you get **30% off your next month**.
+Use **Get my referral link** below. Each successful referral earns another discounted month; rewards apply automatically.
 
-Footer: USD, billed monthly. Manage or cancel in Whop. *Delays start at
-detection; delivery times vary. Availability and claims are not guaranteed.
+USD, billed monthly. Manage or cancel in Whop. Delays start at detection; delivery times vary. Availability and claims are not guaranteed.
 
-Buttons: **Subscribe Starter · $5/month** → https://whop.com/checkout/plan_k2rVgU36MH7pE;
-**Subscribe Pro · $20/month** → https://whop.com/checkout/plan_Ta8OgmuWRX49n;
-Second row: **Activate Discord access** → https://whop.com/reviewer-alerts/;
-**Manage subscription** → https://whop.com/@me/settings/orders;
-**Payment methods** → https://whop.com/billing/manage/payment-methods/.
-The same three member-navigation buttons appear on #how-to-use. These are generic
-per-signed-in-user links, with no private customer identifiers. The welcome card
-remains pinned; readback confirmed the buttons and no mentions.
+- [Subscribe Pro · $30/month](https://whop.com/checkout/plan_ADOMT0v8UqKSh)
+- [Activate Discord access](https://whop.com/reviewer-alerts/)
+- [Manage subscription](https://whop.com/@me/settings/orders)
+- [Payment methods](https://whop.com/billing/manage/payment-methods/)
 
-Both products now have a saved **After checkout** redirect to their respective
-product-gated Discord experience (Starter exp_oHhrnaXBiSEMyn, Pro exp_tWRoVrlmCpMiX6).
-Reopening each product confirmed the stored URL. Actual post-payment redirect,
-member cancellation controls and Discord role delivery still require the member
-walkthrough. No checkout setting requiring Discord before payment was found in
-the inspected product/pricing options. Do not claim the connection step is gone.
-
-## #greeting
-
-Personal member greetings only; ordinary members cannot post. Exact joining-user
-mention allowlist, no roles/everyone/reply pings. The durable worker links #welcome
-and #how-to-use. Server default is mentions-only; personal notification overrides
-cannot be forced by the owner. Real join/push walkthrough remains pending.
-
-## #how-to-use (stable internal key: how-it-works; public read-only)
-
+## how-it-works
 **Set up your alerts**
 
 **1 · Pick a feed**
-Free: #free-24h-alerts
-Starter: #starter-items
-Pro: choose category OR value channels, or #pro-all for everything.
+Free: <#1562537606716203069> (historical, 24-hour delay)
+Pro: choose category OR value channels, or <#1562537637787603055> for everything.
 Start with one feed to avoid duplicate alerts.
 
 **2 · Turn on notifications**
@@ -98,31 +47,70 @@ To stop a feed's alerts, choose **Nothing**.
 Click **Open review item** using your own eligible Walmart account. If needed,
 try **View product**. Availability varies.
 
-Need help? Ask in #general. Plans and subscriptions: #welcome.
+Need help? Ask in <#1562537608091926602>. Plans and subscriptions: <#1562537601670578236>.
 
-## #plans-and-help (private operations reference)
+**Refer a friend · you both save 30%**
+Give a friend **30% off their first month**. When they subscribe, you get **30% off your next month**.
+Use **Get my referral link** below. Each successful referral earns another discounted month; rewards apply automatically.
 
-Planned access options (paid plans billed monthly in USD):
+- [Activate Discord access](https://whop.com/reviewer-alerts/)
+- [Manage subscription](https://whop.com/@me/settings/orders)
+- [Payment methods](https://whop.com/billing/manage/payment-methods/)
 
-- Free — every captured item in #free-24h-alerts, released after 24 hours.
-  These are historical listings; they may no longer be available.
-- Starter — $5: items with a positive observed value below $40, released after
-  a five-minute delay.
-- Pro — $20: all observed values, with no intentional delivery delay; browse
-  price and category feeds.
+## plans-and-help
+**Membership reference**
+Free: every detected item after 24 hours, as historical alerts.
+Pro: $30/month, all observed values with no added delivery delay, category and value feeds, and personal item requests.
 
-Starter covers all categories and has no keyword restriction. Values of $40 or
-more, zero values, unknown values and items marked unavailable do not enter
-Starter. Delay starts when our feed first detects the item, not when Walmart
-first lists it or another reviewer finishes claiming it.
+Pro is open with unlimited signups. No member cap or waitlist. Starter and the old $20 Pro checkout are retired: hidden and out of stock. Existing test purchases are unchanged.
 
-Both monthly plans are now visible, Buy now, with unlimited stock. Checkout
-explains renewal and cancellation before subscription. Paid access does not
-guarantee inventory or successful claims. No third tier or referral program is active.
+Public subscription card: <#1562537601670578236>.
 
-## #updates (stable internal key: feed-status)
 
-**Updates & announcements**
-Service notices, improvements and resolved issues will be posted here.
+## free-card
+**⭐ Want earlier alerts?**
 
-Compare plans and subscribe in #welcome. For setup and help, visit #how-to-use.
+**Choose the membership that fits you**
+**Free:** Every detected item after **24 hours**, as historical alerts.
+
+**Pro · $30/month**
+Get new-item alerts across **all values** with **no added delay**, category and value feeds, and personal item requests. Spend less time checking Walmart.
+
+**Refer a friend · you both save 30%**
+Give a friend **30% off their first month**. When they subscribe, you get **30% off your next month**.
+Use **Get my referral link** below. Each successful referral earns another discounted month; rewards apply automatically.
+
+USD, billed monthly. Manage or cancel in Whop. Delays start at detection; delivery times vary. Availability and claims are not guaranteed.
+
+- [Pro · $30/month](https://whop.com/checkout/plan_ADOMT0v8UqKSh)
+- [Compare plans](https://discord.com/channels/1562530389866717295/1562537601670578236)
+
+## Pending notification wording from the other October 28 task
+
+This guidance remains a draft and was preserved; the live pricing edit did not
+change notification preferences or replace the existing notification instructions.
+
+**2 · Turn on notifications**
+In your personal server notification settings, choose **Only @mentions**.
+For a quieter Pro setup, enable notifications only on **#💲200-plus**
+(observed value **$200 and above**): right-click it (desktop) or long-press it
+(phone) → **Notification Settings → All Messages**.
+High-value alerts require this opt-in; they do not automatically ping Pro members.
+Your Discord app and device notification settings still control delivery.
+
+Other feed alerts are optional. Leave them at **Default** to inherit the server's
+mentions-only setting, or enable **All Messages** on the feeds you want.
+Existing channel or category overrides may still enable alerts; reset those to
+**Default** if you want them to inherit your server setting.
+To stop a feed's alerts, choose **Nothing**.
+
+## Referral placement status: October 30, 2026
+
+The owner subsequently authorized full implementation and approved the required
+Whop API credential. Referrals are now live. The existing welcome, setup and
+free-feed cards plus six existing Pro activation cards have the working private
+button. New Pro activation cards use the same entry automatically. Six channel
+descriptions and Whop copy point to the live offer. Existing IDs, buttons and
+pins were preserved; no public announcement or DM was sent. A single private
+owner-button reply verified the integration. See [the rollout record](referral-automation-20261030.md)
+for invoice-event evidence still awaiting real paid members.

@@ -11,6 +11,82 @@ server's private channels and role rules remain in force. See
 
 Runs entirely on your own machine. **No cloud account, no hosting bill, $0/month.**
 
+## Diagnosing an empty or stalled scanner
+
+Extension **2.26.13** adds an optional fourth, furniture-focused priority tab.
+It reuses the same deep-page reader, durable checkpoints, intake deduplication,
+traffic waiting, verification pauses and foreground reading turns. Ten editable
+searches get a separate one-minute break after a completed round. General custom
+keyword capacity is now 128, with append-only changes preserving active progress.
+A narrow card-parser repair also recovers canonical heading cards with explicitly
+bound variant links. See [discovery repair and rollout](tasks/scanner-discovery-20261101.md).
+Deploy the compatible backend first, then reload the extension before enabling
+priority. An old backend cannot accept new priority settings or reports.
+
+Extension **2.26.12** and the compatible backend add connected operational logs:
+scanner/verification/traffic decisions, HTTP intake, every queued product/job,
+Discord outcomes and timing, workers, personal alerts, referrals and host
+recovery. Browser sequence receipts and health counters expose overwritten or
+failed log writes. Logs stay local, bounded and redacted. Use
+`tools/log_audit.py summary` or `trace --item ip-12345678 --ledger` to inspect
+history. See [logging commands and limits](docs/logging.md) and the
+[logging release](tasks/logging-overhaul-20261031.md). Reload the extension and
+refresh scanner tabs while preserving saved sweeps and settings.
+
+Extension **2.26.11** recognizes Walmart's **Hold tight for a moment / High
+traffic** screen. The affected scanner keeps its checkpoint and waits for the
+page to clear, without refreshing, clicking, consuming ordinary failure retries
+or declaring results empty. It resumes its original navigation/readiness checks
+when Walmart loads the page. Options shows **waiting-traffic** and diagnostics
+record wait/resume timing without page text. Install the compatible backend,
+reload the extension and refresh scanner tabs while keeping saved sweeps.
+See the [traffic-wait release](tasks/high-traffic-wait-20261031.md).
+
+Extension **2.26.10** prevents an old, rejected page from spending another recovery
+retry while its correctly scoped replacement is still loading. Loading has the
+existing finite deadline; acknowledged pages, search depth and normal pacing are
+preserved. Reload the extension and refresh scanner tabs to activate it, keeping
+saved sweeps and settings. See the [October 31 audit](tasks/reliability-audit-20261031.md)
+for delivery checks, timing evidence and remaining coverage limits.
+
+Extension **2.26.9** also recovers an observed native pager that adds a different
+catalogue modifier. The changed response stays unauthorized. The managed scanner
+retains its checkpoint, resumes the first outstanding page of the assigned scope,
+and uses paced URL pagination for that target. Other searches, filters and unknown
+modifiers remain separate scopes. Saved coverage and normal pacing are retained.
+
+Extension **2.26.8** gives blank targets bounded, guarded rendering opportunities,
+keeps input and focus waiting out of active timeout accounting, and recovers
+freshness-poll exceptions without losing acknowledged pages. Explicit HTTP
+failures retain unresolved coverage with paced recovery. Focus handoffs wake
+the next eligible scanner while preserving normal navigation pacing and fresh
+authorization. Department/keyword intake and retry diagnostics now identify
+numeric target attempts and first discoveries, without search text.
+Install the compatible backend validator before reloading the extension, then
+refresh the scanner tabs. Preserve saved settings, sweeps and unresolved history.
+
+Extension **2.26.7** verifies empty auxiliary targets from two stable, visible
+no-results observations, two seconds apart, on the assigned first page. The
+Options status counts these as **verified empty**, separately from unresolved
+targets. Blank/loading/error pages, unbound filters and missing interior pages
+remain unresolved. This verification needs no extra reload or product request.
+It also fixes concurrent focus retries that could keep every scanner waiting
+despite an available turn. Manual browsing, input and verification pauses remain.
+Install the compatible backend status validator before reloading the extension,
+then refresh the scanner tabs; saved settings and coverage are retained.
+
+Extension **2.26.6** adds bounded `page-state` records to the local rotating
+`data/browser-diagnostic-events.jsonl` archive. They record rendering/empty-state
+flags, card counts, page identity, recovery steps and observable HTTP status,
+without page/account text, URLs or credentials. Missing HTTP evidence is unknown,
+not proof that every request succeeded. Existing scan behavior is unchanged.
+
+After installing this update, reload **Reviewer Item Relay** in
+`chrome://extensions`, then refresh the scanner tabs. The backend must also
+support the new schema. The October 29 compatible backend is already activated
+on this owner's machine. See the [release and remaining fix proposal](tasks/scanner-fix-proposal-20261029.md)
+for evidence, limits, verification and rollback.
+
 ## How it works
 
 ```
@@ -29,35 +105,14 @@ handles (including filtered ones), and pushes matches to your phone. Nothing
 leaves your computer except the notification sent through your chosen provider.
 
 With `NOTIFY_PROVIDER=discord`, the backend instead bypasses these personal
-rules and uses its own durable per-channel queue. Starter receives positive
-values below $40 after five minutes; Pro receives all values without an
-intentional delay; free members receive historical snapshots after 24 hours.
+rules and uses its own durable per-channel queue. Pro is $30/month and receives
+all values without an intentional delay; free members receive historical
+snapshots after 24 hours. Starter is retired and receives no deliveries.
 It never imports old `seen.json` history into Discord. Repeated observations do
 not reset timers or resend completed destinations. Unavailable items appear only
 in the delayed free history. Unknown departments go to `other`.
 
 There is deliberately **no auto-claim**. You still claim items by hand.
-
-## Read this before you start
-
-**Automated access to walmart.com is a Terms of Use violation.** Walmart's
-[Terms of Use](https://www.walmart.com/help/article/walmart-com-terms-of-use/3b75080af40340d6bbd596f116fae5a0)
-prohibit using "any robot, spider, site search/retrieval application or other
-manual or automatic device to retrieve, index, 'scrape,' 'data mine' or
-otherwise gather any Materials," and state that your account "may be restricted
-or terminated for any reason, at our sole discretion." Recognized Reviewer
-status is invite-only and revocable.
-
-This design is about as low-exposure as such a thing gets — your own browser,
-your own residential IP, your own session, a real browser fingerprint, no stored
-credentials, no headless browser, and 2FA left on. But leaving a tab on a
-self-refresh timer is still automated retrieval on a schedule, and the clause
-above is broad enough to reach it. **Lower exposure than a bot, not zero.**
-
-The tuning knob is the refresh interval. Each refresh is a full sweep of about
-24 pages, so every 3 minutes is roughly 480 page loads an hour, far past
-anything a person does, and it has triggered Walmart's bot check in practice.
-Every 30 to 60 minutes is far gentler. Your account, your call.
 
 ## Setup
 
@@ -129,7 +184,7 @@ Do not run `run.ps1` at the same time because both would need port 8787.
 
 1. `chrome://extensions` → Developer mode → **Load unpacked** → pick
    `extension/`. If it was already installed, click **Reload** on its card and
-   verify that the displayed version is **2.22.2**.
+   verify that the displayed version is **2.26.13**.
 2. Open its **Options**. The defaults are already correct for a local server —
    endpoint `http://127.0.0.1:8787/ingest`, path `^/reviews/claim-product`.
 3. With **reviewer-item-notifier** running, click **Check connection**. This
@@ -188,7 +243,8 @@ Existing enabled Sweep settings remain enabled after upgrading.
 **Additional coverage (2.20.0):** department and keyword scans run by default
 alongside the normal home scan after reloading the extension. No checkbox setup
 is required; brands remain off. Options can disable either scan or customize
-keywords. The extension creates at most two additional background tabs;
+keywords. The extension creates two additional background tabs by default and
+one more when the priority scan is enabled;
 do not create a tab per department. Their settings live in
 `data/scanner-settings.json`; the existing `data/relay-settings.json` contract
 stays unchanged.
@@ -209,16 +265,18 @@ cannot be counted as coverage for another target. Invalid catalogue metadata
 fails the department round with bounded recovery; home and keyword scans continue.
 
 The keyword tab searches editable terms independently. Defaults start with
-Furniture, Chair, Chairs, Couch, Sofa and Pet, followed by the existing broad
-terms. Each query reads all available pages before advancing. Search URLs start
+Large Appliance, Kitchen Appliance, Cordless, Ride On, Sports Watch and AMOLED,
+then limited appliance `*`/`&` trials, specific products and broad terms.
+Searches use Walmart's native `queryNups` parameter alongside `q`; literal suffixes
+are encoded as part of the term. Each query reads all available pages before advancing. Search URLs start
 clean, so a department or brand cannot accidentally narrow a keyword search.
 Products discovered by multiple scans use the same notifier duplicate protection.
 
 Each additional scan has its own durable queue, acknowledged progress, retry
 budget and refresh clock. Closing its tab restores its committed progress. A
 failed filter is retried and then skipped for that round without stopping the
-home or other additional scan. Site changes, queue limits and the site's
-observed 25-page ceiling appear as **partial** coverage in **Additional scan
+home or other additional scan. Site changes, queue limits and unconfirmed final
+pages appear as **partial** coverage in **Additional scan
 status**. Use **Restart additional scans** to start fresh. There is no guarantee
 that Walmart exposes every eligible item through these filters.
 
@@ -227,18 +285,55 @@ the pause for real user input. A verification challenge still pauses the shared
 browser session. Additional tabs increase total browsing traffic; scrolling and
 timing variation do not establish that challenges will be prevented.
 
-**Scanner workspace (2.24.1):** grouping and tab rotation are enabled by default.
-Owned home, department and keyword tabs join a blue **Reviewer scans** group in
+**Scanner workspace (2.26.0):** grouping and tab rotation are enabled by default.
+Owned home, department, keyword and enabled priority tabs join a blue **Reviewer scans** group in
 their existing window. Each page gets a focused reading turn with a smooth
 downward scroll, varying steps and timing, and a settled bottom before advancing.
 Long pages resume scrolling in later turns from their previous position. The tab
-is selected again before navigation. Rotation stays within a focused Chrome window and
-yields to other selected tabs, verification, or recent real user input. It never
-brings Chrome over another application. With rotation enabled, unavailable focus
-holds the current page; selecting a scanner tab in the foreground lets rotation
-resume. Explicitly disabling rotation retains background scanning without a
-guaranteed visible reading pass. Grouping does not prevent closing a
-tab, and tabs in other windows form separate groups.
+is selected again before navigation. Collection continues while another app is
+in front: selection changes inside Chrome without bringing its window forward.
+Timer fallbacks keep scrolling independent of animation-frame delivery, with
+the same settled-bottom and late-card checks. Rotation yields to manual tabs
+while that Chrome window is focused, verification, and recent real user input.
+Browser scheduling can delay background work. Explicitly disabling rotation
+retains scanning without selecting tabs. Grouping does not prevent closing a
+tab, and tabs in other windows form separate groups. Previously registered,
+retired scanner tabs close automatically after fresh ownership checks. Selected,
+pinned, shared, challenged or manually changed tabs stay open. Older archives
+without positive ownership evidence remain safe to close manually.
+
+The additional keyword tab defaults to 100 searches, with category discovery
+terms followed by specific products, including Smartwatch, Smart Watch, Fitness Tracker, Laptop,
+Espresso Machine and Mattress. Saved custom lists remain authoritative. Each
+keyword and department uses the configured page delay with timing variation;
+the homepage's refresh budget is not allocated again to every additional target.
+Additional scans run serially within each lane and wait the saved refresh interval
+plus cycle jitter after a full round. A five-minute setting therefore does not
+mean every keyword is revisited every five minutes. More searches, empty-result
+confirmation, limited site results and user activity can extend a round.
+
+**Fourth priority tab (2.26.13):** enable **Hunt high-value products in a fourth
+tab** in Options. Its default terms are Furniture, Sofa, Couch, Sectional,
+Recliner, Mattress, Bed, Desk, Dining Table and Dresser. This is search targeting,
+not a price filter. It reads every page before advancing and shares fair turns
+and normal target-start spacing with the other lanes. Set its completed-round
+break independently from 1–120 minutes; global auto-refresh zero also suppresses
+automatic priority rounds. Settings are `auxiliaryPriority`,
+`auxiliaryPriorityQueries` (null uses defaults; at most 24 terms), and
+`auxiliaryPriorityRefreshMinutes`. Existing settings without these fields keep
+the fourth tab off. A short queue improves revisit frequency; it cannot force
+Walmart to render an item or promise a fixed time through traffic/loading pauses.
+
+**Card-based availability (2.26.2):** the scanner reads the visible Free label
+beside the card's valuation and its Out of stock label. Variant swatches and
+ambiguous/missing cards cannot create standalone alerts. Free shipping alone
+does not qualify. Out-of-stock candidates are filtered before ingest and are
+not marked persistently seen. Individual product pages are not loaded; the
+product-fetch admission/cache/cooldown path introduced in2.26.0–2.26.1 was removed
+at the owner's request. Original ingest deadlines and retry timing are restored.
+Real visible browser challenges retain the existing verification helper and
+shared scan pause. Bot-check notification attempts remain durably reserved and
+limited to one per fifteen minutes, including ambiguous failed requests.
 
 Verification now retains the home scan's acknowledged progress as well as the
 additional scans' checkpoints. Compatible progress resumes under fresh leases;
@@ -250,7 +345,7 @@ checks; neither tab focus nor refreshing guarantees that Walmart accepts a check
 
 Every sweep walks page 1 to the last page (detected by the portal's "no search
 results" panel). **Delay between pages** is a minimum (default 15 seconds), with
-varying timing. Regular mode spreads known pages across about 75% of the saved
+varying timing. Regular homepage mode spreads known pages across about 75% of the saved
 refresh interval, up to a 90-second baseline per page. For example, 17 pages at
 a 10-minute target use about 26 seconds between navigation starts. Loading,
 settling and local delivery count toward that interval; they no longer add a
@@ -430,7 +525,7 @@ it can receive the heartbeat confirming that verification is finished.
 
 Operational logs target **60 days**, rotating daily or when a segment fills and
 compressing older segments. Space backstops remove the oldest history sooner
-if needed: **32 MiB** for Discord delivery logs, **16 MiB** for backend logs and
+if needed: **64 MiB** for Discord delivery logs (10-MiB segments), **16 MiB** for backend logs and
 **2 MiB** for recovery logs. Docker's separate recent console cache is capped
 at **30 MiB**. See [log retention and viewing](tasks/discord-delivery-monitoring.md#watch-the-logs)
 for paths and compressed archives. These limits cover logs; delivery databases,

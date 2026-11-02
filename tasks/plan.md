@@ -1,5 +1,224 @@
 # Discord reviewer alerts: research and implementation plan
 
+## Referral discounts revision: October 30, 2026
+
+**Status: implemented and deployed; live links, native checkout and private
+button verified. Actual paid invoice/lifecycle events remain unobserved.**
+This replaces the earlier cash-affiliate proposal. The owner explicitly chose
+percentage discounts only, then selected one monthly payment for each person.
+No live coupon, commission, checkout, Discord role, subscription or message was
+changed during planning. Tasks **RA1-RA8** in [todo.md](todo.md) implement this
+revision. Earlier project history is preserved below the separator.
+
+The owner subsequently authorized implementation and approved the required API
+key. Core Pro referral automation is now live, and the coming-soon placements
+have been replaced with working buttons and instructions. See the current
+[rollout record](referral-automation-20261030.md) for deployed code, proof and
+the outstanding real-invoice evidence. The earlier
+[copy-only record](referral-offer-placements-20261030.md) is historical.
+
+### Accepted offer
+
+> Refer a friend. They get 30% off their first month, and you get 30% off your
+> next month when they subscribe.
+
+| Membership | Normal monthly price | One discounted payment | Later payments |
+|---|---:|---:|---:|
+| Pro | $30.00 | $21.00 | $30.00 |
+| Future higher tier, name undecided | $99.00 | $69.30 | $99.00 |
+
+These are membership amounts before any applicable checkout tax or fees. Each
+person receives a percentage of their own selected tier. A Pro member referring
+a future $99 member still gets 30% off their own Pro payment, not a fixed share
+of the friend's purchase. Never hardcode a $9 reward. Native cash affiliate
+rates stay at **0%**, with no cash payout, wallet credit or revenue share.
+
+A successful first paid subscription is the proposed qualifying event. A
+Discord join or complimentary/manual trial alone does not produce a paid bill
+to discount. A tester can have a referral identity before paying; any earned
+membership discount must remain pending until a qualifying subscription exists.
+Preserve existing trial promises and current Pro benefits, speed and unlimited
+signups. The $99 tier is future scope, not a product to create or advertise now.
+
+**Recommended treatment of multiple referrals, not yet accepted as a business
+term:** queue one 30% discount for each successive monthly payment rather than
+adding percentages to one bill. Do not discard additional rewards or silently
+impose a referral cap. Confirm this treatment before publishing the program.
+
+### Current evidence and feasibility
+
+Read-only Chrome account audit and official SDK inspection, October 30, 2026:
+
+| Surface | Verified | Remaining check |
+|---|---|---|
+| Pro product | `prod_GsPF7my0RjJtU`, visible, $30/month, zero active Whop members | Reconfirm active checkout `plan_ADOMT0v8UqKSh` during implementation. Discord testers are not paid members. |
+| Retired pricing | $20 price hidden/out of stock; Starter retired | Keep retired offers unavailable. |
+| Native affiliates | Saved Pro global/member rates both 0%; no affiliates | Leave both zero and keep coupons unattached to cash affiliates. A generic 30% banner is not the saved rate. |
+| Promo codes | No existing codes. Create form supports Percentage and First payment, plus No affiliate | Form was canceled. Confirm API duration matches one invoice, not forever or several monthly invoices. |
+| Promo API | Official SDK exposes promo creation and membership filtering by promo ID | Confirm exact payload, stable payment-to-promo attribution and checkout preapplication for this account/API version. |
+| Existing-subscription discount API | `memberships.apply_promo_code` applies to the next invoice of eligible active/trialing memberships with one recurring item and no existing code | Prove account eligibility, one-use consumption, and applying a later reward after an earlier code has been consumed. |
+| Discord delivery | Verified Whop Bot is above Pro; one Discord app selected on product | Selected app's inner admin panel stayed blank, so role mapping and lifecycle settings still need read-back/testing. |
+| Local bot | Membership worker observes roles; request commands and DM delivery currently check Pro specifically | Whop remains billing/access authority. Higher-tier compatibility needs code changes before that tier launches. |
+| Landing page | Free Cloudflare Pages static site; primary action is plain Discord invite | An invite alone does not attribute a discounted Whop purchase. Keep ad/site unchanged during planning. |
+
+**Conclusion:** Whop supplies the discount primitives, but no audited native
+setting has demonstrated this complete two-sided discount workflow. Plan for a
+small referral worker on the existing backend, not Whop cash-affiliate payouts.
+This is a supported implementation direction, not an already working program.
+Provider access and invoice behavior must pass RA1 before activation.
+
+### Member experience
+
+1. A member opens **Refer a friend** through an authenticated self-service entry.
+   Verify their Whop identity and its Discord connection using provider-backed
+   data. Do not identify subscribers by display name or an ID typed by the user.
+2. They copy a personal link and fallback code. The friend's checkout clearly
+   shows **30% off the first payment**, the discounted amount and the normal
+   renewal amount. Use documented Whop preapplication; if that is unavailable,
+   show the code and an explicit checkout step instead of implying it applied.
+3. The friend pays through Whop and connects their Discord account once. The
+   existing Whop Bot grants the product's role without an owner promotion.
+4. The worker verifies the paid purchase and attribution, records one reward,
+   and applies a one-payment 30% promo to the referrer's eligible subscription.
+   The private status view says **Next payment: $21, then $30/month** for Pro.
+5. If a reward cannot yet be applied, show **Pending** and a concrete reason.
+   Mark **Applied** only after Whop confirms it; mark **Used** only after the
+   discounted invoice succeeds. No one has to request an owner-made coupon.
+
+Prefer the simplest verified Whop-authenticated page or existing bot interaction
+for obtaining links/status. If a Discord slash command is used, its response is
+private and only on request. There are no unsolicited DMs or new announcements.
+A Whop account and initial Discord authorization remain customer actions.
+
+### Automation architecture
+
+- **Whop owns invoices and entitlements.** Keep its existing Discord app and
+  post-checkout redirect `https://whop.com/reviewer-alerts/exp_tWRoVrlmCpMiX6/app/`.
+  The referral worker applies promos only; it never independently grants or
+  revokes paid Discord access.
+- **Separate friend and referrer promo settings.** Friend codes express the
+  first-payment offer and map to one verified referrer. Reward codes apply to
+  an existing membership and must not be configured as new-customer-only.
+  Neither type attaches a cash affiliate. Use supported product/plan scope so
+  an old checkout or unrelated future product is not accidentally discounted.
+- **Durable attribution and rewards.** Store provider business, user, membership,
+  promo and payment IDs with referral ownership. Enforce one earned reward per
+  referred customer's qualifying first paid subscription. Deduplicate provider
+  events and API retries, including upgrades and renewals. A retried invoice
+  must not manufacture another friend or another reward.
+- **Safe application state.** Track pending, applying, applied, used and exception
+  states plus intended membership/invoice and provider result. Reconcile an
+  ambiguous timeout before retrying. Never count a reward as used because an
+  API call was merely sent or an invoice was created but unpaid.
+- **Existing infrastructure first.** Use authenticated outbound polling on the
+  existing backend, with pagination, persisted overlap/cursors and periodic
+  reconciliation, if documented payment/promo data supports it. No new hosting
+  subscription is planned. Signed webhooks are an alternative only if a suitable
+  secured ingress already exists or is explicitly implemented. The loopback
+  relay and static Pages site are not public webhook receivers.
+- **Credentials stay server-side.** Scope access to needed membership, payment
+  and promo operations. No API key in a referral URL, Discord text, frontend,
+  repository or logs. Verify authenticated identities and provider records;
+  never trust browser query parameters as proof a purchase happened.
+- **Failure handling stays visible.** Retain rewards when another code prevents
+  application or the member has no payable subscription; do not replace an
+  existing promotion or create a subscription. Retry transient failures with
+  backoff. Refund/dispute events need reconciliation; a consumed discount does
+  not authorize retroactive charges or a new cash debt. Resolve this policy
+  explicitly rather than improvising a charge or silently losing rewards.
+
+The existing static landing page can later display the offer and referral code.
+It does not need paid hosting or a redesign for the billing worker. Any route
+change needs a real referral-to-checkout test; ordinary Discord invite tracking
+is not a substitute for the purchase record.
+
+### Future $99 tier and Discord compatibility
+
+Use a stable internal tier key, a separate Whop product and a separate Discord
+role when this tier is actually defined. Its public name is display metadata,
+not an access check. Keep the entry disabled until valid product/plan/role IDs
+and actual benefits are configured. No unnamed live product or empty paid tier.
+
+Shared Pro channels, item-request commands and request DMs should accept **Pro
+or the future higher-tier role**. Premium-only capabilities check only the
+higher-tier role. Both permission generation and backend checks must agree.
+Do not depend on both products granting the same Pro role unless overlapping
+subscription expiry has been proven safe. The higher role can instead receive
+its own channel allowlists for shared features.
+
+Planned code audit includes `layout.py`, `provision.py`, `request_commands.py`,
+`request_delivery.py`, and `membership.py`. Preserve existing membership-ledger
+identity and trial grants; adding a tier must not replay welcome messages or
+invalidate ledger records. Never require the disabled future role at startup.
+
+Use percentage promos scoped to the active tier's plan. Test a pending reward
+across tier changes, invoice rounding, prorations and full monthly renewals.
+Do not apply a full-month reward accidentally to an upgrade adjustment. Whop's
+supported upgrade/downgrade flow must prevent two unintended subscriptions and
+preserve shared access while any qualifying membership remains valid. Public
+renaming must not change referral ownership, billing identity or permissions.
+The present Pro product receives no artificial delay or reduced features.
+
+### Ordered delivery and evidence
+
+- **RA1:** Prove Whop billing/promo capabilities, exact one-payment duration,
+  repeated reward eligibility and ordinary buyer Discord access.
+- **RA2:** Deliver a verified personal referral identity and friend checkout.
+- **RA3:** Record a qualifying paid referral exactly once using provider data.
+- **RA4:** Apply and reconcile the referrer's next-invoice reward automatically.
+- **RA5:** Add recovery for other promos, missing subscriptions, failed invoices,
+  multiple rewards and refunds, with a private status view.
+- **RA6:** Make shared paid access accept a configured future tier safely.
+- **RA7:** Prove billing/access transitions and future-tier cases in supported
+  test facilities; leave future live product creation for its actual launch.
+- **RA8:** Publish intuitive instructions in approved existing surfaces and
+  record the operating handoff after evidence is complete.
+
+Configuration inspection is not a paid end-to-end test. Verify first-payment
+$21, referrer next-payment $21, and following-payment $30, with exactly one
+reward and the correct Discord role. A zero-dollar access test cannot prove
+these invoice amounts. Use supported provider testing or observe consented
+real transactions; this plan does not authorize test charges or refunds.
+
+### Remaining implementation checks and decisions
+
+- Supported checkout promo parameter, account API scopes, and authoritative
+  purchase/promo fields for attribution and identity binding.
+- Whether a consumed one-payment code detaches automatically or requires a
+  supported cleanup path before another reward can be attached.
+- Recommended successive-month reward queue, interaction with other promos,
+  and refund handling need clear published terms before launch.
+- Current Discord app role/lifecycle mapping, including payment failure and
+  recovery. Existing manual testers must not be mass-revoked.
+- Future tier name/benefits and supported upgrade/proration behavior remain
+  undecided. They do not need to be chosen to implement Pro referrals.
+
+### Primary sources and inspected surfaces
+
+- [Whop official membership SDK](https://github.com/whopio/whopsdk-python/blob/main/src/whop_sdk/memberships/client.py):
+  next-invoice promo application, eligibility and promo-based membership lookup.
+- [Whop official promo-code SDK](https://github.com/whopio/whopsdk-python/blob/main/src/whop_sdk/promo_codes/client.py):
+  percentage-code creation and product/plan controls. Confirm exact current
+  version before implementation; do not guess payload semantics.
+- [Whop promo-code guide](https://whop.com/blog/whop-promo-codes/): discount
+  durations and checkout configuration.
+- [Whop Discord integration](https://whop.com/blog/link-whop-to-discord/) and
+  [membership tiers](https://whop.com/blog/membership-tiers-discord/): role-based
+  delivery. These do not prove this account's current lifecycle behavior.
+- Account UI: `/dashboard/biz_EIvLkhcxjNoQdD/promo/`, affiliate rates, Pro
+  product editor, its selected Discord app, Discord Roles / Integrations.
+- Local evidence: `discord_bridge/whop-products.json`, `membership.py`,
+  `request_commands.py`, `request_delivery.py`, `layout.py`, `provision.py`.
+
+---
+
+October 28 implementation: Free and $30/month Pro with unlimited signups are
+configured. Starter and old $20 checkout options are hidden and out of stock.
+The owner rejected member caps, waitlists and added restrictions. Earlier FP
+capacity, complimentary setup and admission gates below are superseded, not an
+authorized backlog. Current scope, verification and limitations:
+[free-pro-launch-20261028.md](free-pro-launch-20261028.md).
+
 Prepared October 21, 2026 (America/Chicago). Status: proposed design for review;
 no Discord resources, subscriptions, messages, or production changes were made.
 Update: the owner subsequently selected exactly **$5 / $20** and authorized

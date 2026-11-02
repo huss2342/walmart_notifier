@@ -39,9 +39,9 @@ docker compose logs --tail 100 -f notifier
 
 Stop either live view with Ctrl+C. This stops the viewer, not the sender.
 The JSONL log survives container replacement in the existing data bind mount.
-It rotates daily (UTC) or at 5 MiB, compressing completed segments as
+It rotates daily (UTC) or at 10 MiB, compressing completed segments as
 `delivery.jsonl.<timestamp>-<id>.gz`. The owner selected a **60-day history target**
-on October 23. Cleanup removes the oldest segments first, with a **32-MiB total
+on October 23. Cleanup removes the oldest segments first, with a **64-MiB total
 disk backstop** and at most 256 archives; heavy traffic can shorten that history.
 Cleanup runs on writes, at rotation and at least hourly while logging. A segment
 ages from its last write, so a few records can remain up to one segment longer.
@@ -110,6 +110,30 @@ can have all-items, category, price, Starter and free destinations. A partial
 delivery can therefore appear in both sent and expired totals.
 
 ## When something needs attention
+
+For a personal request that goes quiet, filter delivery events by
+`audience=personal`. The October 30 diagnostics add `request_changed` (committed
+add/edit/delete, revision and minimum value), `request_dm_status`, `request_match`
+(matched/queued/already-sent/held counts), and a `request_queue_summary` at most
+once per minute, including idle periods. A zero minimum means no value filter.
+`request_provider_error` retains safe numeric status/provider codes; terminal
+`dispatch_*` events describe the resulting outcome. Follow the stable outbox
+`dispatch_id` across retries rather than counting error records as failed DMs.
+
+`request_store.member_ref(member_id)` produces the pseudonymous correlation
+reference used in these private logs; raw member IDs and request text are omitted.
+The request ID survives in lifecycle logs after deletion. Compare lifecycle and
+match records against continuing collector intake, queue reasons, and sender
+poll health. Missing queue metrics are explicitly unavailable, not zero backlog.
+SQLite failures retain trusted result-code/name classification without SQL or
+exception text, and a second recovery failure cannot terminate the sender loop.
+The sender uses bounded stoppable backoff while storage remains unhealthy.
+
+There is no total personal-notification cap or twenty-minute watch cutoff.
+Each successfully sent product stays deduplicated per member; the twenty-minute
+deadline applies to individual unsent alerts. See the
+[solar investigation](solar-alert-investigation-20261030.md) for evidence,
+limitations and deployment receipts.
 
 For increasing due age, first inspect tier counts and active cooldowns. If a
 route is waiting, let its retry deadline pass and watch whether confirmed sends
