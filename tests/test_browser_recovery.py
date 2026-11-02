@@ -500,8 +500,10 @@ def test_once_dry_run_reports_only_profile_and_fixed_action_without_launching(
     monkeypatch.setattr(recovery, "HostPlatform", lambda: platform)
     assert recovery.main(["--root", str(tmp_path), "--once", "--dry-run"]) == 0
     output = (tmp_path / "data" / "browser-recovery.log").read_text(encoding="utf-8")
-    assert "chrome-profile-selected profile=Profile 4" in output
-    assert "healthy" in output
+    events = [json.loads(line) for line in output.splitlines()]
+    assert any(event["event"] == "chrome-profile-selected" for event in events)
+    assert any(event["event"] == "healthy" and event["duration_ms"] >= 0 for event in events)
+    assert "Profile 4" not in output
     assert "https://" not in output
     assert platform.calls == []
 

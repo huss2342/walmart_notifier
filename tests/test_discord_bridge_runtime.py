@@ -47,31 +47,33 @@ def test_invalid_values_are_rejected(value):
 
 
 def test_price_boundary_and_unknown_do_not_unlock_starter():
-    assert "starter-items" in route_keys(normalize_item(item(39.99)))
-    for value in (40, 200, 0, None):
+    for value in (0.01, 39.99, 40, 200, 0, None):
         assert "starter-items" not in route_keys(normalize_item(item(value)))
     assert "price-200-plus" in route_keys(normalize_item(item(200)))
     assert "type-electronics" in route_keys(normalize_item(item(category="electronics")))
 
 
-def test_restart_duplicate_ingest_and_five_minute_delay(tmp_path):
+def test_restart_duplicate_ingest_and_24_hour_free_delay(tmp_path):
     path = tmp_path / "queue.sqlite3"
     store = JobStore(path)
     assert store.record([normalize_item(item())], now=1000)["new"] == 1
     assert store.record([normalize_item(item())], now=1200)["duplicates"] == 1
     # Reopening is an actual process-state loss, not an in-memory timer.
     restarted = JobStore(path)
-    live = restarted.claim(now=1299)
+    live = restarted.claim_batch(now=1299)
     assert live["route"] != "starter-items"
     while live:
-        restarted.finish(live, "sent", message_id="123456789012345678")
-        live = restarted.claim(now=1299)
-    assert restarted.claim(now=1299) is None
-    delayed = restarted.claim(now=1300)
-    assert delayed["route"] == "starter-items"
-    restarted.finish(delayed, "sent", message_id="123456789012345679")
+        restarted.finish_batch(live, "sent", message_id="123456789012345678")
+        live = restarted.claim_batch(now=1299)
+    assert restarted.claim_batch(now=1299) is None
+    assert restarted.claim_batch(now=1300) is None
     assert restarted.record([normalize_item(item())], now=1400)["new"] == 0
-    assert restarted.claim(now=1400) is None
+    assert restarted.claim_batch(now=1400) is None
+    assert restarted.claim_batch(now=87399) is None
+    delayed = restarted.claim_batch(now=87400)
+    assert delayed["route"] == "yesterday-recap"
+    restarted.finish_batch(delayed, "sent", message_id="123456789012345679")
+    assert restarted.claim_batch(now=87401) is None
 
 
 def test_failed_destination_does_not_repeat_other_destinations(tmp_path):
@@ -97,7 +99,7 @@ def test_lease_ownership_and_expired_jobs(tmp_path):
     assert not store.finish(first, "sent", message_id="123456789012345678")
     assert store.finish(replacement, "sent", message_id="123456789012345678")
     assert store.claim(now=3000) is None
-    assert store.counts()["expired"] == 3
+    assert store.counts()["expired"] == 2
 
 
 def test_batch_validation_does_not_partially_commit(tmp_path):
@@ -109,12 +111,12 @@ def test_batch_validation_does_not_partially_commit(tmp_path):
 
 def test_message_is_safe_without_claim_count_or_pings():
     clean = normalize_item(item(title="@everyone **Audio card**", claims_remaining=3))
-    message = render_message(clean, first_seen=1000, last_seen=1000, route="starter-items")
+    message = render_message(clean, first_seen=1000, last_seen=1000, route="pro-all")
     text = json.dumps(message)
     assert message["allowed_mentions"] == {"parse": []}
     assert "claims_remaining" not in text
     assert "Claims remaining" not in text
-    assert "5-minute delay" in text
+    assert "5-minute delay" not in text
     assert [button["label"] for button in message["components"][0]["components"]] == [
         "Open review item",
         "View product",
@@ -185,9 +187,10 @@ def test_later_enrichment_creates_missing_routes_without_resetting_clock(tmp_pat
         store.finish(job, "sent", message_id="123456789012345678")
     assert "type-electronics" in routes and "price-20-40" in routes
     assert "starter-items" not in routes
-    delayed = store.claim(now=1300)
-    assert delayed["route"] == "starter-items"
-    assert delayed["first_seen"] == 1000
+    assert routes["price-20-40"]["first_seen"] == 1000
+    assert store.claim(now=1300) is None
+    delayed = store.claim(now=87400)
+    assert delayed["route"] == "yesterday-recap" and delayed["first_seen"] == 1000
 
 
 def test_long_product_slug_falls_back_to_short_safe_discord_links():

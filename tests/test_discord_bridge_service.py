@@ -61,7 +61,7 @@ def test_http_rejects_mixed_batch_and_returns_durable_acceptance(endpoint):
         request(server, "POST", "/v1/observations", {"items": [good]}, headers)[2]["duplicates"]
         == 1
     )
-    assert sum(store.counts().values()) == 5
+    assert sum(store.counts().values()) == 4
 
 
 def test_http_enforces_size_content_type_and_does_not_send(endpoint):
@@ -83,7 +83,7 @@ def test_postcommit_monitor_hook_cannot_change_durable_acceptance(tmp_path):
 
     def accepted(result):
         observed.append(result)
-        assert store.counts()["pending"] == 5
+        assert store.counts()["pending"] == 4
         raise OSError("monitor unavailable")
 
     server = make_server(store, key="k" * 40, port=0, on_accepted=accepted)
@@ -132,7 +132,7 @@ def test_worker_defaults_to_preview_and_fails_closed_on_audit(tmp_path):
         auditor=lambda *_args: {"ok": False, "findings": ["leak"]},
     )
     assert result["blocked"] and not client.sent
-    assert store.counts() == {"pending": 5}
+    assert store.counts() == {"pending": 4}
 
 
 def test_worker_rate_limit_retry_and_price_update_cannot_leak_starter(tmp_path):
@@ -156,7 +156,11 @@ def test_worker_rate_limit_retry_and_price_update_cannot_leak_starter(tmp_path):
     store.record([normalize_item({**raw, "value_usd": 99.99})], now=1200)
     deliver_due(store, client, state, live=True, now=1300, auditor=okay)
     assert len(client.sent) == 3
-    assert store.counts()["skipped"] == 1
+    assert store.counts() == {"sent": 3, "pending": 1, "failed": 1}
+    assert all(
+        call[1] != f"/channels/{state['channels']['starter-items']}/messages"
+        for call in client.sent
+    )
     assert all(call[2]["enforce_nonce"] is True for call in client.sent)
 
 

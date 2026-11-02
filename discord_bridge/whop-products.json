@@ -1,25 +1,25 @@
 {
-  "status": "draft-local-only",
+  "status": "live-pricing-verified-2026-10-28-membership-lifecycle-not-retested",
   "currency": "USD",
   "provider": "Whop built-in Discord integration",
   "products": [
     {
-      "name": "Reviewer Alerts Starter",
-      "monthly_price_cents": 500,
-      "discord_role_key": "starter",
-      "description": "Private reviewer-item alerts with observed retail values below $40, released five minutes after detection. For existing eligible Walmart reviewers. Availability and claims are not guaranteed.",
-      "delay_seconds": 300,
-      "value_ceiling_cents_exclusive": 4000
-    },
-    {
       "name": "Reviewer Alerts Pro",
-      "monthly_price_cents": 2000,
+      "monthly_price_cents": 3000,
+      "product_id": "prod_GsPF7my0RjJtU",
+      "checkout_url": "https://whop.com/checkout/plan_ADOMT0v8UqKSh",
+      "signup_limit": null,
       "discord_role_key": "pro",
       "description": "Private reviewer-item alerts across all observed retail values, with no intentional delay after detection. Browse by price or item type. For existing eligible Walmart reviewers. Availability and claims are not guaranteed.",
       "delay_seconds": 0,
       "value_ceiling_cents_exclusive": null
     }
   ],
+  "retired_checkout_plans": {
+    "starter": "plan_k2rVgU36MH7pE",
+    "pro_20": "plan_Ta8OgmuWRX49n",
+    "state": "hidden-and-out-of-stock"
+  },
   "integration_settings": {
     "visibility": "product-gated",
     "cancellation_action": "remove-only-purchased-tier-role-at-access-expiry",

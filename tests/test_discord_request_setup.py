@@ -48,7 +48,9 @@ def test_explicit_channel_binding_is_dry_run_then_local_only(tmp_path):
     assert client.permissions(channel["id"], [pro]) & USE_APPLICATION_COMMANDS
     assert not client.permissions(channel["id"], [starter]) & USE_APPLICATION_COMMANDS
     assert not client.permissions(channel["id"]) & USE_APPLICATION_COMMANDS
-    assert not client.permissions(channel["id"], [pro]) & (1 << 11)
+    assert client.permissions(channel["id"], [pro]) & (1 << 11)
+    assert not client.permissions(channel["id"], [starter]) & (1 << 11)
+    assert not client.permissions(channel["id"]) & (1 << 11)
 
 
 @pytest.mark.parametrize("drift", ["public", "parent", "name", "pro_commands"])

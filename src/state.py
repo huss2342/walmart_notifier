@@ -35,8 +35,11 @@ import logging
 import math
 import os
 import threading
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+from atomic_json import write_atomic_json
 
 log = logging.getLogger(__name__)
 
@@ -46,11 +49,11 @@ DEFAULT_PATH = Path(__file__).parent.parent / "data" / "seen.json"
 # still-listed item can re-alert, so it is expressed in days rather than left
 # to fall out of a row count.
 RETENTION_DAYS = 60
-# Backstop against unbounded growth only; age is the real policy. At roughly
-# 150 bytes per record this is about 40 MB in the worst case.
+# Backstop against unbounded growth only; age is the real policy. Retained
+# filtering context also contributes to the per-record size.
 MAX_ENTRIES = 250_000
-# Titles are only ever read by a human inspecting the file; the alert itself
-# uses the live item. Full titles ran to 300 characters and dominated the file.
+# Keep the existing compact display field; historical rule evaluation uses the
+# separately retained original title/category/URL rather than this abbreviation.
 MAX_TITLE_CHARS = 120
 FLUSH_INTERVAL_SECONDS = 2.0
 # Compact once the log is at least this long and at least as long as the live
@@ -149,17 +152,21 @@ class SeenStore:
             return 0
         replayed = 0
         try:
-            with path.open("r", encoding="utf-8") as handle:
+            # Decode each record independently: a truncated UTF-8 character in
+            # the last record must not prevent replay of earlier valid lines.
+            with path.open("rb") as handle:
                 for line in handle:
                     line = line.strip()
                     if not line:
                         continue
                     try:
                         entry = json.loads(line)
-                    except json.JSONDecodeError:
+                    except (json.JSONDecodeError, UnicodeError):
                         # A torn final line is the expected cost of appending
                         # without fsync. Everything before it is still good.
                         log.warning("Ignoring an unreadable line in %s.", path)
+                        continue
+                    if not isinstance(entry, dict):
                         continue
                     key, value = entry.get("k"), entry.get("v")
                     if not isinstance(key, str):
@@ -168,6 +175,8 @@ class SeenStore:
                         self._markers[key] = value
                     elif entry.get("t") == "item" and isinstance(value, dict):
                         self._seen[key] = value
+                    else:
+                        continue
                     replayed += 1
             self._log_lines = replayed
         except OSError:
@@ -179,7 +188,6 @@ class SeenStore:
         if self.path is None:
             return
         with self._lock:
-            self._appends.clear()
             self._prune_expired()
             self._trim()
             payload = json.dumps(
@@ -187,12 +195,15 @@ class SeenStore:
                 indent=1, sort_keys=True,
             )
             try:
-                self.path.parent.mkdir(parents=True, exist_ok=True)
                 # Atomic replace: a crash mid-write must not destroy the file
                 # that stops the next run re-alerting on everything.
-                tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-                tmp.write_text(payload, encoding="utf-8")
-                tmp.replace(self.path)
+                write_atomic_json(
+                    self.path, payload, logger=log,
+                    cleanup_warning="Seen store temporary snapshot cleanup unavailable",
+                )
+                # The snapshot now owns these writes. Before replacement they
+                # must remain queued so a failed save can retry through flush().
+                self._appends.clear()
                 # Only now is the log redundant. Removing it first would lose
                 # every appended record if the snapshot write then failed.
                 log_path = self.log_path
@@ -260,8 +271,17 @@ class SeenStore:
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 log_path = self.log_path
-                with log_path.open("a", encoding="utf-8") as handle:
-                    handle.write(lines)
+                with log_path.open("ab+") as handle:
+                    # A torn final record (or a complete one without its final
+                    # newline) cannot be allowed to absorb the first new item.
+                    # Check on every flush so a partial failed append in this
+                    # process is repaired by its retry as well.
+                    handle.seek(0, os.SEEK_END)
+                    if handle.tell():
+                        handle.seek(-1, os.SEEK_END)
+                        if handle.read(1) != b"\n":
+                            handle.write(b"\n")
+                    handle.write(lines.encode("utf-8"))
                 self._log_lines += len(pending)
             except OSError:
                 # Put them back so the next flush retries rather than losing
@@ -320,7 +340,10 @@ class SeenStore:
         with self._lock:
             return item_id in self._pending
 
-    def claim(self, item_id: str, title: str = "", value: float | None = None) -> bool:
+    def claim(
+        self, item_id: str, title: str = "", value: float | None = None,
+        *, category: str = "", url: str = "",
+    ) -> bool:
         """Atomically take ownership of an item. True only for the first caller.
 
         Two requests can relay the same item at the same moment, so the check
@@ -330,7 +353,7 @@ class SeenStore:
         with self._lock:
             if item_id in self._seen or item_id in self._pending:
                 return False
-            self._pending[item_id] = self._record_payload(title, value)
+            self._pending[item_id] = self._record_payload(title, value, category=category, url=url)
             return True
 
     def commit(self, item_id: str) -> bool:
@@ -351,25 +374,34 @@ class SeenStore:
         with self._lock:
             self._pending.pop(item_id, None)
 
-    def mark_seen(self, item_id: str, title: str = "", value: float | None = None) -> bool:
+    def mark_seen(
+        self, item_id: str, title: str = "", value: float | None = None,
+        *, category: str = "", url: str = "",
+    ) -> bool:
         """Record a filtered/seeded item unless its delivery is in flight."""
         with self._lock:
             if item_id in self._pending:
                 return False
-            self._record(item_id, title, value)
+            self._record(item_id, title, value, category=category, url=url)
             self._queue("item", item_id, self._seen[item_id])
             return True
 
-    def _record(self, item_id: str, title: str, value: float | None = None) -> None:
+    def _record(
+        self, item_id: str, title: str, value: float | None = None,
+        *, category: str = "", url: str = "",
+    ) -> None:
         # The value is recorded purely so "has a $50 item ever actually been
         # relayed?" is answerable. Without it, an item that never arrives and
         # an item that arrived and was filtered look identical after the fact.
-        self._seen[item_id] = self._record_payload(title, value)
+        self._seen[item_id] = self._record_payload(title, value, category=category, url=url)
 
     @staticmethod
-    def _record_payload(title: str, value: float | None = None) -> dict:
+    def _record_payload(
+        title: str, value: float | None = None, *, category: str = "", url: str = "",
+    ) -> dict:
         return {
             "title": title[:MAX_TITLE_CHARS],
+            "filter_context": {"title": title, "category": category, "url": url},
             "value_usd": value,
             "seen_at": datetime.now(UTC).isoformat(timespec="seconds"),
         }
@@ -393,7 +425,7 @@ class SeenStore:
         """
         with self._lock:
             return [
-                (item_id, dict(record))
+                (item_id, deepcopy(record))
                 for item_id, record in self._seen.items()
                 if isinstance(record, dict)
             ]

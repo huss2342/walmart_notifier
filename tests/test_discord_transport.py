@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from email.message import Message
 
 import pytest
-from discord_bridge.api import DiscordClient, DiscordError
+from discord_bridge.api import DeliveryOutcome, DiscordClient, DiscordError
 
 
 class SocketResponse:
@@ -405,6 +405,7 @@ def test_slow_dns_or_tls_never_submits_post_after_total_deadline(monkeypatch):
     with pytest.raises(DiscordError, match="timed out") as failure:
         client.request("POST", "/channels/111/messages", {})
     assert failure.value.ambiguous is False
+    assert failure.value.outcome == DeliveryOutcome.NOT_SUBMITTED
     assert len(factory.requests) == 0
     assert factory.connections[0].closed
     assert timers.timers[0].daemon and timers.timers[0].cancelled

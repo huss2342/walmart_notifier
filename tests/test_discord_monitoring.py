@@ -118,7 +118,8 @@ def test_delivery_monitor_reports_sixty_day_compressed_retention(tmp_path):
     monitor = DeliveryMonitor(tmp_path, entry_point="collector_worker", console=False)
     status = monitor.status()
     assert status["retention_days"] == 60
-    assert status["total_max_bytes"] == 32 * 1024 * 1024
+    assert status["max_bytes"] == 10 * 1024 * 1024
+    assert status["total_max_bytes"] == 64 * 1024 * 1024
     assert status["compressed_archives"] is True
 
 

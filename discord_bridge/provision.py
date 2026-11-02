@@ -24,6 +24,7 @@ from .layout import (
     CREATE_INVITE,
     MANAGE_ROLES,
     OPTIONAL_CHANNELS,
+    OPTIONAL_ROLE_NAMES,
     PROVISION_PERMISSIONS,
     READER_PERMISSIONS,
     ROLE_NAMES,
@@ -31,6 +32,7 @@ from .layout import (
     VIEW_CHANNEL,
     permission_overwrites,
 )
+from .policy import RETIRED_ROUTE_KEYS
 
 if TYPE_CHECKING:
     from .api import DiscordClient
@@ -71,7 +73,7 @@ def _validate_state(state: dict, guild_id: str, bot_user_id: str | None = None) 
     if bot_user_id is not None and actual_bot != bot_user_id:
         raise ProvisionError("State belongs to a different bot user; no changes were made.")
     allowed_keys = {
-        "roles": set(ROLE_NAMES),
+        "roles": set(ROLE_NAMES) | set(OPTIONAL_ROLE_NAMES),
         "categories": {c.key for c in CATEGORIES},
         "channels": {c.key for c in (*CHANNELS, *OPTIONAL_CHANNELS)},
     }
@@ -99,7 +101,7 @@ def _validate_state(state: dict, guild_id: str, bot_user_id: str | None = None) 
         clean[field] = dict(state[field])
     if clean["channels"] and not clean["categories"]:
         raise ProvisionError("Channel state is missing its parent categories.")
-    if clean["categories"] and set(clean["roles"]) != set(ROLE_NAMES):
+    if clean["categories"] and not set(ROLE_NAMES).issubset(clean["roles"]):
         raise ProvisionError("Category state is missing its audience roles.")
     return clean
 
@@ -274,6 +276,8 @@ def _role_findings(
                 )
         elif role_id in bot_roles:
             allowed = BOT_RUNTIME_PERMISSIONS | (SETUP_PERMISSIONS if allow_setup else 0)
+            if "trial" in state["roles"]:
+                allowed |= MANAGE_ROLES
             if permissions & ~allowed:
                 findings.append(
                     f"Bot role {role_id}: remove privileges beyond "
@@ -287,6 +291,23 @@ def _role_findings(
                     f"Role {role_id}: unexpected privileged base permissions "
                     "can bypass the intended policy."
                 )
+    if "trial" in state["roles"]:
+        roles = {role["id"]: role for role in snapshot["roles"]}
+        trial = roles.get(state["roles"]["trial"], {})
+        pro = roles.get(state["roles"].get("pro"), {})
+        positions = [roles[role_id].get("position") for role_id in bot_roles if role_id in roles]
+        if (
+            not positions or any(type(p) is not int for p in positions)
+            or type(trial.get("position")) is not int
+            or type(pro.get("position")) is not int
+            or not trial["position"] < max(positions) < pro["position"]
+        ):
+            findings.append("Trial bot must be above Pro Trial and strictly below paid Pro.")
+        if not any(
+            int(roles.get(role_id, {}).get("permissions", "0")) & MANAGE_ROLES
+            for role_id in bot_roles
+        ):
+            findings.append("Trial bot requires Manage Roles for temporary access.")
     return findings
 
 
@@ -315,13 +336,17 @@ def _membership_role(snapshot: dict, state: dict) -> tuple[str | None, list[str]
     position = role.get("position")
     if (
         type(position) is not int
-        or set(state["roles"]) != set(ROLE_NAMES)
+        or not set(ROLE_NAMES).issubset(state["roles"])
         or any(
             type(positions.get(role_id)) is not int or positions[role_id] >= position
-            for role_id in state["roles"].values()
+            for key, role_id in state["roles"].items()
+            if key in ROLE_NAMES and (key != "starter" or role_id in positions)
         )
     ):
-        return None, ["Membership bot's managed role must be strictly above Starter and Pro."]
+        return None, [
+            "Membership bot's managed role must be strictly above Pro "
+            "and any remaining Starter role."
+        ]
     return role_id, []
 
 
@@ -336,7 +361,8 @@ def _resource_findings(
         findings.append(
             f"Untracked channel {resource_id}; existing channels are never adopted automatically."
         )
-    for key, name in ROLE_NAMES.items():
+    role_names = ROLE_NAMES | {k: v for k, v in OPTIONAL_ROLE_NAMES.items() if k in state["roles"]}
+    for key, name in role_names.items():
         resource_id = state["roles"].get(key)
         if resource_id is None:
             if complete:
@@ -345,6 +371,10 @@ def _resource_findings(
                 findings.append(f"Untracked same-name role for {key}; cannot safely adopt it.")
             continue
         role = roles.get(resource_id)
+        # Retain the historical binding without requiring the retired role to
+        # exist. Any surviving Starter role still receives all normal checks.
+        if key == "starter" and role is None:
+            continue
         if role is None or role.get("name") != name or role.get("managed"):
             findings.append(f"Tracked role {key} is missing, renamed, or externally managed.")
     category_by_key = {category.key: category for category in CATEGORIES}
@@ -361,6 +391,10 @@ def _resource_findings(
             continue
         channel = channels.get(resource_id)
         if channel is None:
+            # Retired Starter IDs remain in historical state, but neither its
+            # destination nor its old category is required for active delivery.
+            if spec.key in RETIRED_ROUTE_KEYS or (is_category and spec.key == "starter"):
+                continue
             findings.append(
                 f"Tracked channel {spec.key} is missing; "
                 "review state instead of replacing it blindly."
@@ -382,7 +416,7 @@ def _resource_findings(
                 findings.append(
                     f"Tracked channel {spec.key}: slowmode must be at least 10 seconds."
                 )
-        if set(state["roles"]) != set(ROLE_NAMES):
+        if not set(ROLE_NAMES).issubset(state["roles"]):
             findings.append(f"Tracked channel {spec.key}: audience roles are incomplete.")
             continue
         expected_acl = permission_overwrites(
@@ -390,7 +424,7 @@ def _resource_findings(
             state["bot_user_id"],
             state["roles"],
             category,
-            application_commands=spec.key == "item-requests",
+            application_commands=spec.key in {"item-requests", "trial-management"},
         )
         try:
             if _acl(channel.get("permission_overwrites")) != _acl(expected_acl):

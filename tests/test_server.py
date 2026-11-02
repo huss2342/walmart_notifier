@@ -223,7 +223,10 @@ def test_browser_diagnostics_require_auth_and_reject_web_origins(live_server, mo
     monkeypatch.setattr(server.Handler, "token", "sekrit")
     for method in ("GET", "POST"):
         with pytest.raises(urllib.error.HTTPError) as exc:
-            request(live_server, method, "/browser-diagnostics", diagnostic_report())
+            # GET has no request body in the real bridge. Sending one races
+            # Windows early-close handling before the forbidden response.
+            payload = diagnostic_report() if method == "POST" else None
+            request(live_server, method, "/browser-diagnostics", payload)
         assert exc.value.code == 403
     req = urllib.request.Request(f"{live_server}/browser-diagnostics",
                                  data=json.dumps(diagnostic_report()).encode(), method="POST")
@@ -247,10 +250,31 @@ def test_browser_diagnostics_reject_secret_fields_and_large_bodies(live_server):
     req = urllib.request.Request(f"{live_server}/browser-diagnostics",
                                  data=b"{}", method="POST")
     req.add_header("Content-Type", "application/json")
-    req.add_header("Content-Length", str(128 * 1024 + 1))
+    req.add_header("Content-Length", str(server.MAX_BROWSER_DIAGNOSTICS_BYTES + 1))
     with pytest.raises(urllib.error.HTTPError) as exc:
         urllib.request.urlopen(req, timeout=5)
     assert exc.value.code == 413
+
+
+def test_browser_card_evidence_larger_than_old_limit_is_mirrored_and_archived(live_server):
+    report = diagnostic_report()
+    sample = {"itemId": "ip-21064716574", "decision": "accepted", "cardFound": True,
+              "free": True, "outOfStock": False, "valueCents": None}
+    report["events"] = [
+        {"at": report["exportedAt"] - index, "event": "card-extraction",
+         "documentId": report["exportedAt"] - 1000, "page": index + 1, "lane": "keywords",
+         "acceptedCount": 1, "rejectedCount": 0, "variantCount": 0,
+         "outOfStockCount": 0, "missingValueCount": 1, "samples": [sample] * 12}
+        for index in range(100)
+    ]
+    assert len(json.dumps(report).encode()) > 128 * 1024
+    status, body = request(live_server, "POST", "/browser-diagnostics", report)
+    assert status == 200 and body["ok"] is True
+    assert get(live_server, "/browser-diagnostics")[1]["report"] == report
+    path = server.Handler.browser_diagnostics.path.with_name("browser-diagnostic-events.jsonl")
+    archived = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(archived) == 100
+    assert all(event["entry_point"] == "browser-diagnostics" for event in archived)
 
 
 def test_health_reports_configuration(live_server):
@@ -1154,6 +1178,75 @@ def test_rescan_requires_the_token_and_extension_origin(live_server, monkeypatch
     with pytest.raises(urllib.error.HTTPError) as exc:
         request(live_server, "POST", path="/rescan", payload={}, token="wrong")
     assert exc.value.code == 403
+
+
+def test_rescan_reuses_original_title_category_and_url_after_restart(live_server, monkeypatch):
+    monkeypatch.setenv("RULES_JSON", json.dumps({"rules": [{"min_value_usd": 1000}]}))
+    original_titles = {}
+    for number, suffix in [(123456781, "New"), (123456782, "Refurbished")]:
+        title = "Long product description " * 12 + suffix
+        original_titles[f"ip-{number}"] = title
+        post(live_server, {"items": [{
+            "title": title, "category": "Electronics > Phones", "value_usd": 70.0,
+            "url": f"https://www.walmart.com/ip/budget-phone/{number}?variant=blue",
+        }]})
+    server.Handler.store.flush()
+    server.Handler.store = SeenStore(server.Handler.store.path, autosave=False)
+    monkeypatch.setenv("RULES_JSON", json.dumps({"rules": [{
+        "categories": ["Electronics"], "keywords": ["budget-phone"],
+        "exclude_keywords": ["Refurbished"],
+    }]}))
+
+    _, report = request(live_server, "POST", path="/rescan", payload={})
+    assert report["matched"] == 1
+    assert report["sample"][0]["item_id"] == "ip-123456781"
+    _, result = request(live_server, "POST", path="/rescan", payload={"apply": True})
+    assert result["alerted"] == 1
+    [sent] = server.Handler.notifier.items
+    assert sent.title == original_titles[sent.item_id]
+    assert sent.category == "Electronics > Phones"
+    assert sent.url == "https://www.walmart.com/ip/budget-phone/123456781?variant=blue"
+
+
+def test_rescan_legacy_records_recover_known_urls_without_fabricating_title_hash_links(
+    live_server, monkeypatch,
+):
+    monkeypatch.setenv("RULES_JSON", json.dumps({"rules": [{"name": "all"}]}))
+    for item_id in ["ip-123456789", "t-legacy-title-hash"]:
+        server.Handler.store._seen[item_id] = {"title": "Legacy item", "value_usd": 25.0}
+    _, result = request(live_server, "POST", path="/rescan", payload={"apply": True})
+    assert result["alerted"] == 2
+    assert {item.item_id: item.url for item in server.Handler.notifier.items} == {
+        "ip-123456789": "https://www.walmart.com/ip/123456789", "t-legacy-title-hash": "",
+    }
+
+
+@pytest.mark.parametrize("payload", [
+    {"apply": "false"}, {"apply": 1}, {"limit": True}, {"limit": 1.5},
+    {"limit": "5"}, {"limit": None}, {"extra": "unsupported"},
+])
+def test_rescan_rejects_ambiguous_options_before_sending(live_server, payload):
+    _record_items(server.Handler.store, [("ip-1", "Recorded item", 25.0)])
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        request(live_server, "POST", path="/rescan", payload=payload)
+    assert exc.value.code == 400
+    assert not server.Handler.notifier.items
+
+
+@pytest.mark.parametrize("body", [
+    b'{"apply":false,"apply":true}', b'{"limit":1,"limit":5}',
+    b'{"apply":true,"limit":NaN}', b"\xff",
+])
+def test_rescan_rejects_ambiguous_json_before_sending(live_server, body):
+    _record_items(server.Handler.store, [("ip-1", "Recorded item", 25.0)])
+    request_body = urllib.request.Request(
+        live_server + "/rescan", data=body, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(request_body, timeout=5)
+    assert exc.value.code == 400
+    assert not server.Handler.notifier.items
 
 
 def scanner_settings_payload():

@@ -72,6 +72,24 @@ def test_busy_day_rotates_without_losing_complete_lines(tmp_path):
     assert all(path.stat().st_size <= 512 for path in paths)
 
 
+def test_default_log_keeps_records_above_five_mib_and_rotates_after_ten_mib(tmp_path):
+    writer = RollingLog(tmp_path / "events.log", clock=lambda: NOW)
+    first = b"first record\n" * (256 * 1024)
+    second = b"next record\n" * (256 * 1024)
+    third = b"last record\n" * (256 * 1024)
+    for payload in (first, second, third):
+        writer.append(payload)
+    assert 5 * 1024 * 1024 < writer.path.stat().st_size <= 10 * 1024 * 1024
+    assert log_files(tmp_path) == [writer.path]
+    tail = b"tail record\n" * (128 * 1024)
+    writer.append(tail)
+    archived = list(tmp_path.glob("events.log.*.gz"))
+    assert len(archived) == 1
+    assert contents(archived[0]) == first + second + third
+    assert writer.path.read_bytes() == tail
+    assert writer.total_bytes == 64 * 1024 * 1024
+
+
 def test_old_numbered_logs_obey_age_and_space_limits_without_touching_state(tmp_path):
     path = tmp_path / "events.log"
     old = tmp_path / "events.log.1"
@@ -100,6 +118,81 @@ def test_failed_compression_keeps_original_log_and_removes_temporary_file(tmp_pa
         writer.append(b"new record\n" * 2)
     assert writer.path.read_bytes() == b"x" * 500
     assert log_files(tmp_path) == [writer.path]
+
+
+@pytest.mark.parametrize("existing", [b"", b'{"event":"original"}\n'])
+@pytest.mark.parametrize("failure", ["exception", "zero-progress"])
+def test_failed_partial_append_rolls_back_before_a_complete_retry(
+    tmp_path, monkeypatch, existing, failure,
+):
+    writer = RollingLog(tmp_path / "events.jsonl")
+    if existing:
+        writer.append(existing)
+    write = os.write
+    calls = 0
+    payload = b'{"event":"complete new record"}\n'
+
+    def short_then_fail(descriptor, data):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return write(descriptor, data[:16])
+        if failure == "zero-progress":
+            return 0
+        raise OSError("write unavailable")
+
+    monkeypatch.setattr(os, "write", short_then_fail)
+    with pytest.raises(OSError):
+        writer.append(payload)
+    assert writer.path.read_bytes() == existing
+    monkeypatch.setattr(os, "write", write)
+    writer.append(payload)
+    assert writer.path.read_bytes() == existing + payload
+
+
+def test_an_initial_zero_byte_write_preserves_existing_log_and_can_retry(tmp_path, monkeypatch):
+    writer = RollingLog(tmp_path / "events.log")
+    writer.append(b"original\n")
+    write = os.write
+    monkeypatch.setattr(os, "write", lambda *_args: 0)
+    with pytest.raises(OSError, match="did not advance"):
+        writer.append(b"new record\n")
+    assert writer.path.read_bytes() == b"original\n"
+    monkeypatch.setattr(os, "write", write)
+    writer.append(b"new record\n")
+    assert writer.path.read_bytes() == b"original\nnew record\n"
+
+
+def test_failed_rollback_prevents_another_writer_appending_until_repaired(tmp_path, monkeypatch):
+    path = tmp_path / "events.log"
+    writer = RollingLog(path)
+    writer.append(b"original\n")
+    write, truncate = os.write, os.ftruncate
+    calls = 0
+
+    def short_then_fail(descriptor, data):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return write(descriptor, data[:3])
+        raise OSError("write failed")
+
+    def failed_truncate(*_args):
+        raise OSError("rollback unavailable")
+
+    monkeypatch.setattr(os, "write", short_then_fail)
+    monkeypatch.setattr(os, "ftruncate", failed_truncate)
+    with pytest.raises(OSError, match="write failed"):
+        writer.append(b"new record\n")
+    partial = path.read_bytes()
+    monkeypatch.setattr(os, "write", write)
+    next_writer = RollingLog(path)
+    with pytest.raises(OSError, match="rollback unavailable"):
+        next_writer.append(b"new record\n")
+    assert path.read_bytes() == partial
+    monkeypatch.setattr(os, "ftruncate", truncate)
+    next_writer.append(b"new record\n")
+    assert path.read_bytes() == b"original\nnew record\n"
 
 
 def test_locked_original_does_not_accumulate_duplicate_archives(tmp_path, monkeypatch):

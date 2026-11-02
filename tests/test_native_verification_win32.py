@@ -1,8 +1,10 @@
 """Native input safety behavior uses a fake OS; these tests never inject input."""
 
+import json
 import subprocess
 import sys
 import threading
+from pathlib import Path
 
 import pytest
 from native_verification.contracts import DesktopError
@@ -87,6 +89,9 @@ class FakeOS:
 
 VIEWPORT = {"width": 1000, "height": 700, "dpr": 1}
 POINT = {"x": 400, "y": 300}
+PROTOCOL_CASES = json.loads(
+    (Path(__file__).parent / "fixtures" / "native-protocol-cases.json").read_text()
+)
 
 
 def make_desktop():
@@ -301,6 +306,26 @@ def test_invalid_geometry_never_acquires_input_or_moves(viewport, point):
     desktop, os_api = make_desktop()
     assert_error("invalid-request", lambda: desktop.prepare(viewport, point))
     assert not os_api.events and not os_api.lease
+
+
+@pytest.mark.parametrize("case", PROTOCOL_CASES["prepare"], ids=lambda case: case["name"])
+def test_desktop_geometry_matches_the_same_host_protocol_fixtures(case):
+    desktop, os_api = make_desktop()
+    viewport, point = case["viewport"], case["point"]
+    os_api.widgets = [(11, (0, 0, round(viewport["width"] * viewport["dpr"]),
+                           round(viewport["height"] * viewport["dpr"])))]
+    try:
+        if case["valid"]:
+            target = desktop.prepare(viewport, point)
+            assert (target.x, target.y) == (
+                round(point["x"] * viewport["dpr"]), round(point["y"] * viewport["dpr"]),
+            )
+            assert all(event[0] == "move" for event in os_api.events)
+        else:
+            assert_error("invalid-request", lambda: desktop.prepare(viewport, point))
+            assert not os_api.events and not os_api.lease
+    finally:
+        desktop.close()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Off-Windows boundary only")

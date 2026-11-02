@@ -95,7 +95,7 @@ def test_http_ingest_routes_before_personal_filters_and_dedupe(discord_server):
     assert summary["filtered"] == summary["notified"] == summary["failed"] == 0
     assert client.calls == []  # HTTP acknowledges durable intake, not a remote send.
     delivered = notifier.deliver_once()
-    assert delivered["sent"] == 3  # Pro all + furniture + $10-20. Starter/free wait.
+    assert delivered["sent"] == 3  # Pro all + furniture + $10-20. Free waits.
     wire = json.dumps(client.calls)
     assert "do-not-publish" not in wire and "claims_remaining" not in wire
     assert "type-furniture" in notifier.state["channels"]
@@ -210,7 +210,7 @@ def test_health_separates_queued_and_delivered(discord_server):
         health = json.load(response)
     assert health["notifier"] == "DiscordNotifier"
     assert health["discord"]["personal_filters_applied"] is False
-    assert health["discord"]["jobs"] == {"pending": 5}
+    assert health["discord"]["jobs"] == {"pending": 4}
     assert health["runtime"]["last_notification"] is None
     assert health["runtime"]["last_successful_relay"]["summary"]["queued"] == 1
 
@@ -246,7 +246,7 @@ def test_background_notification_timestamp_does_not_fake_relay(discord_server):
     assert runtime.snapshot()["last_successful_relay"] is None
 
 
-def test_starter_and_free_clocks_survive_collector_restart(tmp_path):
+def test_pro_and_free_clocks_survive_collector_restart(tmp_path):
     path = tmp_path / "q"
     notifier = DiscordNotifier(JobStore(path))
     notifier.ingest([Item.from_dict(product())])
@@ -257,6 +257,7 @@ def test_starter_and_free_clocks_survive_collector_restart(tmp_path):
     notifier.ingest([Item.from_dict(product(value_usd=17.99))])
     with notifier.store._connect() as db:
         second = db.execute("SELECT route,due FROM jobs ORDER BY route").fetchall()
-    assert dict(first)["starter-items"] == detected + 300
+    assert "starter-items" not in dict(first)
+    assert dict(first)["pro-all"] == detected
     assert dict(first)["yesterday-recap"] == detected + 86400
     assert dict(first) == dict(second)

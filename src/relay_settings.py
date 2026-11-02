@@ -10,11 +10,11 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import tempfile
 import threading
 from copy import deepcopy
 from pathlib import Path
+
+from atomic_json import write_atomic_json
 
 log = logging.getLogger(__name__)
 
@@ -101,21 +101,7 @@ class RelaySettingsStore:
             return deepcopy(clean)
 
     def _write(self, encoded: bytes) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                dir=self.path.parent, prefix=f".{self.path.name}.", suffix=".tmp",
-                mode="wb", delete=False,
-            ) as handle:
-                temporary = Path(handle.name)
-                handle.write(encoded)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, self.path)
-        finally:
-            if temporary is not None:
-                try:
-                    temporary.unlink(missing_ok=True)
-                except OSError:
-                    log.warning("Relay settings temporary file cleanup unavailable")
+        write_atomic_json(
+            self.path, encoded, logger=log,
+            cleanup_warning="Relay settings temporary file cleanup unavailable",
+        )

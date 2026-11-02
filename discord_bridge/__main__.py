@@ -135,8 +135,11 @@ def main(argv=None) -> int:
             items = validate_batch(json.loads(args.input.read_text(encoding="utf-8")))
             if args.command == "enqueue":
                 store = JobStore(args.database)
-                result = store.record(items)
-                DeliveryMonitor(store.path.parent, entry_point="cli_enqueue").intake(result)
+                monitor = DeliveryMonitor(store.path.parent, entry_point="cli_enqueue")
+                result = store.record(
+                    items, event_sink=monitor.emit, request_event_sink=monitor.emit
+                )
+                monitor.intake(result, items=items)
                 print(json.dumps(result))
             else:
                 print(
@@ -217,7 +220,8 @@ def main(argv=None) -> int:
             port=args.port,
             live=args.live,
             on_queued=waking.set,
-            on_accepted=monitor.intake,
+            on_observed=lambda result, items: monitor.intake(result, items=items),
+            event_sink=monitor.emit,
         )
 
         def worker():

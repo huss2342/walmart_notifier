@@ -1,12 +1,22 @@
 """Private-server layout and least-privilege Discord permission policy.
 
-Prices are monthly USD. A channel is a delivery destination, not a scheduler:
-the durable bridge releases Starter messages after 300 seconds.
+Prices are monthly USD. The retired Starter binding is retained privately so
+existing delivery records and the ownership audit remain valid.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+from .policy import FREE_DELAY_SECONDS as FREE_DELAY_SECONDS
+from .policy import FREE_ROUTE_KEY as FREE_ROUTE_KEY
+from .policy import PLAN_PRICES_CENTS as PLAN_PRICES_CENTS
+from .policy import (
+    PRODUCT_CATEGORY_TOPICS,
+    price_feed_topics,
+)
+from .policy import STARTER_DELAY_SECONDS as STARTER_DELAY_SECONDS
+from .policy import STARTER_MAX_PRICE_CENTS as STARTER_MAX_PRICE_CENTS
 
 CREATE_INVITE = 1 << 0
 ADMINISTRATOR = 1 << 3
@@ -45,12 +55,7 @@ PROVISION_PERMISSIONS = SETUP_PERMISSIONS | BOT_RUNTIME_PERMISSIONS
 MEMBER_ACTION_DENY = SEND_MESSAGES | EMBED_LINKS
 
 ROLE_NAMES = {"starter": "Starter", "pro": "Pro"}
-PLAN_PRICES_CENTS = {"starter": 500, "pro": 2000}
-STARTER_MAX_PRICE_CENTS = 4000  # exclusive: $40.00 belongs to Pro
-STARTER_DELAY_SECONDS = 300
-FREE_DELAY_SECONDS = 86400
-FREE_ROUTE_KEY = "yesterday-recap"
-
+OPTIONAL_ROLE_NAMES = {"trial": "Pro Trial"}
 CHANNEL_DISPLAY_NAMES = {
     "welcome": "💳-welcome",
     "how-it-works": "how-to-use",
@@ -61,7 +66,8 @@ CHANNEL_DISPLAY_NAMES = {
     "price-40-80": "💲40-80",
     "price-80-200": "💲80-200",
     "price-200-plus": "💲200-plus",
-    FREE_ROUTE_KEY: "🆓-free-24h-alerts",
+    FREE_ROUTE_KEY: "🆓24h-delayed-alerts",
+    "starter-items": "retired-starter-feed",
 }
 
 
@@ -89,7 +95,7 @@ class Channel:
 CATEGORIES = (
     Category("public-info", "START HERE", "everyone"),
     Category("community", "COMMUNITY", "everyone", community=True),
-    Category("starter", "STARTER - 5 MIN DELAY", "starter"),
+    Category("starter", "RETIRED FEED", "operations"),
     Category("pro-price", "PRO - BY VALUE", "pro"),
     Category("pro-type", "PRO - BY CATEGORY", "pro"),
     Category("pro-firehose", "PRO - ALL ITEMS", "pro"),
@@ -100,7 +106,8 @@ CHANNELS = (
     Channel(
         "welcome",
         "public-info",
-        "Compare Free, Starter and Pro, then subscribe through the pinned Whop plan links.",
+        "Free: historical alerts after 24 hours. Pro: $30/month for all values, "
+        "category feeds and personal item requests. Subscribe using the pinned Whop link.",
     ),
     Channel(
         "greeting",
@@ -123,14 +130,16 @@ CHANNELS = (
     Channel(
         "plans-and-help",
         "operations",
-        "Starter: $5/month, items below $40, released 5 minutes after detection. "
-        "Pro: $20/month, all observed values immediately after detection. "
-        "Billing is not enabled yet.",
+        "Free: historical alerts after 24 hours. "
+        f"Pro: ${PLAN_PRICES_CENTS['pro'] / 100:g}/month, "
+        "all observed values, category feeds and personal item requests. "
+        "Subscribe, manage or cancel through Whop. Starter is retired.",
     ),
     Channel(
         "yesterday-recap",
         "public-info",
-        "Free: every detected item, released at least 24 hours after detection. "
+        f"Free: every detected item, released at least {FREE_DELAY_SECONDS / 3600:g} hours "
+        "after detection. "
         "Historical listings; current availability is not verified.",
     ),
     Channel(
@@ -148,72 +157,11 @@ CHANNELS = (
     Channel(
         "starter-items",
         "starter",
-        "Starter: observed value below $40; released at least 5 minutes after detection. "
-        "Pro members may also browse this delayed feed.",
+        "Retired Starter feed, retained privately for existing delivery records. "
+        "Current Free and Pro options are in #welcome.",
     ),
-    Channel("price-under-10", "pro-price", "Observed value below $10. Immediate after detection."),
-    Channel(
-        "price-10-20",
-        "pro-price",
-        "Observed value from $10 to below $20. Immediate after detection.",
-    ),
-    Channel(
-        "price-20-40",
-        "pro-price",
-        "Observed value from $20 to below $40. Immediate after detection.",
-    ),
-    Channel(
-        "price-40-80",
-        "pro-price",
-        "Observed value from $40 to below $80. Immediate after detection.",
-    ),
-    Channel(
-        "price-80-200",
-        "pro-price",
-        "Observed value from $80 to below $200. Immediate after detection.",
-    ),
-    Channel(
-        "price-200-plus", "pro-price", "Observed value $200 and above. Immediate after detection."
-    ),
-    Channel("type-furniture", "pro-type", "Furniture alerts. Immediate after detection."),
-    Channel(
-        "type-home-storage-decor",
-        "pro-type",
-        "Home, storage, and decor alerts. Immediate after detection.",
-    ),
-    Channel(
-        "type-kitchen-appliances",
-        "pro-type",
-        "Kitchen and appliance alerts. Immediate after detection.",
-    ),
-    Channel("type-electronics", "pro-type", "Electronics alerts. Immediate after detection."),
-    Channel(
-        "type-tools-auto", "pro-type", "Tools and automotive alerts. Immediate after detection."
-    ),
-    Channel(
-        "type-beauty-health", "pro-type", "Beauty and health alerts. Immediate after detection."
-    ),
-    Channel(
-        "type-clothing-accessories",
-        "pro-type",
-        "Clothing and accessories alerts. Immediate after detection.",
-    ),
-    Channel(
-        "type-toys-baby-books",
-        "pro-type",
-        "Toys, baby products, and books. Immediate after detection.",
-    ),
-    Channel("type-pets", "pro-type", "Pet supplies. Immediate after detection."),
-    Channel(
-        "type-sports-office-travel",
-        "pro-type",
-        "Sports, office, and travel products. Immediate after detection.",
-    ),
-    Channel(
-        "type-other",
-        "pro-type",
-        "Other or unclassified items. Immediate after detection; classifications may be corrected.",
-    ),
+    *(Channel(f"price-{key}", "pro-price", topic) for key, topic in price_feed_topics()),
+    *(Channel(f"type-{key}", "pro-type", topic) for key, topic in PRODUCT_CATEGORY_TOPICS),
     Channel(
         "pro-all",
         "pro-firehose",
@@ -251,6 +199,11 @@ OPTIONAL_CHANNELS = (
         "Pro personal item requests. Use /request add, list, edit, delete or test-dm. "
         "Matches are sent only by DM. Enable server DMs; ten requests per member.",
     ),
+    Channel(
+        "trial-management", "operations",
+        "Owner-only Pro trial controls. Use /trial to grant, extend, revoke or list access, "
+        "and enable or disable the automatic welcome trial.",
+    ),
 )
 
 
@@ -264,20 +217,24 @@ def permission_overwrites(
 ) -> list[dict]:
     """Explicit ACLs avoid role-combination leaks and public creation windows."""
     public = category.audience == "everyone"
-    if application_commands and category.audience != "pro":
-        raise ValueError("Personal request commands require a Pro-only channel")
+    if application_commands and category.audience not in {"pro", "operations"}:
+        raise ValueError("Commands require a Pro-only or owner-only channel")
     chat = public and category.community
     reader_allow = (READER_PERMISSIONS | (SEND_MESSAGES if chat else 0)) if public else 0
     member_deny = (EMBED_LINKS if chat else MEMBER_ACTION_DENY) | (0 if public else VIEW_CHANNEL)
     if application_commands:
         member_deny |= USE_APPLICATION_COMMANDS
     result = [{"id": guild_id, "type": 0, "allow": str(reader_allow), "deny": str(member_deny)}]
-    for role in ("starter", "pro"):
-        allowed = category.audience == "starter" or (category.audience == "pro" and role == "pro")
+    audience_roles = ("starter", "pro") + (("trial",) if "trial" in roles else ())
+    for role in audience_roles:
+        allowed = category.audience == "starter" or (
+            category.audience == "pro" and role in {"pro", "trial"}
+        )
         if allowed:
             role_allow = READER_PERMISSIONS
-            if application_commands and role == "pro":
-                role_allow |= USE_APPLICATION_COMMANDS
+            if application_commands and role in {"pro", "trial"}:
+                # Discord requires Send Messages even for private slash replies.
+                role_allow |= USE_APPLICATION_COMMANDS | SEND_MESSAGES
             result.append({"id": roles[role], "type": 0, "allow": str(role_allow), "deny": "0"})
     result.append(
         {"id": bot_user_id, "type": 1, "allow": str(BOT_RUNTIME_PERMISSIONS), "deny": "0"}
@@ -297,16 +254,9 @@ def server_manifest() -> dict:
                 "route": FREE_ROUTE_KEY,
                 "historical": True,
             },
-            "starter": {
-                "role": ROLE_NAMES["starter"],
-                "monthly_price_usd": 5,
-                "monthly_price_cents": PLAN_PRICES_CENTS["starter"],
-                "delay_seconds": STARTER_DELAY_SECONDS,
-                "max_price_cents_exclusive": STARTER_MAX_PRICE_CENTS,
-            },
             "pro": {
                 "role": ROLE_NAMES["pro"],
-                "monthly_price_usd": 20,
+                "monthly_price_usd": PLAN_PRICES_CENTS["pro"] / 100,
                 "monthly_price_cents": PLAN_PRICES_CENTS["pro"],
                 "delay_seconds": 0,
                 "max_price_cents_exclusive": None,

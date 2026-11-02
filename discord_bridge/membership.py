@@ -21,7 +21,10 @@ _TIERS = {"starter": ("Starter", 0x1ABC9C), "pro": ("Pro", 0xF1C40F)}
 class MembershipWorker(WelcomeWorker):
     """Reuse the exact-user, at-most-once outbox and paid-delivery priority."""
 
+    component = "membership"
+
     def __init__(self, *args, **kwargs):
+        self.referrals_enabled = False
         super().__init__(*args, **kwargs)
         if not self.enabled:
             return
@@ -175,6 +178,15 @@ class MembershipWorker(WelcomeWorker):
                 "color": color,
             }
         ]
+        if self.referrals_enabled and detail["tier"] == "pro":
+            from .referral_ui import referral_button
+
+            payload["embeds"][0]["description"] += (
+                "\n\n**Refer a friend**\nGive a friend 30% off their first month. "
+                "When they subscribe, you get 30% off your next month. "
+                "Use the button below to get your personal link."
+            )
+            payload["components"] = [{"type": 1, "components": [referral_button()]}]
         return payload
 
     def health(self):

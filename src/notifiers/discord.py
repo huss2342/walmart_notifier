@@ -17,7 +17,7 @@ from pathlib import Path
 from discord_bridge.api import DiscordClient, DiscordError
 from discord_bridge.classification import classify_product
 from discord_bridge.core import JobStore, normalize_item
-from discord_bridge.monitoring import DeliveryMonitor, emit_event
+from discord_bridge.monitoring import DeliveryMonitor, emit_event, error_fields
 from discord_bridge.service import deliver_due
 
 from models import Item
@@ -71,6 +71,8 @@ class DiscordNotifier:
         membership_path=None,
         requests_enabled=False,
         requests_token=None,
+        referrals_enabled=False,
+        referrals_config_path=None,
     ):
         self.store = store
         self.client = client
@@ -85,6 +87,16 @@ class DiscordNotifier:
         self._thread = None
         self._last_delivery = None
         self._lock = threading.Lock()
+        self._worker_status = {
+            "last_poll_at": None,
+            "last_poll_status": None,
+            "poll_started_at": None,
+            "last_success": None,
+            "last_failure_at": None,
+            "last_error": None,
+            "recovered_at": None,
+        }
+        self._poll_started_monotonic = None
         self.monitor = DeliveryMonitor(self.store.path.parent, entry_point="collector_worker")
         self.welcome = None
         if live and welcome_enabled:
@@ -114,6 +126,27 @@ class DiscordNotifier:
                 paid_due=self._paid_due,
                 event_sink=self.monitor.emit,
             )
+        self.referrals = None
+        self._referral_error = None
+        if live and referrals_enabled:
+            try:
+                if not requests_enabled or not requests_token:
+                    raise ValueError("Referrals require the existing interaction gateway")
+                from discord_bridge.referral_runtime import ReferralRuntime
+
+                self.referrals = ReferralRuntime(
+                    self.state,
+                    referrals_config_path or self.store.path.parent / "referral-config.json",
+                    event_sink=self.monitor.emit,
+                )
+            except (ValueError, OSError) as exc:
+                # Referral setup errors cannot disable the existing item feeds.
+                self._referral_error = "configuration"
+                emit_event(self.monitor.emit, "referral_error", component="referrals",
+                           phase="prepare",
+                           **error_fields(exc))
+        if self.membership is not None:
+            self.membership.referrals_enabled = self.referrals is not None
         self.requests = None
         if live and requests_enabled:
             from discord_bridge.request_runtime import RequestRuntime
@@ -126,6 +159,11 @@ class DiscordNotifier:
                 auditor=self.auditor,
                 stop_event=self._stop,
                 event_sink=self.monitor.emit,
+                **(
+                    {"referral_handler": self.referrals.handler}
+                    if self.referrals is not None
+                    else {}
+                ),
             )
 
     def _paid_due(self):
@@ -159,6 +197,9 @@ class DiscordNotifier:
             requests_enabled=os.environ.get("DISCORD_REQUESTS_ENABLED", "false").strip().lower()
             == "true",
             requests_token=os.environ.get("DISCORD_BOT_TOKEN", ""),
+            referrals_enabled=os.environ.get("DISCORD_REFERRALS_ENABLED", "false").strip().lower()
+            == "true",
+            referrals_config_path=os.environ.get("DISCORD_REFERRALS_CONFIG"),
         )
 
     def ingest(self, items: list[Item], *, seed_only=False) -> DiscordSummary:
@@ -169,8 +210,11 @@ class DiscordNotifier:
             summary.observe(item)
         if not public:
             return summary
-        result = self.store.record(public, seed_only=seed_only)
-        self.monitor.intake(result, seed_only=seed_only)
+        result = self.store.record(
+            public, seed_only=seed_only, request_event_sink=self.monitor.emit,
+            event_sink=self.monitor.emit,
+        )
+        self.monitor.intake(result, seed_only=seed_only, items=public)
         self._wake.set()
         summary.new = result["new"]
         summary.duplicates = result["duplicates"]
@@ -216,24 +260,58 @@ class DiscordNotifier:
             return
 
         def work():
+            emit_event(self.monitor.emit, "worker_lifecycle", component="channel",
+                       transition="started")
             while not self._stop.is_set():
                 self._wake.clear()
                 wait_seconds = 5
+                with self._lock:
+                    self._worker_status["poll_started_at"] = time.time()
+                    self._poll_started_monotonic = time.monotonic()
                 try:
                     result = self.deliver_once()
                     wait_seconds = result["wait_seconds"]
+                    if result["sent"]:
+                        with self._lock:
+                            self._worker_status["last_success"] = time.time()
                     if result["sent"] and on_sent is not None:
                         on_sent()
+                    recovered = False
+                    with self._lock:
+                        checked_at = time.time()
+                        self._worker_status["last_poll_status"] = (
+                            "blocked" if result["blocked"] else "ok"
+                        )
+                        if not result["blocked"]:
+                            if self._worker_status["last_error"] is not None:
+                                self._worker_status["recovered_at"] = checked_at
+                                recovered = True
+                            self._worker_status["last_error"] = None
+                    if recovered:
+                        emit_event(self.monitor.emit, "worker_recovered", component="channel",
+                                   transition="recovered")
                 except Exception as exc:
                     with self._lock:
                         self.last_diagnostic = "Discord worker error; queued items retained."
+                        self._worker_status.update(
+                            last_poll_status="error",
+                            last_failure_at=time.time(),
+                            last_error=type(exc).__name__,
+                        )
                     emit_event(
                         self.monitor.emit,
                         "worker_error",
                         phase="worker",
-                        error_type=type(exc).__name__,
+                        component="channel",
+                        **error_fields(exc),
                     )
+                finally:
+                    with self._lock:
+                        self._worker_status["last_poll_at"] = time.time()
+                        self._poll_started_monotonic = None
                 self._wake.wait(min(5, max(0.01, wait_seconds)))
+            emit_event(self.monitor.emit, "worker_lifecycle", component="channel",
+                       transition="stopped")
 
         self._thread = threading.Thread(target=work, name="discord-delivery", daemon=True)
         self._thread.start()
@@ -243,6 +321,8 @@ class DiscordNotifier:
             self.membership.start()
         if self.requests is not None:
             self.requests.start()
+        if self.referrals is not None:
+            self.referrals.start()
 
     def stop(self):
         self._stop.set()
@@ -253,6 +333,8 @@ class DiscordNotifier:
             self.membership.stop()
         if self.requests is not None:
             self.requests.stop()
+        if self.referrals is not None:
+            self.referrals.stop()
         if self._thread is not None:
             self._thread.join(timeout=12)
         if (
@@ -276,12 +358,30 @@ class DiscordNotifier:
     def health(self):
         with self._lock:
             last_delivery = self._last_delivery
+            worker = dict(self._worker_status)
+            in_progress = self._poll_started_monotonic is not None
+            worker.update(
+                enabled=self.live,
+                running=self._thread is not None and self._thread.is_alive(),
+                in_progress=in_progress,
+                in_progress_seconds=max(0, time.monotonic() - self._poll_started_monotonic)
+                if in_progress
+                else 0,
+            )
         return {
             "live_sending": self.live,
+            "worker": worker,
             "jobs": self.store.counts(),
             "last_delivery": last_delivery,
             "personal_filters_applied": False,
             "requests": self.requests.health() if self.requests is not None else {"enabled": False},
+            "referrals": self.referrals.health()
+            if self.referrals is not None
+            else {
+                "enabled": bool(self._referral_error),
+                "configured": False,
+                "last_error": self._referral_error,
+            },
             "queue": self.store.delivery_metrics(now=time.time()),
             "monitoring": self.monitor.status(),
             "welcome": self.welcome.health()

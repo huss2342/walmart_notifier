@@ -6,16 +6,19 @@ intent or publicly reachable interaction server is needed.
 """
 
 import asyncio
+import hashlib
 import logging
 import math
 import re
 import threading
 import time
 import uuid
+import weakref
 from contextlib import suppress
 
 from .api import DiscordError
-from .monitoring import emit_event
+from .monitoring import emit_event, error_fields
+from .request_store import member_ref
 
 _SNOWFLAKE = re.compile(r"[0-9]{17,20}\Z")
 _DM_HELP = (
@@ -26,6 +29,10 @@ _DM_HELP = (
 _RETRY = "Discord is temporarily busy. Please retry in a moment."
 _RECONNECTING = (
     "The bot is reconnecting to Discord. Please wait a moment and retry your command here."
+)
+_EXPIRED_CONTROLS = (
+    "These request controls have expired. Run /request list for fresh controls. "
+    "Your saved requests are unchanged."
 )
 
 
@@ -48,6 +55,12 @@ def _display(value, limit=120):
     # Inline code makes request input readable without user-supplied formatting.
     value = str(value).replace("`", "ʼ").replace("\n", " ").replace("\r", " ")
     return value[:limit] + ("…" if len(value) > limit else "")
+
+
+def _request_label(row, limit=120):
+    value = row.get("min_value_cents")
+    minimum = f" (${value // 100:,}.{value % 100:02d}+)" if value is not None else ""
+    return _display(row["query"], limit) + minimum
 
 
 class _SDKLogFilter(logging.Filter):
@@ -101,10 +114,64 @@ class _PrivateError(Exception):
 class RequestCommands:
     """Framework-independent handlers with an authenticated owner on every path."""
 
-    def __init__(self, client, state, store, *, event_sink=None):
+    def __init__(self, client, state, store, *, event_sink=None, trial_store=None):
         self.client, self.state, self.store = client, state, store
         self.guild, self.pro, self.channel = _configuration(state)
         self._events = event_sink
+        self.trial_store = trial_store
+        self._views = weakref.WeakValueDictionary()
+        self._modals = weakref.WeakValueDictionary()
+
+    def _trace(self, interaction, stage, *, error=None, elapsed=None):
+        """Log only fixed command names, timings and safe provider classification."""
+        data = getattr(interaction, "data", None)
+        data = data if isinstance(data, dict) else {}
+        command = "unknown"
+        if data.get("name") == "request":
+            for option in data.get("options", []):
+                if isinstance(option, dict) and option.get("name") in {
+                    "add",
+                    "list",
+                    "edit",
+                    "delete",
+                    "test-dm",
+                }:
+                    command = option["name"]
+                    break
+        kind = getattr(getattr(interaction, "type", None), "value", None)
+        if kind == 3:
+            command = "component"
+        elif kind == 5:
+            command = "modal"
+        fields = {"audience": "personal", "interaction_stage": stage, "command": command}
+        identity = getattr(interaction, "id", None)
+        if identity is not None:
+            fields["correlation_id"] = hashlib.sha256(
+                f"request-interaction:{identity}".encode()
+            ).hexdigest()[:32]
+        user = str(getattr(getattr(interaction, "user", None), "id", ""))
+        if _id(user):
+            fields["member_ref"] = member_ref(user)
+        if elapsed is not None:
+            fields["elapsed_seconds"] = elapsed
+        created = getattr(interaction, "created_at", None)
+        if created is not None:
+            fields["interaction_age_seconds"] = max(0, time.time() - created.timestamp())
+        if error is not None:
+            fields.update(error_fields(error))
+            fields.update(
+                status=getattr(error, "status", None),
+                provider_code=getattr(error, "code", getattr(error, "provider_code", None)),
+            )
+        emit_event(self._events, "request_interaction", **fields)
+
+    async def expired_controls(self, interaction):
+        if self.in_channel(interaction):
+            self._trace(interaction, "expired")
+            await self._send(
+                interaction,
+                _EXPIRED_CONTROLS,
+            )
 
     def in_channel(self, interaction):
         return (
@@ -166,7 +233,12 @@ class RequestCommands:
             or not isinstance(member.get("roles"), list)
         ):
             raise DiscordError()
-        if self.pro not in member["roles"] or member["user"].get("bot", False):
+        trial = self.state.get("roles", {}).get("trial")
+        eligible = self.pro in member["roles"] or (
+            trial is not None and trial in member["roles"] and self.trial_store is not None
+            and self.trial_store.active(user)
+        )
+        if not eligible or member["user"].get("bot", False):
             raise _PrivateError("Personal item requests are available to current Pro members only.")
         return user
 
@@ -178,11 +250,17 @@ class RequestCommands:
         try:
             kwargs.update(ephemeral=True, allowed_mentions=_sdk().AllowedMentions.none())
             if interaction.response.is_done():
-                await interaction.followup.send(content, **kwargs)
+                message = await interaction.followup.send(content, **kwargs)
             else:
-                await interaction.response.send_message(content, **kwargs)
-        except Exception:
+                response = await interaction.response.send_message(content, **kwargs)
+                message = getattr(response, "resource", None)
+            view = kwargs.get("view")
+            if view is not None and message is not None:
+                view.message = message
+            self._trace(interaction, "replied")
+        except Exception as exc:
             self._failure("request_reply")
+            self._trace(interaction, "failed", error=exc)
             return False
         return True
 
@@ -190,6 +268,8 @@ class RequestCommands:
         if not await self.channel_guard(interaction):
             return
         self._failure("request_command")
+        if _error is not None:
+            self._trace(interaction, "failed", error=getattr(_error, "original", _error))
         if self.is_autocomplete(interaction):
             if not interaction.response.is_done():
                 with suppress(Exception):
@@ -213,36 +293,34 @@ class RequestCommands:
         if not await self.channel_guard(interaction):
             return
         # Acknowledge before any provider or SQLite work, including role checks.
-        if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True, thinking=True)
+        started = time.monotonic()
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.defer(ephemeral=True, thinking=True)
+            self._trace(interaction, "acknowledged", elapsed=time.monotonic() - started)
+        except Exception as exc:
+            # An unacknowledged/expired command must never mutate a saved watch.
+            self._trace(interaction, "failed", error=exc, elapsed=time.monotonic() - started)
+            return
         try:
             user = await asyncio.to_thread(self.authorize, interaction, expected)
             await action(user)
         except _PrivateError as exc:
             await self._send(interaction, str(exc))
-        except DiscordError:
+        except DiscordError as exc:
             self._failure("request_provider")
+            self._trace(interaction, "failed", error=exc, elapsed=time.monotonic() - started)
             await self._send(interaction, _RETRY)
-        except Exception:
-            await self.error(interaction)
+        except Exception as exc:
+            await self.error(interaction, exc)
 
-    async def _change(self, operation, *args):
+    async def _change(self, operation, *args, **kwargs):
         try:
-            return await asyncio.to_thread(operation, *args)
+            return await asyncio.to_thread(operation, *args, **kwargs)
         except ValueError as exc:
             # Only RequestStore validation messages are safe member-facing copy.
             # Never echo arbitrary provider/runtime exception text.
             raise _PrivateError(str(exc)) from None
-
-    def _preflight_add(self, user, item):
-        from .request_store import MAX_REQUESTS, parse_query
-
-        query, _, _ = parse_query(item)
-        if len(self.store.list(user)) >= MAX_REQUESTS:
-            raise ValueError(
-                "You can have up to 10 requests. Delete one with /request delete first."
-            )
-        return query
 
     def _test_delivery(self, user):
         try:
@@ -281,22 +359,32 @@ class RequestCommands:
                 return "blocked"
             raise
 
-    async def add(self, interaction, item):
+    async def add(self, interaction, item, min_value=None):
         async def action(user):
-            query = await self._change(self._preflight_add, user, item)
+            await self._change(self.store.validate_add, user, item, min_value=min_value)
             status = await asyncio.to_thread(self.store.dm_status, user)
             if status == "needs_test":
                 status = await asyncio.to_thread(self._test_delivery, user)
-            row = await self._change(self.store.add, user, query)
+            rows = await self._change(self.store.add_many, user, item, min_value=min_value)
+            reused = sum(row.get("already_saved") is True for row in rows)
+            added = len(rows) - reused
+            labels = ", ".join(f"`{_request_label(row, 70)}`" for row in rows)
+            saved = "Request saved" if len(rows) == 1 else f"{len(rows)} requests saved"
+            accepted = "Request accepted" if len(rows) == 1 else f"{len(rows)} requests accepted"
+            if reused:
+                saved = accepted = (
+                    f"{added} new requests saved; {reused} already saved "
+                    "(existing filters unchanged)"
+                )
             if status != "ready":
                 await self._send(
                     interaction,
-                    f"Request saved: `{_display(row['query'])}`. Alerts are paused. {_DM_HELP}",
+                    f"{saved}: {labels}. Alerts are paused. {_DM_HELP}",
                 )
             else:
                 await self._send(
                     interaction,
-                    f"Request accepted: `{_display(row['query'])}`. "
+                    f"{accepted}: {labels}. "
                     "I'll DM you when a matching item is detected. "
                     "Requests stay active until deleted; each product alerts once. "
                     "Keywords may also match accessories. "
@@ -309,18 +397,23 @@ class RequestCommands:
         async def action(user):
             rows = await asyncio.to_thread(self.store.list, user)
             status = await asyncio.to_thread(self.store.dm_status, user)
-            header = "**Your personal item requests** (up to 10)\n"
+            header = (
+                "**Your personal item requests** (up to 10)\n"
+                "Controls expire after five minutes of inactivity; "
+                "run /request list for fresh controls.\n"
+            )
             if status != "ready":
                 header += "**Alerts paused: DMs need attention.** " + _DM_HELP + "\n"
             if not rows:
                 await self._send(
                     interaction,
                     header + "No requests yet. Use /request add with an item name, "
-                    "Walmart link, or item ID.",
+                    "comma-separated names, Walmart link, or item ID. "
+                    "Optionally set min_value in dollars or append $100+.",
                 )
                 return
             text = header + "\n".join(
-                f"{index}. `{_display(row['query'])}`"
+                f"{index}. `{_request_label(row, 80)}`"
                 + {
                     "needs_review": " — delivery needs review",
                     "failed": " — delivery failed; a future fresh match can retry",
@@ -331,12 +424,12 @@ class RequestCommands:
 
         await self._execute(interaction, action, expected=expected)
 
-    async def edit(self, interaction, request, item, *, expected=None):
+    async def edit(self, interaction, request, item, min_value=None, *, expected=None):
         async def action(user):
-            row = await self._change(self.store.edit, user, request, item)
+            row = await self._change(self.store.edit, user, request, item, min_value=min_value)
             await self._send(
                 interaction,
-                f"Request updated: `{_display(row['query'])}`. "
+                f"Request updated: `{_request_label(row)}`. "
                 "Use /request list to view your requests.",
             )
 
@@ -381,7 +474,7 @@ class RequestCommands:
         try:
             self.owner(interaction)
             rows = await asyncio.wait_for(asyncio.to_thread(choices), timeout=1.8)
-            return [(str(row["query"])[:100], str(row["id"])) for row in rows[:10]]
+            return [(_request_label(row, 65)[:100], str(row["id"])) for row in rows[:10]]
         except Exception:
             return []
 
@@ -394,13 +487,24 @@ def build_request_view(handler, owner, rows):
         item = discord.ui.TextInput(
             label="New item name, Walmart URL, or item ID", min_length=1, max_length=512
         )
+        min_value = discord.ui.TextInput(
+            label="Minimum value in USD (blank keeps, 0 clears)", required=False, max_length=16
+        )
 
         def __init__(self, request_id):
-            super().__init__(timeout=300)
+            self.key = uuid.uuid4().hex
+            super().__init__(timeout=300, custom_id=f"request-modal:{self.key}")
+            handler._modals[self.key] = self
             self.request_id = request_id
 
         async def on_submit(self, interaction):
-            await handler.edit(interaction, self.request_id, str(self.item.value), expected=owner)
+            await handler.edit(
+                interaction,
+                self.request_id,
+                str(self.item.value),
+                min_value=str(self.min_value.value).strip() or None,
+                expected=owner,
+            )
 
         async def on_error(self, interaction, _error):
             await handler.error(interaction)
@@ -408,16 +512,33 @@ def build_request_view(handler, owner, rows):
     class RequestView(discord.ui.View):
         def __init__(self):
             super().__init__(timeout=300)
+            self.key = uuid.uuid4().hex
+            self.message = None
             self.selected = str(rows[0]["id"])
             self.select = discord.ui.Select(
                 placeholder="Choose a request to edit or delete",
                 options=[
-                    discord.SelectOption(label=str(row["query"])[:100], value=str(row["id"]))
+                    discord.SelectOption(label=_request_label(row, 65)[:100], value=str(row["id"]))
                     for row in rows[:10]
                 ],
             )
             self.select.callback = self.choose
             self.add_item(self.select)
+            for index, child in enumerate(self.children):
+                child.custom_id = f"request-ui:{self.key}:{index}"
+            handler._views[self.key] = self
+
+        async def on_timeout(self):
+            for child in self.children:
+                child.disabled = True
+            if self.message is not None:
+                try:
+                    await self.message.edit(
+                        content=_EXPIRED_CONTROLS,
+                        view=self,
+                    )
+                except Exception:
+                    handler._failure("request_controls_expired")
 
         async def interaction_check(self, interaction):
             if not await handler.channel_guard(interaction):
@@ -441,7 +562,7 @@ def build_request_view(handler, owner, rows):
                 self.selected = selected
                 await handler._send(
                     interaction,
-                    f"Selected `{_display(row['query'])}`. "
+                    f"Selected `{_request_label(row)}`. "
                     "Use the Edit or Delete button on your request list.",
                 )
 
@@ -478,16 +599,20 @@ def build_request_command_group(handler):
     discord = _sdk()
     app = discord.app_commands
     item_query = app.Range[str, 1, 512]
+    minimum_value = app.Range[float, 0, 100_000_000]
     group = app.Group(
         name="request", description="Manage your private Pro item alerts", guild_only=True
     )
 
     @group.command(
-        name="add", description="Request an item and receive a private DM when it is found"
+        name="add", description="Request one or more items and receive private matching DMs"
     )
-    @app.describe(item="Item keywords, Walmart product URL, or exact item ID")
-    async def add(interaction, item: item_query):
-        await handler.add(interaction, item)
+    @app.describe(
+        item="Item keywords (commas for bulk), Walmart URL, or item ID; optional $100+ suffix",
+        min_value="Optional minimum item value in USD, e.g. 100 for $100+",
+    )
+    async def add(interaction, item: item_query, min_value: minimum_value = None):
+        await handler.add(interaction, item, min_value=min_value)
 
     @group.command(name="list", description="View your requests and private Edit/Delete controls")
     async def list_requests(interaction):
@@ -497,9 +622,10 @@ def build_request_command_group(handler):
     @app.describe(
         request="Choose one of your own requests",
         item="Item keywords, Walmart product URL, or exact item ID",
+        min_value="Minimum item value in USD; omit to keep the current minimum, or 0 to clear it",
     )
-    async def edit(interaction, request: str, item: item_query):
-        await handler.edit(interaction, request, item)
+    async def edit(interaction, request: str, item: item_query, min_value: minimum_value = None):
+        await handler.edit(interaction, request, item, min_value=min_value)
 
     @group.command(
         name="delete", description="Delete one of your own requests and cancel its unsent alerts"
@@ -527,14 +653,32 @@ def build_request_command_group(handler):
 def request_command_definition():
     """Registration payload independent of the SDK and existing guild commands."""
 
-    def item():
+    def item(*, bulk=False):
         return {
             "type": 3,
             "name": "item",
-            "description": "Item keywords, Walmart product URL, or exact item ID",
+            "description": (
+                "Item keywords (commas for bulk), Walmart URL, or item ID; optional $100+ suffix"
+                if bulk
+                else "Item keywords, Walmart product URL, or exact item ID"
+            ),
             "required": True,
             "min_length": 1,
             "max_length": 512,
+        }
+
+    def minimum(*, editing=False):
+        return {
+            "type": 10,
+            "name": "min_value",
+            "description": (
+                "Minimum item value in USD; omit to keep the current minimum, or 0 to clear it"
+                if editing
+                else "Optional minimum item value in USD, e.g. 100 for $100+"
+            ),
+            "required": False,
+            "min_value": 0,
+            "max_value": 100_000_000,
         }
 
     def request():
@@ -559,8 +703,8 @@ def request_command_definition():
             {
                 "type": 1,
                 "name": "add",
-                "description": "Request an item and receive a private DM when it is found",
-                "options": [item()],
+                "description": "Request one or more items and receive private matching DMs",
+                "options": [item(bulk=True), minimum()],
             },
             {
                 "type": 1,
@@ -572,7 +716,7 @@ def request_command_definition():
                 "type": 1,
                 "name": "edit",
                 "description": "Change one of your own item requests",
-                "options": [request(), item()],
+                "options": [request(), item(), minimum(editing=True)],
             },
             {
                 "type": 1,
@@ -609,15 +753,29 @@ class RequestGateway:
     """A small daemon lifecycle around Discord.py; registration is always explicit."""
 
     def __init__(
-        self, client, state, store, *, token, enabled=False, stop_event=None, event_sink=None
+        self,
+        client,
+        state,
+        store,
+        *,
+        token,
+        enabled=False,
+        stop_event=None,
+        event_sink=None,
+        referral_handler=None,
+        trial_service=None,
     ):
         self.enabled = bool(enabled)
         self.client, self.state, self.store = client, state, store
         self._token = token
         self._stop = stop_event if stop_event is not None else threading.Event()
         self._events = event_sink
+        self._referral_handler = referral_handler
+        self._trial_service = trial_service
         self._thread, self._loop, self._gateway = None, None, None
         self._connected, self._last_error = False, None
+        self._last_interaction_at = None
+        self._last_lifecycle = None
         if self.enabled:
             _configuration(state)
             if not _id(state.get("bot_user_id")):
@@ -630,10 +788,17 @@ class RequestGateway:
                 raise ValueError("Personal request Gateway requires a valid bot token")
 
     def _event(self, event):
-        # Lifecycle readiness is reported in health; operational logs receive
-        # only safe fixed error types through the bridge's existing sink.
-        if event != "gateway_ready":
-            emit_event(self._events, "worker_error", phase="worker", error_type=event)
+        if event == self._last_lifecycle:
+            return
+        self._last_lifecycle = event
+        if event == "gateway_ready":
+            emit_event(self._events, "gateway_state", component="gateway", transition="ready")
+        elif event == "gateway_disconnected":
+            emit_event(self._events, "gateway_state", component="gateway",
+                       transition="disconnected")
+        else:
+            emit_event(self._events, "worker_error", component="gateway", phase="worker",
+                       error_type=event)
 
     def start(self):
         if not self.enabled or self._stop.is_set() or (self._thread and self._thread.is_alive()):
@@ -642,6 +807,7 @@ class RequestGateway:
             target=self._run, name="discord-personal-requests", daemon=True
         )
         self._thread.start()
+        emit_event(self._events, "worker_lifecycle", component="gateway", transition="started")
 
     def _run(self):
         try:
@@ -652,19 +818,35 @@ class RequestGateway:
         finally:
             self._connected = False
             self._loop = None
+            emit_event(self._events, "worker_lifecycle", component="gateway", transition="stopped")
 
     async def _connect(self):
         discord = _sdk()
         self._loop = asyncio.get_running_loop()
-        handler = RequestCommands(self.client, self.state, self.store, event_sink=self._events)
+        handler = RequestCommands(
+            self.client, self.state, self.store, event_sink=self._events,
+            trial_store=self._trial_service.store if self._trial_service is not None else None,
+        )
         gateway = discord.Client(
             intents=discord.Intents.none(), allowed_mentions=discord.AllowedMentions.none()
         )
         self._gateway = gateway
+        gateway._request_handler = handler
         tree = discord.app_commands.CommandTree(gateway)
         tree.add_command(
             build_request_command_group(handler), guild=discord.Object(id=int(handler.guild))
         )
+        trial_handler = None
+        if self._trial_service is not None:
+            from .trial_commands import TrialCommands, build_trial_command_group
+
+            trial_handler = TrialCommands(
+                self.client, self.state, self._trial_service, event_sink=self._events,
+            )
+            tree.add_command(
+                build_trial_command_group(trial_handler),
+                guild=discord.Object(id=int(handler.guild)),
+            )
 
         async def mark_ready():
             if self._stop.is_set() or gateway.is_closed():
@@ -697,15 +879,77 @@ class RequestGateway:
             self._connected = False
             if not self._stop.is_set() and self._last_error != "gateway_identity":
                 self._last_error = "gateway_reconnecting"
+                self._event("gateway_disconnected")
 
         @gateway.event
         async def on_error(_event, *_args, **_kwargs):
             self._last_error = "gateway_event"
             self._event("gateway_error")
 
-        tree.on_error = handler.error
+        def is_trial(interaction):
+            data = getattr(interaction, "data", None)
+            return (
+                trial_handler is not None and isinstance(data, dict) and data.get("name") == "trial"
+            )
+
+        async def command_error(interaction, error):
+            await (trial_handler if is_trial(interaction) else handler).error(interaction, error)
+
+        tree.on_error = command_error
+
+        @gateway.event
+        async def on_interaction(interaction):
+            self._last_interaction_at = time.time()
+            custom_id = (getattr(interaction, "data", None) or {}).get("custom_id", "")
+            if trial_handler is not None and isinstance(custom_id, str) and custom_id.startswith(
+                "trial-ui:"
+            ):
+                parts = custom_id.split(":")
+                view = trial_handler._views.get(parts[1]) if len(parts) == 3 else None
+                if not interaction.response.is_done():
+                    if not self._connected or self._stop.is_set():
+                        await trial_handler.error(interaction)
+                    elif view is None or view.is_finished():
+                        await trial_handler.expired_controls(interaction)
+                return
+            if self._referral_handler is not None and self._referral_handler.accepts(interaction):
+                if self._connected and not self._stop.is_set():
+                    await self._referral_handler.handle(interaction)
+                else:
+                    await self._referral_handler.error(interaction, RuntimeError("reconnecting"))
+                return
+            if not handler.in_channel(interaction):
+                return
+            handler._trace(interaction, "received")
+            kind = getattr(getattr(interaction, "type", None), "value", None)
+            if kind not in {3, 5} or interaction.response.is_done():
+                return
+            custom_id = (getattr(interaction, "data", None) or {}).get("custom_id", "")
+            parts = custom_id.split(":") if isinstance(custom_id, str) else []
+            view = (
+                handler._views.get(parts[1])
+                if kind == 3 and len(parts) == 3 and parts[0] == "request-ui"
+                else None
+            )
+            if kind == 5:
+                view = (
+                    handler._modals.get(parts[1])
+                    if len(parts) == 2 and parts[0] == "request-modal"
+                    else None
+                )
+            if view is None or view.is_finished():
+                # SDK silently drops unknown/expired components, including old
+                # controls left visible after a process restart. Never replay them.
+                await handler.expired_controls(interaction)
 
         async def interaction_check(interaction):
+            if is_trial(interaction):
+                if not await trial_handler.guard(interaction):
+                    return False
+                if self._connected and not self._stop.is_set() and not gateway.is_closed():
+                    return True
+                await trial_handler.error(interaction)
+                return False
             if not await handler.channel_guard(interaction):
                 return False
             if self._connected and not self._stop.is_set() and not gateway.is_closed():
@@ -745,4 +989,5 @@ class RequestGateway:
             "connected": self._connected,
             "running": bool(self._thread and self._thread.is_alive()),
             "last_error": self._last_error,
+            "last_interaction_at": self._last_interaction_at,
         }

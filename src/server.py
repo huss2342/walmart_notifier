@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import hmac
 import ipaddress
 import json
@@ -32,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from discord_bridge.rolling_logs import RollingLogHandler  # noqa: E402
 
+from browser_diagnostics import MAX_FILE_BYTES as MAX_BROWSER_DIAGNOSTICS_BYTES  # noqa: E402
 from browser_diagnostics import BrowserDiagnosticsStore  # noqa: E402
 from config import (  # noqa: E402
     clear_user_rules,
@@ -46,6 +48,7 @@ from models import Item  # noqa: E402
 from notifiers import build_notifier  # noqa: E402
 from notifiers.discord import DiscordNotifier  # noqa: E402
 from notifiers.telegram import TelegramNotifier  # noqa: E402
+from operational_logging import OperationalLog, RequestLoggingMixin  # noqa: E402
 from pipeline import process  # noqa: E402
 from relay_settings import RelaySettingsStore  # noqa: E402
 from relay_watchdog import RelayWatchdog  # noqa: E402
@@ -77,7 +80,7 @@ LAST_NOTIFICATION_MARKER = "runtime:last-item-notification"
 BROWSER_HEARTBEAT_STALE_SECONDS = 180
 BROWSER_PHASES = frozenset({
     "passive", "waiting-verification", "ready", "sweeping", "waiting-user",
-    "ingest-retry", "complete", "unreachable",
+    "ingest-retry", "complete", "unreachable", "waiting-traffic",
 })
 # A loosened filter can match thousands of recorded items; cap the burst.
 RESCAN_ALERT_LIMIT = 25
@@ -335,6 +338,8 @@ def _browser_status_lines(browser: object) -> list[str]:
         )
     elif phase == "waiting-user":
         lines.append("Scanning waits until you stop clicking or scrolling for 30 seconds")
+    elif phase == "waiting-traffic":
+        lines.append("Waiting for Walmart high traffic to clear; scanning resumes automatically")
     elif phase == "ingest-retry":
         lines.append("⚠️ Item delivery is retrying; check the latest relay error below")
     return lines
@@ -404,7 +409,7 @@ def _telegram_status_text(runtime: RuntimeStatus, store: SeenStore) -> str:
     return "\n".join(lines)
 
 
-class Handler(BaseHTTPRequestHandler):
+class Handler(RequestLoggingMixin, BaseHTTPRequestHandler):
     server_version = "ReviewerNotifier/2.1"
 
     # Injected by serve().
@@ -430,7 +435,9 @@ class Handler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin", "")
         if origin.startswith("chrome-extension://") or origin.startswith("moz-extension://"):
             self.send_header("Access-Control-Allow-Origin", origin)
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Ingest-Token")
+            self.send_header("Access-Control-Allow-Headers",
+                             "Content-Type, X-Ingest-Token, X-Request-ID")
+            self.send_header("Access-Control-Expose-Headers", "X-Request-ID")
             self.send_header("Access-Control-Allow-Methods",
                              "GET, POST, PUT, DELETE, OPTIONS")
             # Compatibility with Chrome's older Private Network Access
@@ -448,6 +455,7 @@ class Handler(BaseHTTPRequestHandler):
         self._cors()
         self.end_headers()
         self.wfile.write(body)
+        self._http_response_bytes = len(body)
 
     def _authorized(self) -> bool:
         if not self.token:
@@ -472,9 +480,7 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def log_message(self, fmt: str, *args) -> None:
-        # Route through logging instead of stderr, and drop the noisy default
-        # per-request line -- the handlers below log what actually matters.
-        log.debug(fmt, *args)
+        super().log_message(fmt, *args)
 
     # --- routes -------------------------------------------------------------
 
@@ -498,12 +504,19 @@ class Handler(BaseHTTPRequestHandler):
             self._read_scanner_control(path)
             return
         if path in ("/", "/health"):
+            diagnostics = getattr(self, "browser_diagnostics", None)
             self._reply(200, {
                 "status": "ok",
                 "rules": [r.name for r in load_rules()],
                 "notifier": type(self.notifier).__name__,
                 "notifier_configured": type(self.notifier).__name__ != "NullNotifier",
                 "notifier_diagnostic": self._notifier_diagnostic(),
+                "logging": {
+                    "operations": self.operations.status()
+                    if self.operations is not None else {"enabled": False},
+                    "browser": diagnostics.health()
+                    if callable(getattr(diagnostics, "health", None)) else {},
+                },
                 "discord": (
                     self.notifier.health() if isinstance(self.notifier, DiscordNotifier) else None
                 ),
@@ -632,7 +645,9 @@ class Handler(BaseHTTPRequestHandler):
         if length > maximum:
             self._reply(413, "payload too large")
             return None
-        return self.rfile.read(length) if length else b""
+        body = self.rfile.read(length) if length else b""
+        self._http_request_bytes = len(body)
+        return body
 
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.split("?")[0].rstrip("/")
@@ -694,12 +709,19 @@ class Handler(BaseHTTPRequestHandler):
                 # Preserve local observation diagnostics without using personal
                 # dedupe as an admission gate for the independent Discord queue.
                 for item in items:
-                    self.store.mark_seen(item.item_id, item.title, item.value_usd)
+                    self.store.mark_seen(
+                        item.item_id, item.title, item.value_usd,
+                        category=item.category, url=item.url,
+                    )
             else:
                 summary = process(
-                    items, load_rules(), self.store, self.notifier, seed_only=seed_mode()
+                    items, load_rules(), self.store, self.notifier, seed_only=seed_mode(),
+                    event_sink=(lambda event, **fields: self.operations.emit(
+                        event, entry_point='http', **fields))
+                    if self.operations is not None else None,
                 )
         except Exception as exc:
+            self._http_error = type(exc).__name__
             self.runtime_status.record_failure(type(exc).__name__)
             if isinstance(self.notifier, DiscordNotifier):
                 if isinstance(exc, ValueError):
@@ -719,6 +741,10 @@ class Handler(BaseHTTPRequestHandler):
         # marker is recorded so it lands in the same write. This costs the
         # number of new records; the snapshot is rewritten only on compaction.
         self.store.flush()
+        if self.operations is not None:
+            counts = {'new', 'duplicates', 'queued', 'filtered', 'failed', 'pending', 'notified'}
+            self.operations.emit('intake_result', entry_point='http', items=summary.seen,
+                **{key: value for key, value in summary.as_dict().items() if key in counts})
         if summary.notified or summary.failed:
             log.info("Ingest: %s", json.dumps(summary.as_dict()))
         else:
@@ -784,11 +810,11 @@ class Handler(BaseHTTPRequestHandler):
     def _receive_browser_diagnostics(self) -> None:
         if not self._require_json():
             return
-        body = self._read_body(128 * 1024)
+        body = self._read_body(MAX_BROWSER_DIAGNOSTICS_BYTES)
         if body is None:
             return
         try:
-            self.browser_diagnostics.record_report(json.loads(body.decode("utf-8")))
+            receipt = self.browser_diagnostics.record_report(json.loads(body.decode("utf-8")))
         except (TypeError, ValueError, RecursionError):
             self._reply(400, {"error": "Invalid browser diagnostic report."})
             return
@@ -797,7 +823,8 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(500, {"error": "Could not persist browser diagnostics."})
             return
         # Diagnostic traffic must not reset relay staleness or send alerts.
-        self._reply(200, {"ok": True})
+        payload = {"ok": True, **({"receipt": receipt} if isinstance(receipt, dict) else {})}
+        self._reply(200, payload)
 
     def _rescan(self) -> None:
         """Re-apply the current rules to already-recorded items.
@@ -817,10 +844,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         if body:
             try:
-                data = json.loads(body.decode("utf-8"))
-                apply = bool(data.get("apply", False))
-                limit = int(data.get("limit", RESCAN_ALERT_LIMIT))
-            except (AttributeError, TypeError, ValueError):
+                data = parse_scanner_json(body)
+                if (type(data) is not dict or set(data) - {"apply", "limit"}
+                        or type(data.get("apply", False)) is not bool
+                        or type(data.get("limit", RESCAN_ALERT_LIMIT)) is not int):
+                    raise ValueError("Invalid rescan options")
+                apply = data.get("apply", False)
+                limit = data.get("limit", RESCAN_ALERT_LIMIT)
+            except (TypeError, ValueError):
                 self._reply(400, {"error": "body must be a JSON object"})
                 return
         limit = max(0, min(limit, RESCAN_ALERT_LIMIT))
@@ -832,20 +863,15 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         rules = load_rules()
-        matches: list[tuple[str, dict]] = []
+        matches: list[tuple[Item, dict]] = []
         for item_id, record in self.store.iter_records():
-            value = record.get("value_usd")
-            item = Item(
-                item_id=item_id,
-                title=str(record.get("title") or ""),
-                value_usd=value if isinstance(value, (int, float)) else None,
-            )
+            item = self._rescan_item(item_id, record)
             if first_match(item, rules) is not None:
-                matches.append((item_id, record))
+                matches.append((item, record))
 
         # Highest value first: if the alert budget is spent, spend it on the
         # items most worth knowing about.
-        matches.sort(key=lambda pair: pair[1].get("value_usd") or 0, reverse=True)
+        matches.sort(key=lambda pair: pair[0].value_usd or 0, reverse=True)
         payload = {
             "ok": True,
             "applied": apply,
@@ -853,9 +879,9 @@ class Handler(BaseHTTPRequestHandler):
             "matched": len(matches),
             "alert_limit": limit,
             "sample": [
-                {"item_id": item_id, "title": record.get("title"),
-                 "value_usd": record.get("value_usd")}
-                for item_id, record in matches[:10]
+                {"item_id": item.item_id, "title": record.get("title"),
+                 "value_usd": item.value_usd}
+                for item, record in matches[:10]
             ],
         }
 
@@ -868,19 +894,11 @@ class Handler(BaseHTTPRequestHandler):
 
         sent = 0
         failed = 0
-        for item_id, record in matches[:limit]:
-            value = record.get("value_usd")
-            item = Item(
-                item_id=item_id,
-                title=str(record.get("title") or ""),
-                value_usd=value if isinstance(value, (int, float)) else None,
-                url=f"https://www.walmart.com/ip/{item_id.removeprefix('ip-')}",
-                source="rescan",
-            )
+        for item, _record in matches[:limit]:
             try:
                 delivered = self.notifier.send(item, priority="high")
             except Exception:
-                log.exception("Rescan alert failed for %s.", item_id)
+                log.exception("Rescan alert failed for %s.", item.item_id)
                 delivered = False
             if delivered:
                 sent += 1
@@ -891,6 +909,33 @@ class Handler(BaseHTTPRequestHandler):
         payload["suppressed"] = max(0, len(matches) - limit)
         log.info("Rescan alerted on %d of %d matching records.", sent, len(matches))
         self._reply(200, payload)
+
+    @staticmethod
+    def _rescan_item(item_id: str, record: dict) -> Item:
+        """Recover rule inputs without pretending old records contain new fields."""
+        context = record.get("filter_context")
+        if not isinstance(context, dict):
+            context = {}
+
+        def text(field: str) -> str:
+            value = context.get(field, record.get(field, ""))
+            return value if isinstance(value, str) else ""
+
+        value = record.get("value_usd")
+        try:
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value < 0):
+                value = None
+        except OverflowError:
+            value = None
+        url = text("url")
+        number = item_id.removeprefix("ip-")
+        if not url and item_id.startswith("ip-") and number.isascii() and number.isdigit():
+            url = f"https://www.walmart.com/ip/{number}"
+        return Item(
+            item_id=item_id, title=text("title"), category=text("category"),
+            value_usd=value, url=url, source="rescan",
+        )
 
     def _notifier_diagnostic(self) -> str:
         """A notifier-owned message guaranteed not to contain its secrets."""
@@ -1022,6 +1067,21 @@ def _require_safe_bind(
         )
 
 
+def _log_service_errors(callback):
+    @functools.wraps(callback)
+    def logged(*args, **kwargs):
+        previous = Handler.operations
+        try:
+            return callback(*args, **kwargs)
+        except Exception as exc:
+            sink = Handler.operations
+            if sink is not None and sink is not previous:
+                sink.emit('service_error', component='backend', error_type=type(exc).__name__)
+            raise
+    return logged
+
+
+@_log_service_errors
 def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
           state_path: str | None = None) -> None:
     token = os.environ.get("INGEST_TOKEN", "").strip()
@@ -1039,6 +1099,8 @@ def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
         sys.stdout.reconfigure(line_buffering=True)
 
     Handler.store = SeenStore(state_path)
+    Handler.operations = OperationalLog(Handler.store.path.parent if Handler.store.path else None)
+    Handler.operations.emit('service_starting', component='backend')
     Handler.token = token
     Handler.notifier = build_notifier()
     Handler.runtime_status = RuntimeStatus(Handler.store)
@@ -1125,6 +1187,7 @@ def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
         print("\nLeave this running. Ctrl-C to stop.")
 
     try:
+        Handler.operations.emit('service_started', component='backend')
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nStopping.")
@@ -1136,6 +1199,7 @@ def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
             command_poller.stop()
         Handler.store.close()
         httpd.server_close()
+        Handler.operations.emit('service_stopped', component='backend')
 
 
 def main() -> None:

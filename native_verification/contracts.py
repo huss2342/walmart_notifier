@@ -1,21 +1,24 @@
 """Small shared contracts; no browser content or arbitrary desktop commands."""
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 
-HOST_NAME = "com.reviewer_item_relay.verification"
-PROTOCOL_VERSION = 1
-MAX_MESSAGE_BYTES = 16_384
-MAX_HOLD_MS = 30_000
-MIN_IDLE_MS = 5_000
-PREPARE_TTL_MS = 2_000
-
-ERROR_CODES = frozenset({
-    "unsupported-platform", "invalid-request", "invalid-origin", "invalid-window",
-    "helper-busy", "desktop-locked", "user-busy", "button-held", "focus-changed",
-    "window-changed", "viewport-mismatch", "target-obscured", "target-expired",
-    "user-input", "input-failed", "release-failed", "watchdog-unavailable",
-    "already-used", "not-prepared", "host-unavailable", "max-duration", "closed",
-})
+PROTOCOL = json.loads(Path(__file__).with_name("protocol.json").read_text(encoding="utf-8"))
+HOST_NAME = PROTOCOL["hostName"]
+EXTENSION_ORIGIN = PROTOCOL["extensionOrigin"]
+PROTOCOL_VERSION = PROTOCOL["version"]
+MAX_MESSAGE_BYTES = PROTOCOL["limits"]["messageBytes"]
+MAX_HOLD_MS = PROTOCOL["limits"]["holdMs"]
+MIN_IDLE_MS = PROTOCOL["limits"]["idleMs"]
+PREPARE_TTL_MS = PROTOCOL["limits"]["prepareTtlMs"]
+MAX_VIEWPORT = PROTOCOL["limits"]["viewportMax"]
+MIN_DPR = PROTOCOL["limits"]["dprMin"]
+MAX_DPR = PROTOCOL["limits"]["dprMax"]
+ERROR_CODES = frozenset(PROTOCOL["errorCodes"])
+OPS = frozenset(PROTOCOL["operations"])
+REQUEST_ID_PATTERN = PROTOCOL["requestIdPattern"]
+PREPARE_TOKEN_PATTERN = PROTOCOL["prepareTokenPattern"]
 
 
 class DesktopError(Exception):

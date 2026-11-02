@@ -61,7 +61,8 @@ _RULES = (
             "baby carrier|baby bottle|baby stroller|baby blanket|baby swing|baby bouncer|"
             "diaper bag|audio card|yoto card|tonies audio|board book|picture book|"
             "children s book|children s books|kids book|glove launcher toy|"
-            "launcher toy|hand puppets|boxing puppets|costume glove"
+            "launcher toy|hand puppets|boxing puppets|costume glove|toy figurine|"
+            "toy figurines|toy train|ride on train|kids electric train|train set"
         ),
     ),
     (
@@ -93,7 +94,9 @@ _RULES = (
             "chair leg floor protector|chair leg floor protectors|hat rack|cap organizer|"
             "clothes drying rack|clothing rack|clothes storage bags|clothesline|"
             "contact paper|wallpaper|stocking holder|stocking holders|rubber broom|travel pouches|"
-            "cleaning gloves|wrapping paper|gift wrap|odor eliminator spray"
+            "cleaning gloves|wrapping paper|gift wrap|odor eliminator spray|"
+            "artificial christmas tree|artificial indoor christmas tree|crib sheet|crib sheets|"
+            "mattress sheet|mattress sheets|beach towel clip|beach towel clips"
         ),
     ),
     (
@@ -116,7 +119,9 @@ _RULES = (
             "luggage tags|boxing gloves|baseball gloves|batting gloves|goalkeeper gloves|"
             "swim vest|float vest|life vest|life jacket|weighted vest|swim cap|swim caps|"
             "swimming cap|swimming caps|swim goggles|swimming goggles|thank you cards|"
-            "golf ball pouch|golf gloves|fishing gloves|gymnastics hand grips"
+            "golf ball pouch|golf gloves|fishing gloves|gymnastics hand grips|"
+            "electric bike|electric bicycle|bike tire|bike tires|bicycle tire|bicycle tires|"
+            "bike inner tube|bicycle inner tube"
         ),
     ),
     (
@@ -170,7 +175,8 @@ _RULES = (
         _terms(
             "phone case|phone cases|phone cover|phone charm|screen protector|tablet case|"
             "laptop sleeve|charging cable|usb cable|hdmi cable|camera lens|power bank|"
-            "power station|memory card|smart watch|wireless earbuds|gaming mouse|"
+            "power station|memory card|smart watch|gps sports watch|gps watch|sports watch|"
+            "wireless earbuds|gaming mouse|"
             "computer mouse|graphics card|pc power supply|"
             "nfc stickers|av cable|coaxial cable"
         ),
@@ -364,6 +370,7 @@ _HUMAN_APPAREL = re.compile(
     rf"\b(?:women|womens|men|mens|girls|boys|"
     rf"(?:dog|cat) (?:mom|dad)|adults?\b(?! {_PET_WEARER}\b))\b"
 )
+_GRAPHIC_GARMENT = re.compile(r"\bgraphic (?:t shirts?|tee shirts?|tees?|hoodies?|sweatshirts?)\b")
 
 
 def _normalize(value: str, limit: int) -> str:
@@ -389,6 +396,16 @@ def _title_evidence(title: str) -> list[tuple[int, str, str]]:
         evidence.append((150, "pets", pet_apparel.group()))
     if pet_recipient := _PET_APPAREL_RECIPIENT.search(normalized):
         evidence.append((150, "pets", pet_recipient.group()))
+    # A graphic garment depicts a watch/bike/tree; it is not that depicted product.
+    # Restrict this stronger garment evidence to the title's product phrase so
+    # a toy "wearing" a shirt or storage bags "for" shirts keep their purpose.
+    # A leading gift recipient labels the primary product rather than a feature.
+    product_phrase = re.sub(
+        r"\Agifts? for (?:men|women|moms?|dads?|boys|girls|adults?)\b", "", normalized
+    )
+    product_phrase = re.split(r"\b(?:for|with|wearing|featuring)\b", product_phrase, maxsplit=1)[0]
+    if graphic_garment := _GRAPHIC_GARMENT.search(product_phrase):
+        evidence.append((140, "clothing-accessories", graphic_garment.group()))
     for score, category, terms in _RULES:
         text = pet_padded if category == "pets" else padded
         matches = [term for term in terms if f" {term} " in text]

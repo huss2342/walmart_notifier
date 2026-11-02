@@ -1,11 +1,14 @@
 """Strict, private browser telemetry persists independently of item dedupe."""
 
+import gzip
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 
 import pytest
 
+import atomic_json
 import browser_diagnostics
 from browser_diagnostics import BrowserDiagnosticsStore
 
@@ -29,8 +32,208 @@ def report():
     }
 
 
+@pytest.mark.parametrize("event", ["auxiliary-target-retry", "auxiliary-target-skipped"])
+@pytest.mark.parametrize("failure_code", ["document-http-error", "navigation-scope-changed"])
+def test_recovery_identity_and_failure_code_survive_strict_boundary(event, failure_code):
+    incoming = report()
+    incoming["events"] = [{"at": NOW, "event": event, "lane": "departments",
+                           "tabId": 7, "generation": 9, "documentId": NOW - 1000,
+                           "round": 4, "targetIndex": 3, "attempt": 2,
+                           "failureCode": failure_code, "responseStatus": 520}]
+    store = BrowserDiagnosticsStore(":memory:")
+    store.record_report(incoming)
+    assert store.snapshot()["report"]["events"] == incoming["events"]
+
+
+@pytest.mark.parametrize("outcome", ["ready", "interrupted", "timeout", "http-error"])
+def test_navigation_outcome_survives_strict_boundary(outcome):
+    incoming = report()
+    incoming["events"] = [{"at": NOW, "event": "navigation-outcome", "outcome": outcome,
+                           "documentId": NOW - 1000, "targetPage": 4, "responseStatus": 520}]
+    store = BrowserDiagnosticsStore(":memory:")
+    store.record_report(incoming)
+    assert store.snapshot()["report"]["events"] == incoming["events"]
+
+
+@pytest.mark.parametrize("field,value", [("outcome", "private body"), ("responseStatus", 999)])
+def test_navigation_outcome_rejects_unbounded_values(field, value):
+    incoming = report()
+    incoming["events"] = [{"at": NOW, "event": "navigation-outcome", "outcome": "timeout",
+                           "responseStatus": 520, field: value}]
+    with pytest.raises(ValueError, match="Invalid browser diagnostics report"):
+        BrowserDiagnosticsStore(":memory:").record_report(incoming)
+
+
+def page_state_event():
+    return {
+        "at": NOW, "event": "page-state", "lane": "home", "stage": "empty-observed",
+        "tabId": 42, "generation": 7, "documentId": NOW - 1000, "page": 1,
+        "attempt": 2, "items": 0, "pages": 0, "elapsedMs": 30_000, "mode": "none",
+        "state": {
+            "readyState": "complete", "visibility": "hidden", "route": "reviewer",
+            "reviewerShell": True, "resultsLabel": False, "noResults": False,
+            "loading": True, "error": False, "signIn": False, "productLinks": 0,
+            "offerLines": 0, "pagerPresent": False, "renderedPage": 0,
+            "navigationType": "reload", "responseStatus": 200, "failedRequests": 2,
+            "readingFailures": 0, "readingWorkMs": 0, "queryIndex": 3, "queryCount": 100,
+        },
+    }
+
+
+@pytest.mark.parametrize("stage", ["empty-observed", "empty-confirmation", "fallback",
+                                  "unusable", "zero-page-complete", "recovered"])
+def test_page_state_survives_archive_snapshot_restart_without_duplicates(tmp_path, stage):
+    incoming = report()
+    event = page_state_event()
+    event["stage"] = stage
+    incoming["events"] = [event]
+    path = tmp_path / "browser-diagnostics.json"
+    BrowserDiagnosticsStore(path).record_report(incoming)
+    restarted = BrowserDiagnosticsStore(path)
+    assert restarted.snapshot()["report"] == incoming
+    restarted.record_report(incoming)
+    events = archived_events(path)
+    assert len(events) == 1
+    assert {key: value for key, value in events[0].items()
+            if key not in {"entry_point", "extensionVersion"}} == event
+    assert path.stat().st_size <= browser_diagnostics.MAX_FILE_BYTES
+
+
+@pytest.mark.parametrize("field", list(page_state_event()["state"]))
+@pytest.mark.parametrize("value", [None, [], {}, "private-value"])
+def test_page_state_rejects_malformed_required_facts(field, value):
+    incoming = report()
+    event = page_state_event()
+    event["state"][field] = value
+    incoming["events"] = [event]
+    with pytest.raises(ValueError, match="^Invalid browser diagnostics report$"):
+        BrowserDiagnosticsStore(":memory:").record_report(incoming)
+
+
+@pytest.mark.parametrize("field,maximum", [
+    ("productLinks", 10000), ("offerLines", 10000), ("renderedPage", 100000),
+    ("failedRequests", 10000), ("readingFailures", 10000), ("readingWorkMs", 10**15),
+    ("queryIndex", 10000), ("queryCount", 10000),
+])
+@pytest.mark.parametrize("value", [True, -1, 0.5, float("nan"), float("inf"), "overflow"])
+def test_page_state_rejects_noninteger_and_out_of_range_counts(field, maximum, value):
+    incoming = report()
+    event = page_state_event()
+    event["state"][field] = maximum + 1 if value == "overflow" else value
+    incoming["events"] = [event]
+    with pytest.raises(ValueError, match="^Invalid browser diagnostics report$"):
+        BrowserDiagnosticsStore(":memory:").record_report(incoming)
+
+
+@pytest.mark.parametrize("value", [True, -1, 1, 99, 600, 200.5])
+def test_page_state_rejects_invalid_response_status(value):
+    incoming = report()
+    event = page_state_event()
+    event["state"]["responseStatus"] = value
+    incoming["events"] = [event]
+    with pytest.raises(ValueError, match="^Invalid browser diagnostics report$"):
+        BrowserDiagnosticsStore(":memory:").record_report(incoming)
+
+
+@pytest.mark.parametrize("value", [0, 100, 599])
+def test_page_state_accepts_unknown_response_status_and_valid_boundaries(value):
+    incoming = report()
+    event = page_state_event()
+    event["state"].update(productLinks=10000, offerLines=10000, renderedPage=100000,
+                          failedRequests=10000, readingFailures=10000, readingWorkMs=10**15,
+                          queryIndex=10000, queryCount=10000, responseStatus=value)
+    incoming["events"] = [event]
+    store = BrowserDiagnosticsStore(":memory:")
+    store.record_report(incoming)
+    assert store.snapshot()["report"] == incoming
+
+
+@pytest.mark.parametrize("field", ["reviewerShell", "resultsLabel", "noResults", "loading",
+                                  "error", "signIn", "pagerPresent"])
+@pytest.mark.parametrize("value", [0, 1])
+def test_page_state_does_not_coerce_numbers_to_boolean_facts(field, value):
+    incoming = report()
+    event = page_state_event()
+    event["state"][field] = value
+    incoming["events"] = [event]
+    with pytest.raises(ValueError):
+        BrowserDiagnosticsStore(":memory:").record_report(incoming)
+
+
+@pytest.mark.parametrize("field", ["lane", "stage", "state"])
+def test_page_state_requires_its_context(field):
+    incoming = report()
+    event = page_state_event()
+    del event[field]
+    incoming["events"] = [event]
+    with pytest.raises(ValueError):
+        BrowserDiagnosticsStore(":memory:").record_report(incoming)
+
+
+def test_page_state_rejects_missing_unknown_and_private_state_fields():
+    for field in page_state_event()["state"]:
+        incoming = report()
+        event = page_state_event()
+        del event["state"][field]
+        incoming["events"] = [event]
+        with pytest.raises(ValueError):
+            BrowserDiagnosticsStore(":memory:").record_report(incoming)
+    for field in ("url", "text", "html", "account", "unknown"):
+        incoming = report()
+        event = page_state_event()
+        event["state"][field] = "private"
+        incoming["events"] = [event]
+        with pytest.raises(ValueError):
+            BrowserDiagnosticsStore(":memory:").record_report(incoming)
+
+
+@pytest.mark.parametrize("field", ["state", "stage"])
+def test_page_state_context_cannot_attach_to_older_events(field):
+    incoming = report()
+    incoming["events"][0][field] = page_state_event()[field]
+    with pytest.raises(ValueError):
+        BrowserDiagnosticsStore(":memory:").record_report(incoming)
+
+
+def test_page_state_history_remains_under_the_existing_report_bound():
+    incoming = report()
+    incoming["events"] = [page_state_event() for _ in range(browser_diagnostics.MAX_EVENTS)]
+    store = BrowserDiagnosticsStore(":memory:")
+    store.record_report(incoming)
+    assert len(store.snapshot()["report"]["events"]) == browser_diagnostics.MAX_EVENTS
+    assert len(json.dumps(store.snapshot()).encode()) < browser_diagnostics.MAX_FILE_BYTES
+
+
+def assert_snapshot_files(path):
+    assert {entry.name for entry in path.parent.iterdir()} == {
+        path.name, "browser-diagnostic-events.jsonl", ".browser-diagnostic-events.jsonl.lock",
+    }
+
+
 def test_empty_memory_store_has_no_report():
     assert BrowserDiagnosticsStore(":memory:").snapshot() == {"receivedAt": 0, "report": None}
+
+
+@pytest.mark.parametrize("event", ["focus-granted", "focus-denied", "focus-released",
+                                  "pager-clamped", "page-repeat"])
+def test_performance_events_survive_restart_without_private_context(tmp_path, event):
+    incoming = report()
+    detail = {"at": NOW, "event": event, "page": 85, "targetPage": 25,
+              "durationMs": 203, "elapsedMs": 5000}
+    if event.startswith("focus-"):
+        detail.update(operation="page-scroll", reason="waiting-turn")
+    incoming["events"] = [detail]
+    path = tmp_path / "browser-diagnostics.json"
+    BrowserDiagnosticsStore(path).record_report(incoming)
+    assert BrowserDiagnosticsStore(path).snapshot()["report"] == incoming
+
+
+@pytest.mark.parametrize("operation", ["private-operation", True, 1, None])
+def test_focus_events_reject_unrecognized_operations(operation):
+    incoming = report()
+    incoming["events"] = [{"at": NOW, "event": "focus-denied", "operation": operation}]
+    with pytest.raises(ValueError):
+        BrowserDiagnosticsStore(":memory:").record_report(incoming)
 
 
 def test_tab_recovery_event_survives_snapshot_restart(tmp_path):
@@ -152,7 +355,7 @@ def test_report_survives_restart_as_one_bounded_snapshot(tmp_path):
     assert json.loads(path.read_text(encoding="utf-8")) == expected
     assert BrowserDiagnosticsStore(path).snapshot() == expected
     assert path.stat().st_size <= 128 * 1024
-    assert list(path.parent.iterdir()) == [path]
+    assert_snapshot_files(path)
 
 
 def test_record_and_snapshot_do_not_expose_mutable_state():
@@ -340,21 +543,23 @@ def test_three_hundred_events_are_allowed(tmp_path):
     assert path.stat().st_size <= 128 * 1024
 
 
-def test_oversized_valid_metadata_is_rejected():
+def test_oversized_valid_metadata_is_rejected_before_retention(monkeypatch):
     incoming = report()
     fields = dict.fromkeys([
         "tabId", "generation", "page", "targetPage", "delayMs", "count", "pages",
         "durationMs", "attempt", "items", "new", "duplicates", "matched", "notified",
         "failed", "pending",
     ], 1_000_000_000_000_000)
-    incoming["events"] = [{"at": NOW, "event": "page-delivered", **fields}] * 300
+    incoming["events"] = [{"at": 0, "event": "page-delivered", **fields}] * 300
+    encoded = json.dumps({"receivedAt": 0, "report": incoming}, separators=(",", ":")).encode()
+    monkeypatch.setattr(browser_diagnostics, "MAX_FILE_BYTES", len(encoded) - 1)
     with pytest.raises(ValueError):
         BrowserDiagnosticsStore(":memory:").record_report(incoming)
 
 
 @pytest.mark.parametrize("contents", [
     "private invalid payload", "[]", '{"receivedAt": 1, "report": null}',
-    '{"receivedAt":true,"report":{}}', "x" * (128 * 1024 + 1),
+    '{"receivedAt":true,"report":{}}', "x" * (1024 * 1024 + 1),
 ], ids=["invalid-json", "not-object", "null-report", "boolean-time", "oversized-file"])
 def test_corrupt_or_oversized_snapshot_loads_empty_without_disclosing_payload(
     tmp_path, caplog, contents,
@@ -387,7 +592,7 @@ def test_failed_atomic_replace_preserves_prior_memory_and_disk(tmp_path, monkeyp
     def fail_replace(source, destination):
         raise OSError("disk unavailable")
 
-    monkeypatch.setattr(browser_diagnostics.os, "replace", fail_replace)
+    monkeypatch.setattr(atomic_json.os, "replace", fail_replace)
     incoming = report()
     incoming["verification"]["count"] = 2
     with pytest.raises(OSError):
@@ -395,7 +600,7 @@ def test_failed_atomic_replace_preserves_prior_memory_and_disk(tmp_path, monkeyp
 
     assert store.snapshot() == before_memory
     assert path.read_bytes() == before_disk
-    assert list(tmp_path.iterdir()) == [path]
+    assert_snapshot_files(path)
 
 
 def test_invalid_new_report_does_not_replace_a_valid_snapshot(tmp_path):
@@ -426,7 +631,7 @@ def test_concurrent_writes_leave_a_complete_restartable_snapshot(tmp_path):
         list(executor.map(record_count, range(30)))
 
     assert BrowserDiagnosticsStore(path).snapshot() == store.snapshot()
-    assert list(tmp_path.iterdir()) == [path]
+    assert_snapshot_files(path)
 
 
 def scan_metrics():
@@ -498,3 +703,255 @@ def test_zero_transition_metrics_use_null_rate_and_old_reports_remain_compatible
     assert BrowserDiagnosticsStore(path).snapshot()["report"] == incoming
     store.record_report(report())
     assert "metrics" not in BrowserDiagnosticsStore(path).snapshot()["report"]
+
+
+def card_event():
+    return {
+        "at": NOW, "event": "card-extraction", "lane": "keywords", "page": 2,
+        "acceptedCount": 1, "rejectedCount": 1, "variantCount": 0,
+        "outOfStockCount": 1, "missingValueCount": 0,
+        "samples": [{"itemId": "ip-21279955832", "decision": "accepted",
+                     "cardFound": True, "free": True, "outOfStock": False, "valueCents": 64999},
+                    {"itemId": "ip-12345678", "decision": "out-of-stock",
+                     "cardFound": True, "free": True, "outOfStock": True, "valueCents": None}],
+    }
+
+
+def archived_events(path):
+    return [json.loads(line) for line in path.with_name("browser-diagnostic-events.jsonl")
+            .read_text(encoding="utf-8").splitlines()]
+
+
+def test_card_evidence_survives_snapshot_and_safe_event_archive_restart(tmp_path):
+    incoming = report()
+    incoming["events"] = [card_event()]
+    path = tmp_path / "browser-diagnostics.json"
+    BrowserDiagnosticsStore(path).record_report(incoming)
+
+    assert BrowserDiagnosticsStore(path).snapshot()["report"] == incoming
+    assert archived_events(path) == [{
+        "entry_point": "browser-diagnostics", "extensionVersion": incoming["extensionVersion"],
+        **card_event(),
+    }]
+
+
+@pytest.mark.parametrize("field,value", [
+    ("itemId", "https://walmart.com/ip/12345678?token=private"),
+    ("itemId", "ip-12345"), ("itemId", "ip-" + "1" * 21),
+    ("itemId", "ip-１２３４５６"), ("itemId", 12345678),
+    ("decision", "private error text"), ("cardFound", 1), ("cardFound", None),
+    ("free", "true"), ("free", 1), ("outOfStock", "false"),
+    ("valueCents", True), ("valueCents", -1), ("valueCents", 2.5),
+    ("valueCents", float("inf")), ("valueCents", 1e16),
+    ("url", "https://example.com/private"), ("title", "private DOM text"),
+])
+def test_card_sample_rejects_private_or_malformed_fields(field, value):
+    incoming = report()
+    incoming["events"] = [card_event()]
+    incoming["events"][0]["samples"][0][field] = value
+    with pytest.raises(ValueError, match="^Invalid browser diagnostics report$"):
+        BrowserDiagnosticsStore(":memory:").record_report(incoming)
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda event: event.update(samples=event["samples"] * 7),
+    lambda event: event.update(samples=None),
+    lambda event: event["samples"][0].pop("free"),
+    lambda event: event.update(lane="private-keyword"),
+    lambda event: event.update(acceptedCount=True),
+    lambda event: event.update(rejectedCount=-1),
+    lambda event: event.update(variantCount=1.5),
+    lambda event: event.update(outOfStockCount="2"),
+    lambda event: event.update(missingValueCount=float("nan")),
+    lambda event: event.pop("samples"),
+    lambda event: event.pop("lane"),
+])
+def test_card_evidence_rejects_bad_shapes_counts_and_unknown_lanes(mutation):
+    incoming = report()
+    incoming["events"] = [card_event()]
+    mutation(incoming["events"][0])
+    with pytest.raises(ValueError, match="^Invalid browser diagnostics report$"):
+        BrowserDiagnosticsStore(":memory:").record_report(incoming)
+
+
+def test_all_fixed_card_decisions_and_nullable_evidence_are_supported():
+    incoming = report()
+    event = card_event()
+    event["samples"] = [{"itemId": "ip-12345678", "decision": decision,
+                         "cardFound": False, "free": None, "outOfStock": None, "valueCents": None}
+                        for decision in ("accepted", "out-of-stock", "variant", "card-unavailable",
+                                         "not-free", "missing-title")]
+    incoming["events"] = [event]
+    store = BrowserDiagnosticsStore(":memory:")
+    store.record_report(incoming)
+    assert store.snapshot()["report"] == incoming
+
+
+def test_auxiliary_lane_events_keep_fixed_metadata_without_raw_failure_strings(tmp_path):
+    incoming = report()
+    incoming["events"] = [{"at": NOW, "event": event, "lane": lane, "tabId": 11,
+                           "page": 3, "reason": "unusable"}
+                          for event, lane in [("auxiliary-target-start", "departments"),
+                                              ("auxiliary-page-delivered", "keywords"),
+                                              ("auxiliary-target-skipped", "brands"),
+                                              ("auxiliary-error", "home")]]
+    path = tmp_path / "snapshot.json"
+    BrowserDiagnosticsStore(path).record_report(incoming)
+    assert BrowserDiagnosticsStore(path).snapshot()["report"] == incoming
+    incoming["events"][0]["target"] = "private query and URL"
+    with pytest.raises(ValueError, match="^Invalid browser diagnostics report$"):
+        BrowserDiagnosticsStore(":memory:").record_report(incoming)
+
+
+def test_auxiliary_failure_code_preserves_only_the_shared_safe_enum(tmp_path):
+    incoming = report()
+    incoming["events"] = [{"at": NOW, "event": event, "lane": "keywords",
+                           "failureCode": "selection-render-timeout"}
+                          for event in ("auxiliary-target-skipped", "auxiliary-error")]
+    path = tmp_path / "snapshot.json"
+    BrowserDiagnosticsStore(path).record_report(incoming)
+    assert BrowserDiagnosticsStore(path).snapshot()["report"] == incoming
+    for event, code in [("auxiliary-error", "private error and URL"),
+                        ("auxiliary-target-start", "selection-render-timeout"),
+                        ("page-loaded", "none")]:
+        incoming["events"] = [{"at": NOW, "event": event, "lane": "home", "failureCode": code}]
+        with pytest.raises(ValueError, match="^Invalid browser diagnostics report$"):
+            BrowserDiagnosticsStore(":memory:").record_report(incoming)
+
+
+def test_large_bounded_card_history_fits_one_mebibyte_snapshot(tmp_path):
+    incoming = report()
+    event = card_event()
+    event["samples"] *= 6
+    incoming["events"] = [{**deepcopy(event), "page": page} for page in range(300)]
+    path = tmp_path / "snapshot.json"
+    BrowserDiagnosticsStore(path).record_report(incoming)
+    assert 128 * 1024 < path.stat().st_size <= 1024 * 1024
+    assert BrowserDiagnosticsStore(path).snapshot()["report"] == incoming
+
+
+def test_unchanged_mirrors_and_worker_restarts_do_not_repeat_archived_events(tmp_path):
+    path = tmp_path / "snapshot.json"
+    incoming = report()
+    incoming["events"] = [card_event()]
+    store = BrowserDiagnosticsStore(path)
+    store.record_report(incoming)
+    store.record_report(incoming)
+    BrowserDiagnosticsStore(path).record_report(incoming)
+    assert len(archived_events(path)) == 1
+    next_report = report()
+    next_report["events"] = [card_event(), {"at": NOW, "event": "page-delivered", "items": 2}]
+    BrowserDiagnosticsStore(path).record_report(next_report)
+    assert len(archived_events(path)) == 2
+    BrowserDiagnosticsStore(path).record_report(report())
+    assert archived_events(path)[0]["samples"] == card_event()["samples"], (
+        "Snapshot replacement must retain prior evidence"
+    )
+
+
+@pytest.mark.parametrize("empty_archive", [False, True])
+def test_first_mirror_archives_retained_history_without_a_populated_archive(
+    tmp_path, empty_archive,
+):
+    path = tmp_path / "snapshot.json"
+    incoming = report()
+    path.write_text(json.dumps({"receivedAt": NOW, "report": incoming}), encoding="utf-8")
+    if empty_archive:
+        path.with_name("browser-diagnostic-events.jsonl").write_bytes(b"")
+    BrowserDiagnosticsStore(path).record_report(incoming)
+    assert len(archived_events(path)) == 1
+    BrowserDiagnosticsStore(path).record_report(incoming)
+    assert len(archived_events(path)) == 1
+
+
+def test_archive_failure_cannot_acknowledge_or_replace_a_snapshot(tmp_path):
+    class Archive:
+        fail = False
+
+        def append(self, encoded):
+            if self.fail:
+                raise OSError("archive unavailable")
+
+    archive = Archive()
+    path = tmp_path / "snapshot.json"
+    store = BrowserDiagnosticsStore(path, archive=archive)
+    store.record_report(report())
+    before_memory, before_disk = store.snapshot(), path.read_bytes()
+    incoming = report()
+    incoming["events"] = [card_event()]
+    archive.fail = True
+    with pytest.raises(OSError, match="archive unavailable"):
+        store.record_report(incoming)
+    assert store.snapshot() == before_memory
+    assert path.read_bytes() == before_disk
+
+
+def test_snapshot_write_failure_keeps_archived_evidence_without_duplicate_retry(
+    tmp_path, monkeypatch,
+):
+    path = tmp_path / "snapshot.json"
+    store = BrowserDiagnosticsStore(path)
+    store.record_report(report())
+    before_memory, before_disk = store.snapshot(), path.read_bytes()
+    incoming = report()
+    incoming["events"] = [card_event()]
+    replace = atomic_json.os.replace
+
+    def fail_replace(source, destination):
+        raise OSError("snapshot unavailable")
+
+    monkeypatch.setattr(atomic_json.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="snapshot unavailable"):
+        store.record_report(incoming)
+    assert store.snapshot() == before_memory
+    assert path.read_bytes() == before_disk
+    assert len(archived_events(path)) == 2
+    monkeypatch.setattr(atomic_json.os, "replace", replace)
+    store.record_report(incoming)
+    assert len(archived_events(path)) == 2
+
+
+def test_partial_archive_append_cannot_corrupt_a_retried_diagnostic_report(tmp_path, monkeypatch):
+    path = tmp_path / "snapshot.json"
+    store = BrowserDiagnosticsStore(path)
+    store.record_report(report())
+    before_memory, before_disk = store.snapshot(), path.read_bytes()
+    before_events = archived_events(path)
+    incoming = report()
+    incoming["events"] = [card_event()]
+    write = os.write
+    calls = 0
+
+    def short_then_fail(descriptor, data):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return write(descriptor, data[:16])
+        raise OSError("archive append unavailable")
+
+    monkeypatch.setattr(os, "write", short_then_fail)
+    with pytest.raises(OSError, match="archive append unavailable"):
+        store.record_report(incoming)
+    assert store.snapshot() == before_memory
+    assert path.read_bytes() == before_disk
+    assert archived_events(path) == before_events
+    monkeypatch.setattr(os, "write", write)
+    store.record_report(incoming)
+    assert store.snapshot()["report"] == incoming
+    events = archived_events(path)
+    for archive in path.parent.glob("browser-diagnostic-events.jsonl.*.gz"):
+        events.extend(
+            json.loads(line) for line in gzip.decompress(archive.read_bytes()).splitlines()
+        )
+    assert len(events) == 2
+    assert [event for event in events if event["event"] == "card-extraction"][0]["samples"] == (
+        card_event()["samples"]
+    )
+
+
+def test_unresolved_coverage_is_distinct_from_complete_and_survives_restart(tmp_path):
+    incoming = report()
+    incoming['events'] = [{'at': NOW, 'event': 'coverage-unresolved', 'page': 100, 'pages': 100}]
+    path = tmp_path / 'browser-diagnostics.json'
+    BrowserDiagnosticsStore(path).record_report(incoming)
+    assert BrowserDiagnosticsStore(path).snapshot()['report'] == incoming

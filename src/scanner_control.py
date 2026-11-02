@@ -10,14 +10,14 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
-import tempfile
 import threading
 import time
 import unicodedata
 from copy import deepcopy
 from pathlib import Path
+
+from atomic_json import write_atomic_json
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +45,15 @@ _SETTINGS_KEYS = frozenset(
         "verificationNativeEnabled",
         "pathPattern",
     }
+)
+_OPTIONAL_SETTINGS_KEYS = frozenset(
+    {"auxiliaryPriority", "auxiliaryPriorityQueries", "auxiliaryPriorityRefreshMinutes"}
+)
+# Match JavaScript String.trim() for the new cross-runtime priority contract.
+# Raw Cc/Cs checks still reject control characters before this normalization.
+_PRIORITY_QUERY_WHITESPACE = (
+    "\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005"
+    "\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
 )
 _COMMAND_KEYS = frozenset({"schemaVersion", "restartHomeId", "restartAdditionalId"})
 _STATUS_KEYS = frozenset(
@@ -93,6 +102,9 @@ _LANE_KEYS = frozenset(
         "owned",
         "enabled",
     }
+)
+_LANE_OPTIONAL_NUMBERS = frozenset(
+    {"attemptedTargets", "unresolvedTargets", "emptyTargets", "startedAt", "completedAt"}
 )
 _RUNTIME_KEYS = frozenset(
     {
@@ -170,6 +182,7 @@ PRIMARY_PHASES = frozenset(
         "recovering",
         "transient-end-retry",
         "waiting-content",
+        "waiting-traffic",
         "waiting-navigation",
         "waiting-page-change",
         "waiting-target-change",
@@ -202,6 +215,7 @@ _COMPONENTS = frozenset(
         "primary",
         "departments",
         "keywords",
+        "priority",
         "verification",
         "commands",
     }
@@ -237,6 +251,11 @@ _FAILURE_CODES = frozenset(
         "selection-document-timeout",
         "selection-bind-failed",
         "selection-unconfirmed",
+        "document-http-error",
+        "render-timeout",
+        "render-opportunity-timeout",
+        "navigation-timeout",
+        "navigation-scope-changed",
     }
 )
 _IDENTIFIER = re.compile(r"[A-Za-z0-9_-]{1,64}")
@@ -323,7 +342,7 @@ def parse_json(encoded: bytes | str) -> object:
 
 
 def validate_settings(value: object) -> dict:
-    data = _object(value, _SETTINGS_KEYS, INVALID_SETTINGS)
+    data = _object(value, _SETTINGS_KEYS, INVALID_SETTINGS, optional=_OPTIONAL_SETTINGS_KEYS)
     _schema(data, INVALID_SETTINGS)
     clean = {"schemaVersion": 1}
     for key in _SETTINGS_KEYS - {"schemaVersion", "auxiliaryKeywordQueries", "pathPattern"}:
@@ -331,7 +350,7 @@ def validate_settings(value: object) -> dict:
     incoming = data["auxiliaryKeywordQueries"]
     clean["auxiliaryKeywordQueries"] = None
     if incoming is not None:
-        if type(incoming) is not list or len(incoming) > 100:
+        if type(incoming) is not list or len(incoming) > 128:
             raise ValueError(INVALID_SETTINGS)
         queries = []
         seen = set()
@@ -345,6 +364,33 @@ def validate_settings(value: object) -> dict:
             seen.add(folded)
             queries.append(query)
         clean["auxiliaryKeywordQueries"] = queries
+    if "auxiliaryPriority" in data:
+        clean["auxiliaryPriority"] = _boolean(data["auxiliaryPriority"], INVALID_SETTINGS)
+    if "auxiliaryPriorityRefreshMinutes" in data:
+        refresh = _integer(data["auxiliaryPriorityRefreshMinutes"], INVALID_SETTINGS, 120)
+        if refresh < 1:
+            raise ValueError(INVALID_SETTINGS)
+        clean["auxiliaryPriorityRefreshMinutes"] = refresh
+    if "auxiliaryPriorityQueries" in data:
+        incoming = data["auxiliaryPriorityQueries"]
+        clean["auxiliaryPriorityQueries"] = None
+        if incoming is not None:
+            if type(incoming) is not list or len(incoming) > 24:
+                raise ValueError(INVALID_SETTINGS)
+            queries = []
+            seen = set()
+            for value in incoming:
+                if type(value) is not str or any(
+                    unicodedata.category(char) in {"Cc", "Cs"} for char in value
+                ):
+                    raise ValueError(INVALID_SETTINGS)
+                query = _text(value.strip(_PRIORITY_QUERY_WHITESPACE), 80, INVALID_SETTINGS)
+                folded = query.lower()
+                if folded in seen:
+                    raise ValueError(INVALID_SETTINGS)
+                seen.add(folded)
+                queries.append(query)
+            clean["auxiliaryPriorityQueries"] = queries
     clean["pathPattern"] = _text(data["pathPattern"], 200, INVALID_SETTINGS)
     _encode(clean, MAX_SETTINGS_BYTES, INVALID_SETTINGS)
     return clean
@@ -401,15 +447,20 @@ def validate_status(value: object) -> dict:
         }
     )
     lanes = data["lanes"]
-    if type(lanes) is not list or len(lanes) > 2:
+    if type(lanes) is not list or len(lanes) > 3:
         raise ValueError(INVALID_STATUS)
     clean_lanes = []
     seen = set()
     for value in lanes:
         lane = _object(
-            value, _LANE_KEYS, INVALID_STATUS, optional=frozenset({"lastFailureCode", "runtime"})
+            value,
+            _LANE_KEYS,
+            INVALID_STATUS,
+            optional=_LANE_OPTIONAL_NUMBERS | {"lastFailureCode", "runtime"},
         )
-        name = _choice(lane["lane"], frozenset({"departments", "keywords"}), INVALID_STATUS)
+        name = _choice(
+            lane["lane"], frozenset({"departments", "keywords", "priority"}), INVALID_STATUS
+        )
         if name in seen:
             raise ValueError(INVALID_STATUS)
         seen.add(name)
@@ -430,6 +481,12 @@ def validate_status(value: object) -> dict:
                 "owned": _boolean(lane["owned"], INVALID_STATUS),
                 "enabled": _boolean(lane["enabled"], INVALID_STATUS),
                 "lastErrorCode": _choice(lane["lastErrorCode"], _LAST_ERRORS, INVALID_STATUS),
+            }
+        )
+        clean.update(
+            {
+                key: _integer(lane[key], INVALID_STATUS)
+                for key in _LANE_OPTIONAL_NUMBERS & lane.keys()
             }
         )
         if "lastFailureCode" in lane:
@@ -595,27 +652,10 @@ class _AtomicJsonStore:
             return deepcopy(clean)
 
     def _write(self, encoded: bytes) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                dir=self.path.parent,
-                prefix=f".{self.path.name}.",
-                suffix=".tmp",
-                mode="wb",
-                delete=False,
-            ) as handle:
-                temporary = Path(handle.name)
-                handle.write(encoded)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, self.path)
-        finally:
-            if temporary is not None:
-                try:
-                    temporary.unlink(missing_ok=True)
-                except OSError:
-                    log.warning("Scanner control temporary file cleanup unavailable")
+        write_atomic_json(
+            self.path, encoded, logger=log,
+            cleanup_warning="Scanner control temporary file cleanup unavailable",
+        )
 
 
 class ScannerSettingsStore(_AtomicJsonStore):

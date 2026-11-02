@@ -13,6 +13,32 @@ import urllib.error
 import urllib.request
 from collections import deque
 from contextlib import suppress
+from enum import StrEnum
+
+
+class DeliveryOutcome(StrEnum):
+    """Evidence about a write, distinct from the caller entering its send phase.
+
+    Only the transport can prove NOT_SUBMITTED. Unclassified external errors
+    remain UNKNOWN; callers must never infer rejection from a missing response.
+    """
+
+    NOT_SUBMITTED = "not_submitted"
+    REJECTED = "rejected"
+    ACCEPTED = "accepted"
+    UNKNOWN = "unknown"
+
+    @property
+    def may_have_been_accepted(self):
+        return self in {self.ACCEPTED, self.UNKNOWN}
+
+
+TRANSPORT_ERROR_TYPES = frozenset({
+    "TimeoutError", "gaierror", "SSLError", "ConnectionError", "ConnectionResetError",
+    "ConnectionAbortedError", "BrokenPipeError", "RemoteDisconnected", "BadStatusLine",
+    "IncompleteRead", "HTTPException", "URLError", "UnicodeDecodeError", "JSONDecodeError",
+    "ValueError", "OSError", "other",
+})
 
 
 class DiscordError(Exception):
@@ -27,6 +53,8 @@ class DiscordError(Exception):
         provider_code: int | None = None,
         request_bytes: int | None = None,
         response_bytes: int | None = None,
+        outcome: DeliveryOutcome | None = None,
+        transport_error: str | None = None,
     ):
         super().__init__(message)
         self.status = status
@@ -36,6 +64,17 @@ class DiscordError(Exception):
         self.provider_code = provider_code
         self.request_bytes = request_bytes
         self.response_bytes = response_bytes
+        self.transport_error = transport_error if isinstance(transport_error, str) and (
+            transport_error in TRANSPORT_ERROR_TYPES
+        ) else None
+        if ambiguous:
+            self.outcome = DeliveryOutcome.UNKNOWN
+        else:
+            self.outcome = outcome or (
+                DeliveryOutcome.UNKNOWN
+                if status is None or status >= 500
+                else DeliveryOutcome.REJECTED
+            )
 
 
 def encode_payload(payload: dict) -> bytes:
@@ -237,7 +276,9 @@ class DiscordClient:
         route, major = _route_identity(method, path)
         with self._lock:
             if self._closed:
-                raise DiscordError("Discord client is closed")
+                raise DiscordError(
+                    "Discord client is closed", outcome=DeliveryOutcome.NOT_SUBMITTED
+                )
             return self._wait_until(route, major, time.monotonic())[0]
 
     def cooldown_delay(self, method: str, path: str) -> float:
@@ -250,7 +291,9 @@ class DiscordClient:
         route, major = _route_identity(method, path)
         with self._lock:
             if self._closed:
-                raise DiscordError("Discord client is closed")
+                raise DiscordError(
+                    "Discord client is closed", outcome=DeliveryOutcome.NOT_SUBMITTED
+                )
             return max(0.0, self._cooldown_until(route, major) - time.monotonic())
 
     def close(self):
@@ -361,12 +404,18 @@ class DiscordClient:
         }
         with self._lock:
             if self._closed:
-                raise DiscordError("Discord client is closed")
+                raise DiscordError(
+                    "Discord client is closed", outcome=DeliveryOutcome.NOT_SUBMITTED
+                )
             now = time.monotonic()
             wait, global_limit = self._wait_until(route, major, now)
             if wait:
                 raise DiscordError(
-                    "Discord rate limit", status=429, retry_after=wait, global_limit=global_limit
+                    "Discord rate limit",
+                    status=429,
+                    retry_after=wait,
+                    global_limit=global_limit,
+                    outcome=DeliveryOutcome.NOT_SUBMITTED,
                 )
             while self._started and self._started[0] <= now - self._GLOBAL_WINDOW:
                 self._started.popleft()
@@ -480,7 +529,7 @@ class DiscordClient:
                 request_bytes=len(data) if data is not None else 0,
                 response_bytes=len(body),
             )
-        except (OSError, urllib.error.URLError, ValueError, http.client.HTTPException):
+        except (OSError, urllib.error.URLError, ValueError, http.client.HTTPException) as exc:
             timed_out = deadline is not None and (
                 deadline.expired or time.monotonic() >= deadline.until
             )
@@ -489,6 +538,10 @@ class DiscordClient:
                 if timed_out
                 else "Discord connection or response failed",
                 ambiguous=submitted and method != "GET",
+                outcome=DeliveryOutcome.UNKNOWN if submitted else DeliveryOutcome.NOT_SUBMITTED,
+                transport_error="TimeoutError" if timed_out else (
+                    type(exc).__name__ if type(exc).__name__ in TRANSPORT_ERROR_TYPES else "other"
+                ),
             ) from None
         finally:
             if response is not None and hasattr(response, "close"):

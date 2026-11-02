@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hmac
 import json
+import uuid
 from contextlib import suppress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .core import JobStore, validate_batch
 from .delivery import deliver_due as deliver_due
+from .telemetry_context import bind_request, current_request_id
 
 MAX_BODY_BYTES = 524288
 
@@ -19,7 +21,8 @@ class _Server(ThreadingHTTPServer):
 
 
 def make_server(
-    store: JobStore, *, key: str, port=8788, live=False, on_queued=None, on_accepted=None
+    store: JobStore, *, key: str, port=8788, live=False, on_queued=None, on_accepted=None,
+    on_observed=None, event_sink=None,
 ) -> ThreadingHTTPServer:
     if not isinstance(key, str) or not 32 <= len(key) <= 256 or any(c.isspace() for c in key):
         raise ValueError(
@@ -29,6 +32,10 @@ def make_server(
     class Handler(BaseHTTPRequestHandler):
         server_version = "ReviewerBridge"
         sys_version = ""
+
+        def handle_one_request(self):
+            with bind_request(uuid.uuid4().hex):
+                return super().handle_one_request()
 
         def setup(self):
             super().setup()
@@ -42,6 +49,7 @@ def make_server(
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(encoded)))
+            self.send_header("X-Request-ID", current_request_id() or uuid.uuid4().hex)
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header(
@@ -94,7 +102,8 @@ def make_server(
                 self.reply(400, {"error": "invalid observation batch"})
                 return
             try:
-                result = store.record(items)
+                result = (store.record(items, event_sink=event_sink, request_event_sink=event_sink)
+                          if event_sink is not None else store.record(items))
             except Exception:
                 self.reply(503, {"error": "durable intake unavailable; retry"})
                 return
@@ -105,6 +114,9 @@ def make_server(
                 # extension to retry an observation already accepted.
                 with suppress(Exception):
                     on_accepted(result)
+            if on_observed is not None:
+                with suppress(Exception):
+                    on_observed(result, items)
             self.reply(202, {**result, "status": "durably_accepted"})
 
         def do_OPTIONS(self):  # noqa: N802

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Iterable
+from contextlib import suppress
 from dataclasses import dataclass
 
 from filters import Rule, first_match
@@ -77,6 +78,7 @@ def process(
     store: SeenStore,
     notifier: Notifier,
     seed_only: bool = False,
+    event_sink=None,
 ) -> RunSummary:
     """Run items through the rules and alert on the ones that match.
 
@@ -87,22 +89,35 @@ def process(
     """
     summary = RunSummary()
 
+    def receipt(item, decision, error=None):
+        if event_sink is not None:
+            # Observation cannot change a notification or its durable state.
+            with suppress(Exception):
+                event_sink('pipeline_item', item_id=item.item_id,
+                           decision=decision, error_type=type(error).__name__ if error else None)
+
     for item in items:
         summary.observe(item)
         if store.is_pending(item.item_id):
             summary.new += 1
             summary.pending += 1
+            receipt(item, 'pending')
             continue
         if not store.is_new(item.item_id):
             summary.duplicates += 1
+            receipt(item, 'duplicate')
             continue
         summary.new += 1
 
         if seed_only:
-            if store.mark_seen(item.item_id, item.title, item.value_usd):
+            if store.mark_seen(
+                item.item_id, item.title, item.value_usd, category=item.category, url=item.url,
+            ):
                 summary.seeded += 1
+                receipt(item, 'seeded')
             else:
                 summary.pending += 1
+                receipt(item, 'pending')
             continue
 
         rule = first_match(item, rules)
@@ -110,9 +125,14 @@ def process(
             summary.filtered += 1
             # Record non-matching items too: if a rule is loosened later we do
             # not want a backlog of old listings to fire all at once.
-            if not store.mark_seen(item.item_id, item.title, item.value_usd):
+            if not store.mark_seen(
+                item.item_id, item.title, item.value_usd, category=item.category, url=item.url,
+            ):
                 summary.filtered -= 1
                 summary.pending += 1
+                receipt(item, 'pending')
+            else:
+                receipt(item, 'filtered')
             continue
 
         summary.matched += 1
@@ -120,27 +140,32 @@ def process(
         # Claim before notifying: the timer and the ingest endpoint can be in
         # this loop for the same item at the same time, and only one of them
         # should buzz the phone.
-        if not store.claim(item.item_id, item.title, item.value_usd):
+        if not store.claim(
+            item.item_id, item.title, item.value_usd, category=item.category, url=item.url,
+        ):
             # This is not a completed duplicate. Another request is still
             # delivering it, so the caller must retry the page until that
             # request either commits success or releases the claim.
             log.info("Item %s is pending in a concurrent run; retrying later.", item.item_id)
             summary.matched -= 1
             summary.pending += 1
+            receipt(item, 'pending')
             continue
 
         try:
             delivered = notifier.send(item, priority=rule.priority)
-        except Exception:
+        except Exception as exc:
             # An unexpected notifier error must not leave the persisted claim
             # looking like a successful alert. The HTTP handler reports the
             # exception while a later relay remains free to retry this item.
             store.release(item.item_id)
+            receipt(item, 'failed', exc)
             raise
 
         if delivered:
             store.commit(item.item_id)
             summary.notified += 1
+            receipt(item, 'sent')
             log.info("Alerted on %s (rule=%s, value=%s)",
                      item.title, rule.name, item.value_usd)
         else:
@@ -148,6 +173,7 @@ def process(
             # dropping an item the user actually wanted.
             store.release(item.item_id)
             summary.failed += 1
+            receipt(item, 'failed')
             log.error("Delivery failed for %s; will retry next run.", item.item_id)
 
     return summary

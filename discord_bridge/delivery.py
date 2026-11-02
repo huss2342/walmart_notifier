@@ -10,7 +10,8 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .api import DiscordError
-from .monitoring import emit_event
+from .monitoring import emit_event, error_fields
+from .policy import RETIRED_ROUTE_KEYS
 
 
 class _AuditClient:
@@ -70,6 +71,8 @@ def deliver_due(
         if hint is None:
             return
         for route, channel in state.get("channels", {}).items():
+            if route in RETIRED_ROUTE_KEYS:
+                continue
             if not isinstance(channel, str) or not re.fullmatch(r"\d{17,20}", channel):
                 continue
             wait = hint("POST", f"/channels/{channel}/messages")
@@ -99,8 +102,12 @@ def deliver_due(
                 attempt=max(job["attempts"] for job in jobs),
                 due_delay_seconds_min=min(delays),
                 due_delay_seconds_max=max(delays),
+                due_at_min=min(job["due"] for job in jobs),
+                due_at_max=max(job["due"] for job in jobs),
+                next_attempt_at_min=min(job["next_attempt"] for job in jobs),
+                next_attempt_at_max=max(job["next_attempt"] for job in jobs),
             )
-        emit_event(event_sink, name, correlation_id=correlation_id, **fields)
+        emit_event(event_sink, name, component="channel", correlation_id=correlation_id, **fields)
 
     if not live or stopping.is_set():
         return result
@@ -140,6 +147,7 @@ def deliver_due(
             return {"failed": count}
         send_started = time.monotonic()
         try:
+            event("dispatch_sending", batch, phase="send")
             response = client.request("POST", f"/channels/{channel}/messages", batch["payload"])
             message_id = response.get("id") if isinstance(response, dict) else None
             if not isinstance(message_id, str) or not re.fullmatch(r"\d{17,20}", message_id):
@@ -172,8 +180,7 @@ def deliver_due(
                     reason="http_413_review" if outcome == "held" else "http_413",
                     ambiguous=outcome == "held",
                     provider_code=exc.provider_code,
-                    request_bytes=exc.request_bytes,
-                    response_bytes=exc.response_bytes,
+                    **error_fields(exc),
                 )
                 return {counter: count}
             limited = exc.status == 429
@@ -192,6 +199,8 @@ def deliver_due(
                     reason=f"http_{exc.status}" if exc.status else "retry_limit",
                     ambiguous=exc.ambiguous,
                     elapsed_seconds=time.monotonic() - send_started,
+                    provider_code=exc.provider_code,
+                    **error_fields(exc),
                 )
                 return {"failed": count}
             delay = exc.retry_after if limited else min(300, 2 ** min(attempts, 8))
@@ -209,7 +218,7 @@ def deliver_due(
                 delay=delay,
                 reason="rate_limited" if limited else "remote_retry",
                 count_attempt=not limited,
-                ambiguous=exc.ambiguous or exc.status is None or exc.status >= 500,
+                ambiguous=exc.outcome.may_have_been_accepted,
             )
             event(
                 "dispatch_throttled" if limited else "dispatch_retry",
@@ -220,6 +229,8 @@ def deliver_due(
                 retry_after_seconds=delay,
                 ambiguous=exc.ambiguous,
                 elapsed_seconds=time.monotonic() - send_started,
+                provider_code=exc.provider_code,
+                **error_fields(exc),
             )
             return {"retried": count, "throttled": int(limited)}
 
@@ -232,7 +243,7 @@ def deliver_due(
                 "worker_error",
                 batch,
                 phase="dispatch",
-                error_type=type(exc).__name__,
+                **error_fields(exc),
                 ambiguous=True,
                 elapsed_seconds=time.monotonic() - started,
             )
@@ -261,7 +272,8 @@ def deliver_due(
                     )
                 else:
                     result["blocked"] = True
-                    event("privacy_blocked", reason="audit_error", status=exc.status or 0)
+                    event("privacy_blocked", reason="audit_error", status=exc.status or 0,
+                          provider_code=exc.provider_code, **error_fields(exc))
                 break
             except (ValueError, KeyError, TypeError):
                 assessment = {"ok": False}
@@ -293,6 +305,10 @@ def deliver_due(
                 if batch is None:
                     break
                 routes.append(batch["route"])
+                # A durable claim precedes any HTTP work. Comparing its original
+                # due and retry deadline with the outcome distinguishes waiting
+                # before claim from provider/settlement latency after claim.
+                event("dispatch_claimed", batch)
                 wave.append(pool.submit(send, batch))
                 submitted += 1
             if not wave:

@@ -54,6 +54,7 @@ class Interaction:
 
     async def send(self, content, **kwargs):
         assert kwargs.get("ephemeral") is True
+        assert len(content) <= 2000, "Discord rejects message content above 2000 characters"
         self.acknowledged = True
         self.messages.append((content, kwargs))
 
@@ -80,6 +81,16 @@ class Store:
         row = {"id": str(len(self.rows) + 1), "query": query}
         self.rows[(user, row["id"])] = row
         return row
+
+    def validate_add(self, user, query, **_):
+        from discord_bridge.request_store import parse_query
+
+        parse_query(query)
+        if len(self.list(user)) >= 10:
+            raise ValueError("You can have up to 10 active requests.")
+
+    def add_many(self, user, query, **kwargs):
+        return [self.add(user, query, **kwargs)]
 
     def list(self, user):
         return [dict(row) for (owner, _), row in self.rows.items() if owner == user]
@@ -130,6 +141,116 @@ def make(roles=(PRO,), **interaction_options):
     interaction = Interaction(**interaction_options)
     client, store = Client(roles, interaction), Store()
     return RequestCommands(client, STATE, store), interaction, client, store
+
+
+def real_commands(tmp_path):
+    from discord_bridge.request_store import RequestStore
+
+    interaction = Interaction()
+    client = Client(interaction=interaction)
+    store = RequestStore(tmp_path / "requests.sqlite3", guild_id=GUILD)
+    return RequestCommands(client, STATE, store), interaction, client, store
+
+
+def test_bulk_add_accepts_inline_minimum_and_lists_each_persistent_watch(tmp_path):
+    commands, interaction, client, store = real_commands(tmp_path)
+    invoke(commands.add, interaction, "recliner, chair, reclining chairs $100+")
+    rows = store.list(USER)
+    assert [row["query"] for row in rows] == ["recliner", "chair", "reclining chairs"]
+    assert [row["min_value_cents"] for row in rows] == [10000] * 3
+    reply = interaction.messages[-1][0]
+    assert "3 requests accepted" in reply.lower()
+    assert "$100.00+" in reply and "until deleted" in reply
+    assert len([c for c in client.calls if c[1].endswith("/messages")]) == 1
+    invoke(commands.list, interaction)
+    assert interaction.messages[-1][0].count("$100.00+") == 3
+    assert len(store.list(USER)) == 3
+
+
+def test_bulk_add_preflights_entire_batch_before_testing_dms(tmp_path):
+    commands, interaction, client, store = real_commands(tmp_path)
+    for index in range(9):
+        store.add(USER, f"item {index}")
+    invoke(commands.add, interaction, "chair, recliner", min_value=100)
+    assert len(store.list(USER)) == 9
+    assert "10" in interaction.messages[-1][0]
+    assert not any(c[0] == "POST" for c in client.calls)
+
+
+@pytest.mark.parametrize("minimum", [-1, float("nan"), 1.001])
+def test_invalid_minimum_is_private_and_does_not_test_dms(tmp_path, minimum):
+    commands, interaction, client, store = real_commands(tmp_path)
+    invoke(commands.add, interaction, "recliner", min_value=minimum)
+    assert store.list(USER) == []
+    assert "minimum" in interaction.messages[-1][0].lower()
+    assert not any(c[0] == "POST" for c in client.calls)
+
+
+def test_explicit_minimum_can_be_edited_preserved_and_cleared(tmp_path):
+    commands, interaction, _, store = real_commands(tmp_path)
+    invoke(commands.add, interaction, "recliner", min_value=100.25)
+    row = store.list(USER)[0]
+    assert row["min_value_cents"] == 10025
+    assert "$100.25+" in interaction.messages[-1][0]
+    invoke(commands.edit, interaction, str(row["id"]), "chair")
+    assert store.list(USER)[0]["min_value_cents"] == 10025
+    invoke(commands.edit, interaction, str(row["id"]), "chair", min_value=150)
+    assert store.list(USER)[0]["min_value_cents"] == 15000
+    invoke(commands.edit, interaction, str(row["id"]), "chair", min_value=0)
+    assert store.list(USER)[0]["min_value_cents"] is None
+    assert "$150.00+" not in interaction.messages[-1][0]
+
+
+def test_edit_modal_updates_minimum_and_blank_preserves_it(tmp_path):
+    async def scenario():
+        commands, interaction, _, store = real_commands(tmp_path)
+        store.add(USER, "recliner")
+        await commands.list(interaction)
+        view = interaction.messages[-1][1]["view"]
+        edit = next(child for child in view.children if getattr(child, "label", None) == "Edit")
+        await edit.callback(interaction)
+        modal = interaction.opened_modal
+        modal.item._value = "chair"
+        modal.min_value._value = "100.50"
+        await modal.on_submit(interaction)
+        assert store.list(USER)[0]["min_value_cents"] == 10050
+        modal.min_value._value = ""
+        await modal.on_submit(interaction)
+        assert store.list(USER)[0]["min_value_cents"] == 10050
+        modal.min_value._value = "0"
+        await modal.on_submit(interaction)
+        assert store.list(USER)[0]["min_value_cents"] is None
+
+    asyncio.run(scenario())
+
+
+def test_minimum_slash_option_is_optional_numeric_and_nonnegative():
+    commands, _, _, _ = make()
+    group = build_request_command_group(commands)
+    for name in ("add", "edit"):
+        option = group.get_command(name).get_parameter("min_value")
+        assert option is not None and not option.required
+        assert option.type.value == 10 and option.min_value == 0
+
+
+@pytest.mark.parametrize("status", ["ready", "blocked"])
+def test_full_request_list_fits_discord_message_limit(tmp_path, monkeypatch, status):
+    commands, interaction, _, store = real_commands(tmp_path)
+    for index in range(10):
+        store.add(USER, "a" * 148 + str(index), min_value=100_000_000)
+    store.set_dm_status(USER, status)
+    list_requests = store.list
+    monkeypatch.setattr(
+        store,
+        "list",
+        lambda user: [{**row, "delivery_status": "failed"} for row in list_requests(user)],
+    )
+    invoke(commands.list, interaction)
+    assert interaction.messages
+    content, options = interaction.messages[-1]
+    assert len(content) <= 2000
+    assert content.count("$100,000,000.00+") == 10
+    assert options["view"] is not None
 
 
 @pytest.mark.parametrize("roles", [(), (STARTER,)])
@@ -647,5 +768,8 @@ def test_command_failures_emit_fixed_operational_labels_without_request_data():
     commands._events = lambda event, **fields: events.append((event, fields))
     client.request = lambda *_: (_ for _ in ()).throw(RuntimeError("secret-token secret item"))
     invoke(commands.add, interaction, "secret item")
-    assert events == [("worker_error", {"phase": "worker", "error_type": "request_command"})]
+    assert [event for event in events if event[0] == "worker_error"] == [
+        ("worker_error", {"phase": "worker", "error_type": "request_command"})
+    ]
+    assert any(fields.get("interaction_stage") == "acknowledged" for _, fields in events)
     assert "secret-token" not in str(events) and "secret item" not in str(events)

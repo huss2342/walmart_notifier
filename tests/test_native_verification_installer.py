@@ -36,6 +36,7 @@ def test_installer_whatif_does_not_write_registration_or_files(tmp_path):
     for relative in [
         "native_verification/launcher.cs",
         "native_verification/host.py",
+        "native_verification/protocol.json",
         ".venv/Scripts/python.exe",
     ]:
         source = ROOT / relative

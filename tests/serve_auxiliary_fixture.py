@@ -10,8 +10,10 @@ ROUTES = {
     "/auxiliary_fixture.html": ROOT / "tests/auxiliary_fixture.html",
     "/reviews/claim-product": ROOT / "tests/auxiliary_worker_fixture.html",
     **{f"/{name}": ROOT / "extension" / name for name in (
-        "sweep-modes.js", "runtime-policy.js", "page-controls.js", "page-scroll.js",
-        "live-observer.js", "facet-controls.js", "content.js", "auxiliary-scans.js",
+        "sweep-modes.js", "runtime-policy.js", "verification-observation.js",
+        "page-controls.js", "page-scroll.js",
+        "live-observer.js", "document-session.js", "facet-controls.js", "content.js",
+        "auxiliary-scans.js",
     )},
 }
 

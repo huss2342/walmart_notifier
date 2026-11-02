@@ -7,13 +7,16 @@ ROOT = Path(__file__).resolve().parents[1]
 ROUTES = {
     "/reviews/claim-product": ROOT / "tests/extension_fixture.html",
     "/reviews/navigation-focus": ROOT / "tests/navigation_focus_fixture.html",
+    "/coverage-fixture": ROOT / "tests/coverage_fixture.html",
+    "/sofa-card.json": ROOT / "tests/fixtures/reviewer-sofa-card-20261028.json",
     "/fixture-stubs.js": ROOT / "tests/fixture-stubs.js",
     "/page-scroll-fixture": ROOT / "tests/page_scroll_fixture.html",
     "/verification-watch-fixture": ROOT / "tests/verification_watch_fixture.html",
     **{f"/{name}": ROOT / "extension" / name for name in (
         "options.html", "options.js", "sweep-modes.js", "runtime-policy.js",
         "page-controls.js", "page-scroll.js", "live-observer.js", "relay-settings.js",
-        "scanner-control.js",
+        "scanner-control.js", "document-session.js", "local-client.js", "scanner-settings.js",
+        "verification-observation.js", "verification-protocol.js",
         "facet-controls.js", "content.js", "verification-watch.js",
     )},
 }

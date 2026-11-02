@@ -15,14 +15,22 @@ import sqlite3
 import time
 import unicodedata
 from contextlib import contextmanager
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.parse import urlsplit
+
+from .monitoring import emit_event
 
 MAX_REQUESTS = 10
 ALERT_LIFETIME_SECONDS = 20 * 60
 LEASE_SECONDS = 60
 _SNOWFLAKE = re.compile(r"[0-9]{17,20}")
 _PRODUCT = re.compile(r"(?:ip-)?([0-9]{6,20})", re.IGNORECASE)
+
+
+def member_ref(user_id):
+    """Stable local correlation without putting Discord account IDs in logs."""
+    return hashlib.sha256(f"personal-member-v1:{user_id}".encode()).hexdigest()[:32]
 
 
 def _now(value=None):
@@ -91,6 +99,54 @@ def parse_query(value):
     return query, "keywords", json.dumps(words, ensure_ascii=True, separators=(",", ":"))
 
 
+def _minimum_cents(value):
+    if value is None:
+        return None
+    if type(value) not in (int, float, str):
+        raise ValueError("Minimum value must be a nonnegative USD amount using whole cents.")
+    try:
+        amount = Decimal(str(value))
+    except InvalidOperation:
+        raise ValueError(
+            "Minimum value must be a nonnegative USD amount using whole cents."
+        ) from None
+    if not amount.is_finite() or amount < 0 or amount > 100_000_000:
+        raise ValueError("Minimum value must be between $0 and $100,000,000.")
+    cents = amount * 100
+    if cents != cents.to_integral_value():
+        raise ValueError("Minimum value must use whole cents, such as 100 or 100.25.")
+    return int(cents) or None
+
+
+def _parse_input(value, min_value, *, bulk):
+    """Separate a shared trailing minimum from independently matched phrases."""
+    if not isinstance(value, str) or not value.strip() or len(value) > 512:
+        raise ValueError("Enter item keywords, IDs, or Walmart links, up to 512 characters total.")
+    if any(unicodedata.category(char).startswith("C") for char in value):
+        raise ValueError("Use a single line of ordinary text for your request.")
+    minimum = _minimum_cents(min_value)
+    specified = min_value is not None
+    value = value.strip()
+    suffix = re.search(r"\s+\$([0-9]+(?:\.[0-9]{1,2})?)\+$", value)
+    if suffix:
+        inline = _minimum_cents(suffix.group(1))
+        if specified and inline != minimum:
+            raise ValueError("Use the same minimum value in the item text and min_value option.")
+        value, minimum, specified = value[: suffix.start()], inline, True
+    if "$" in value:
+        raise ValueError("Place one minimum at the end, such as recliner, chair $100+.")
+    parts = value.split(",")
+    if not bulk and len(parts) != 1:
+        raise ValueError("Edit one request at a time; use /request add for comma-separated items.")
+    # Preserve the first spelling but store each equivalent normalized matcher
+    # only once. Exact IDs and links for the same product are equivalent too.
+    queries = {}
+    for part in parts:
+        query, kind, matcher = parse_query(part)
+        queries.setdefault((kind, matcher), (query, kind, matcher))
+    return list(queries.values()), minimum, specified
+
+
 def _all(db, statement, parameters=()):
     cursor = db.execute(statement, parameters)
     names = [column[0] for column in cursor.description]
@@ -104,6 +160,8 @@ def _one(db, statement, parameters=()):
 
 def initialize_requests(db):
     """Create only namespaced tables; never commit a caller's transaction."""
+    if not db.in_transaction:
+        db.execute("BEGIN IMMEDIATE")
     statements = (
         "CREATE TABLE IF NOT EXISTS personal_request_settings "
         "(key TEXT PRIMARY KEY,value TEXT NOT NULL)",
@@ -115,6 +173,31 @@ def initialize_requests(db):
             query TEXT NOT NULL,kind TEXT NOT NULL,matcher TEXT NOT NULL,
             revision INTEGER NOT NULL DEFAULT 1,created REAL NOT NULL,updated REAL NOT NULL)""",
         "CREATE INDEX IF NOT EXISTS personal_requests_user ON personal_requests(user_id,id)",
+        "CREATE INDEX IF NOT EXISTS personal_requests_exact "
+        "ON personal_requests(kind,matcher,updated)",
+        "CREATE INDEX IF NOT EXISTS personal_requests_updated ON personal_requests(updated)",
+        """CREATE TABLE IF NOT EXISTS personal_request_keywords (
+            token TEXT NOT NULL,request_id INTEGER NOT NULL,revision INTEGER NOT NULL,
+            PRIMARY KEY(token,request_id))""",
+        "CREATE INDEX IF NOT EXISTS personal_request_keywords_request "
+        "ON personal_request_keywords(request_id)",
+        """CREATE TRIGGER IF NOT EXISTS personal_request_keyword_insert
+            AFTER INSERT ON personal_requests BEGIN
+            INSERT INTO personal_request_keywords(token,request_id,revision)
+            SELECT value,NEW.id,NEW.revision
+            FROM json_each(CASE WHEN NEW.kind='keywords' THEN NEW.matcher ELSE '[]' END);
+            END""",
+        """CREATE TRIGGER IF NOT EXISTS personal_request_keyword_update
+            AFTER UPDATE OF kind,matcher,revision ON personal_requests BEGIN
+            DELETE FROM personal_request_keywords WHERE request_id=NEW.id;
+            INSERT INTO personal_request_keywords(token,request_id,revision)
+            SELECT value,NEW.id,NEW.revision
+            FROM json_each(CASE WHEN NEW.kind='keywords' THEN NEW.matcher ELSE '[]' END);
+            END""",
+        """CREATE TRIGGER IF NOT EXISTS personal_request_keyword_delete
+            AFTER DELETE ON personal_requests BEGIN
+            DELETE FROM personal_request_keywords WHERE request_id=OLD.id;
+            END""",
         """CREATE TABLE IF NOT EXISTS personal_request_alerts (
             id TEXT PRIMARY KEY,user_id TEXT NOT NULL,item_id TEXT NOT NULL,
             payload TEXT NOT NULL,observed REAL NOT NULL,
@@ -135,9 +218,53 @@ def initialize_requests(db):
     )
     for statement in statements:
         db.execute(statement)
+    columns = {row[1] for row in db.execute("PRAGMA table_info(personal_requests)")}
+    if "min_value_cents" not in columns:
+        # Existing watches stay unfiltered; upgrades share the caller's intake
+        # transaction and never manufacture historical notifications.
+        db.execute("ALTER TABLE personal_requests ADD COLUMN min_value_cents INTEGER")
+    indexed = db.execute(
+        "SELECT value FROM personal_request_settings WHERE key='matching_index_version'"
+    ).fetchone()
+    if indexed is None:
+        # Upgrade old watches in the same transaction as the schema marker.
+        # No separate startup seed, commit, or historical observation is needed.
+        db.execute("DELETE FROM personal_request_keywords")
+        db.execute(
+            """INSERT INTO personal_request_keywords(token,request_id,revision)
+            SELECT token.value,r.id,r.revision FROM personal_requests r,
+            json_each(CASE WHEN r.kind='keywords' THEN r.matcher ELSE '[]' END) token"""
+        )
+        db.execute("INSERT INTO personal_request_settings VALUES ('matching_index_version','1')")
+
+
+def _candidate_requests(db, item, words, now):
+    """Use exact-ID and token indexes before loading complete watch records.
+
+    The keyword GROUP BY requires every distinct normalized query token. The
+    final matcher remains the authority, including revision and Unicode rules.
+    json_each keeps SQL parameter counts bounded even for long product titles.
+    CROSS JOIN fixes the token lookup as the outer loop: otherwise SQLite can
+    choose the kind index and scan all keyword watches for every observation.
+    """
+    return _all(
+        db,
+        """SELECT * FROM personal_requests
+        WHERE kind='exact' AND matcher=? AND updated<=?
+        UNION ALL
+        SELECT r.* FROM personal_request_keywords k
+        CROSS JOIN personal_requests r ON r.id=k.request_id AND r.revision=k.revision
+        WHERE k.token IN (SELECT value FROM json_each(?))
+        AND r.kind='keywords' AND r.updated<=?
+        GROUP BY r.id HAVING COUNT(*)=json_array_length(r.matcher)""",
+        (item["item_id"], now, json.dumps(sorted(words), ensure_ascii=True), now),
+    )
 
 
 def _matches(request, item, *, words=None):
+    minimum = request.get("min_value_cents")
+    if minimum is not None and (item.get("value_cents") is None or item["value_cents"] < minimum):
+        return False
     if request["kind"] == "exact":
         return request["matcher"] == item["item_id"]
     tokens = request.get("_tokens")
@@ -146,20 +273,19 @@ def _matches(request, item, *, words=None):
     return tokens.issubset(set(_words(item["title"])) if words is None else words)
 
 
-def match_requests(db, normalized_items, *, now, seed_only=False):
+def match_requests(db, normalized_items, *, now, seed_only=False, activity=None):
     """Match only this freshly accepted observation inside its intake transaction.
 
     Existing product IDs, including previously seeded IDs, remain eligible when
     they are freshly reobserved. Seed/import batches themselves never alert.
     Returns the number of newly queued member/product pairs.
     """
-    requests = _all(db, "SELECT * FROM personal_requests WHERE updated<=?", (now,))
-    if not requests:
+    if (
+        db.execute("SELECT 1 FROM personal_requests WHERE updated<=? LIMIT 1", (now,)).fetchone()
+        is None
+    ):
         return 0
     now = _now(now)
-    for request in requests:
-        if request["kind"] == "keywords":
-            request["_tokens"] = set(json.loads(request["matcher"]))
     db.execute(
         "UPDATE personal_request_alerts SET state='expired',reason='stale' "
         "WHERE state IN ('pending','leased') AND expires<=?",
@@ -185,7 +311,7 @@ def match_requests(db, normalized_items, *, now, seed_only=False):
             continue
         by_user = {}
         words = set(_words(item["title"]))
-        for request in requests:
+        for request in _candidate_requests(db, item, words, now):
             if _matches(request, item, words=words):
                 by_user.setdefault(request["user_id"], []).append(request)
         for user_id, matches in by_user.items():
@@ -211,6 +337,7 @@ def match_requests(db, normalized_items, *, now, seed_only=False):
             state = db.execute(
                 "SELECT state FROM personal_request_alerts WHERE id=?", (alert_id,)
             ).fetchone()[0]
+            previous_state = state
             if state in {"cancelled", "expired", "failed"}:
                 # These states are definitely unsent. A new eligible live
                 # observation can try again; sent, sending and review remain
@@ -232,6 +359,25 @@ def match_requests(db, normalized_items, *, now, seed_only=False):
                 )
                 state = "pending"
                 queued += 1
+            if activity is not None:
+                for request in matches:
+                    row = activity.setdefault(
+                        request["id"],
+                        {
+                            "request_id": request["id"],
+                            "member_ref": member_ref(user_id),
+                            "matched": 0,
+                            "queued": 0,
+                            "deduplicated": 0,
+                            "held": 0,
+                        },
+                    )
+                    row["matched"] += 1
+                    row["queued"] += int(
+                        bool(inserted) or previous_state in {"cancelled", "expired", "failed"}
+                    )
+                    row["deduplicated"] += int(previous_state == "sent")
+                    row["held"] += int(previous_state in {"sending", "review"})
             if state not in {"pending", "leased"}:
                 continue
             for request in matches:
@@ -243,8 +389,9 @@ def match_requests(db, normalized_items, *, now, seed_only=False):
 
 
 class RequestStore:
-    def __init__(self, path: Path | str, *, guild_id=None):
+    def __init__(self, path: Path | str, *, guild_id=None, event_sink=None):
         self.path = Path(path)
+        self.event_sink = event_sink
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.guild_id = _user(guild_id) if guild_id is not None else None
         with self._db() as db:
@@ -262,6 +409,20 @@ class RequestStore:
                     (self.guild_id,),
                 )
 
+    def _changed(self, action, user_id, row):
+        _, kind, matcher = parse_query(row["query"])
+        emit_event(
+            self.event_sink,
+            "request_changed",
+            audience="personal",
+            action=action,
+            request_id=int(row["id"]),
+            revision=row["revision"],
+            member_ref=member_ref(user_id),
+            query_ref=hashlib.sha256(f"{kind}:{matcher}".encode()).hexdigest()[:32],
+            min_value_cents=row.get("min_value_cents") or 0,
+        )
+
     @contextmanager
     def _db(self):
         db = sqlite3.connect(self.path, timeout=10)
@@ -271,38 +432,94 @@ class RequestStore:
         finally:
             db.close()
 
-    def add(self, user_id, query, *, now=None):
+    @staticmethod
+    def _validate_add(
+        db, user_id, queries, *, reuse_existing=False, minimum=None, minimum_specified=False
+    ):
+        existing = _all(
+            db,
+            "SELECT id,kind,matcher,min_value_cents FROM personal_requests WHERE user_id=?",
+            (user_id,),
+        )
+        identities = {(row["kind"], row["matcher"]): row for row in existing}
+        additions = 0
+        for _, kind, matcher in queries:
+            previous = identities.get((kind, matcher))
+            if previous is None:
+                additions += 1
+            elif not reuse_existing:
+                raise ValueError("You already have this request. Use /request list to manage it.")
+            elif minimum_specified and previous["min_value_cents"] != minimum:
+                raise ValueError(
+                    "An existing request has a different minimum value. "
+                    "Use /request edit to change it; no requests from this batch were added."
+                )
+        if len(existing) + additions > MAX_REQUESTS:
+            raise ValueError(
+                "You can have up to 10 requests. Delete some with /request delete first; "
+                "no requests from this batch were added."
+            )
+        return identities
+
+    def validate_add(self, user_id, query_text, *, min_value=None):
+        user_id = _user(user_id)
+        queries, minimum, specified = _parse_input(query_text, min_value, bulk=True)
+        with self._db() as db:
+            self._validate_add(
+                db,
+                user_id,
+                queries,
+                reuse_existing=True,
+                minimum=minimum,
+                minimum_specified=specified,
+            )
+
+    def _add(self, user_id, query_text, *, min_value=None, now=None, bulk):
         user_id, now = _user(user_id), _now(now)
-        query, kind, matcher = parse_query(query)
+        queries, minimum, specified = _parse_input(query_text, min_value, bulk=bulk)
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            count = db.execute(
-                "SELECT COUNT(*) FROM personal_requests WHERE user_id=?", (user_id,)
-            ).fetchone()[0]
-            if count >= MAX_REQUESTS:
-                raise ValueError(
-                    "You can have up to 10 requests. Delete one with /request delete first."
-                )
+            existing = self._validate_add(
+                db,
+                user_id,
+                queries,
+                reuse_existing=bulk,
+                minimum=minimum,
+                minimum_specified=specified,
+            )
             db.execute(
                 "INSERT OR IGNORE INTO personal_request_users(user_id) VALUES (?)", (user_id,)
             )
-            if db.execute(
-                "SELECT 1 FROM personal_requests WHERE user_id=? AND kind=? AND matcher=?",
-                (user_id, kind, matcher),
-            ).fetchone():
-                raise ValueError("You already have this request. Use /request list to manage it.")
-            cursor = db.execute(
-                """INSERT INTO personal_requests(user_id,query,kind,matcher,created,updated)
-                VALUES (?,?,?,?,?,?)""",
-                (user_id, query, kind, matcher, now, now),
-            )
-            return self._request(db, user_id, cursor.lastrowid)
+            rows = []
+            for query, kind, matcher in queries:
+                previous = existing.get((kind, matcher))
+                if previous is not None:
+                    row = self._request(db, user_id, previous["id"])
+                    rows.append({**row, "already_saved": True})
+                    continue
+                cursor = db.execute(
+                    """INSERT INTO personal_requests
+                    (user_id,query,kind,matcher,created,updated,min_value_cents)
+                    VALUES (?,?,?,?,?,?,?)""",
+                    (user_id, query, kind, matcher, now, now, minimum),
+                )
+                rows.append(self._request(db, user_id, cursor.lastrowid))
+        for row in rows:
+            if not row.get("already_saved"):
+                self._changed("add", user_id, row)
+        return rows
+
+    def add(self, user_id, query, *, min_value=None, now=None):
+        return self._add(user_id, query, min_value=min_value, now=now, bulk=False)[0]
+
+    def add_many(self, user_id, query_text, *, min_value=None, now=None):
+        return self._add(user_id, query_text, min_value=min_value, now=now, bulk=True)
 
     @staticmethod
     def _request(db, user_id, request_id):
         row = _one(
             db,
-            "SELECT id,query,kind,revision,created,updated FROM personal_requests "
+            "SELECT id,query,kind,revision,created,updated,min_value_cents FROM personal_requests "
             "WHERE user_id=? AND id=?",
             (user_id, request_id),
         )
@@ -336,12 +553,15 @@ class RequestStore:
             ).fetchall()
             return [self._request(db, user_id, row[0]) for row in ids]
 
-    def edit(self, user_id, request_id, query, *, now=None):
+    def edit(self, user_id, request_id, query, *, min_value=None, now=None):
         user_id, request_id, now = _user(user_id), _request_id(request_id), _now(now)
-        query, kind, matcher = parse_query(query)
+        queries, minimum, specified = _parse_input(query, min_value, bulk=False)
+        query, kind, matcher = queries[0]
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            self._request(db, user_id, request_id)
+            previous = self._request(db, user_id, request_id)
+            if not specified:
+                minimum = previous["min_value_cents"]
             if db.execute(
                 "SELECT 1 FROM personal_requests "
                 "WHERE user_id=? AND kind=? AND matcher=? AND id!=?",
@@ -349,26 +569,35 @@ class RequestStore:
             ).fetchone():
                 raise ValueError("You already have this request. Use /request list to manage it.")
             db.execute(
-                """UPDATE personal_requests SET query=?,kind=?,matcher=?,
+                """UPDATE personal_requests SET query=?,kind=?,matcher=?,min_value_cents=?,
                 revision=revision+1,updated=?
                 WHERE user_id=? AND id=?""",
-                (query, kind, matcher, now, user_id, request_id),
+                (query, kind, matcher, minimum, now, user_id, request_id),
             )
             db.execute("DELETE FROM personal_request_matches WHERE request_id=?", (request_id,))
             self._cancel_orphans(db)
-            return self._request(db, user_id, request_id)
+            row = self._request(db, user_id, request_id)
+        self._changed("edit", user_id, row)
+        return row
 
     def delete(self, user_id, request_id):
         user_id, request_id = _user(user_id), _request_id(request_id)
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
+            row = _one(
+                db,
+                "SELECT * FROM personal_requests WHERE user_id=? AND id=?",
+                (user_id, request_id),
+            )
             deleted = db.execute(
                 "DELETE FROM personal_requests WHERE user_id=? AND id=?", (user_id, request_id)
             ).rowcount
             if deleted:
                 db.execute("DELETE FROM personal_request_matches WHERE request_id=?", (request_id,))
                 self._cancel_orphans(db)
-            return bool(deleted)
+        if deleted:
+            self._changed("delete", user_id, row)
+        return bool(deleted)
 
     @staticmethod
     def _cancel_orphans(db):
@@ -392,6 +621,13 @@ class RequestStore:
                 channel_id=COALESCE(excluded.channel_id,personal_request_users.channel_id)""",
                 (user_id, status, channel_id),
             )
+        emit_event(
+            self.event_sink,
+            "request_dm_status",
+            audience="personal",
+            member_ref=member_ref(user_id),
+            dm_status=status,
+        )
 
     def dm_status(self, user_id):
         user_id = _user(user_id)
@@ -550,10 +786,27 @@ class RequestStore:
                 ).rowcount
             )
 
+    def owners(self, *, limit=50, after=None):
+        """Bounded membership sweep; saved watches cannot outlive Pro access."""
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("Invalid request-owner page size.")
+        after = _user(after) if after is not None else "0"
+        with self._db() as db:
+            return [row[0] for row in db.execute(
+                "SELECT DISTINCT user_id FROM personal_requests WHERE user_id>? "
+                "ORDER BY user_id LIMIT ?", (after, limit),
+            )]
+
     def revoke_user(self, user_id):
         user_id = _user(user_id)
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
+            removed = _all(db, "SELECT * FROM personal_requests WHERE user_id=?", (user_id,))
+            db.execute(
+                "DELETE FROM personal_request_matches WHERE request_id IN "
+                "(SELECT id FROM personal_requests WHERE user_id=?)", (user_id,),
+            )
+            db.execute("DELETE FROM personal_requests WHERE user_id=?", (user_id,))
             db.execute(
                 "UPDATE personal_request_users SET dm_status='needs_test' WHERE user_id=?",
                 (user_id,),
@@ -564,7 +817,11 @@ class RequestStore:
                 (user_id,),
             )
 
-    def stats(self):
+        for row in removed:
+            self._changed("delete", user_id, row)
+
+    def stats(self, *, now=None):
+        now = _now(now)
         with self._db() as db:
             result = dict.fromkeys(
                 (
@@ -591,4 +848,24 @@ class RequestStore:
             result["dm_blocked"] = db.execute(
                 "SELECT COUNT(*) FROM personal_request_users WHERE dm_status='blocked'"
             ).fetchone()[0]
+            result["needs_test"] = db.execute(
+                "SELECT COUNT(*) FROM personal_request_users WHERE dm_status='needs_test'"
+            ).fetchone()[0]
+            result["due"], oldest = db.execute(
+                "SELECT COUNT(*),MIN(created) FROM personal_request_alerts "
+                "WHERE state='pending' AND expires>? AND next_attempt<=?",
+                (now, now),
+            ).fetchone()
+            result["oldest_due_age_seconds"] = max(0, now - oldest) if oldest is not None else 0
+            result["retry_wait"] = db.execute(
+                "SELECT COUNT(*) FROM personal_request_alerts "
+                "WHERE state='pending' AND expires>? AND next_attempt>?",
+                (now, now),
+            ).fetchone()[0]
+            result["reasons"] = {}
+            for state, reason, count in db.execute(
+                "SELECT state,reason,COUNT(*) FROM personal_request_alerts "
+                "WHERE reason IS NOT NULL GROUP BY state,reason"
+            ):
+                result["reasons"].setdefault(state, {})[reason] = count
             return result

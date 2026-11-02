@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+import atomic_json
 import scanner_control
 from scanner_control import (
     ScannerCommandsStore,
@@ -144,7 +145,7 @@ def test_exact_schemas_return_independent_copies(validator, factory):
         ("auxiliaryKeywordQueries", ["STRASSE", "Straße"]),
         ("auxiliaryKeywordQueries", ["x" * 81]),
         ("auxiliaryKeywordQueries", ["chair\nsecret"]),
-        ("auxiliaryKeywordQueries", [str(index) for index in range(101)]),
+        ("auxiliaryKeywordQueries", [str(index) for index in range(129)]),
         ("pathPattern", ""),
         ("pathPattern", "x" * 201),
         ("pathPattern", "path\x7fcontrol"),
@@ -157,7 +158,9 @@ def test_settings_reject_weak_types_duplicates_controls_and_oversized_values(fie
         validate_settings(incoming)
 
 
-@pytest.mark.parametrize("queries", [None, [], ["x" * 80], [str(i) for i in range(100)]])
+@pytest.mark.parametrize(
+    "queries", [None, [], ["x" * 80], [str(i) for i in range(100)], [str(i) for i in range(128)]]
+)
 def test_optional_and_boundary_keyword_lists_are_valid(queries):
     incoming = {**settings(), "auxiliaryKeywordQueries": queries}
     assert validate_settings(incoming) == incoming
@@ -231,6 +234,39 @@ def test_unknown_extension_versions_and_coarse_scanning_phase_are_safe_status_fa
     incoming["extensionVersion"] = "unknown"
     incoming["primary"]["phase"] = "scanning"
     assert validate_status(incoming) == incoming
+
+
+@pytest.mark.parametrize(
+    "field", ["attemptedTargets", "unresolvedTargets", "emptyTargets", "startedAt", "completedAt"]
+)
+@pytest.mark.parametrize("value", [0, 100_000, 10**15])
+def test_optional_lane_coverage_counters_and_round_timestamps_preserve_measured_numbers(
+    field, value
+):
+    incoming = report()
+    incoming["lanes"][0][field] = value
+    assert validate_status(incoming) == incoming
+
+
+def test_legacy_lane_status_does_not_gain_fabricated_coverage_or_round_timestamps():
+    incoming = report()
+    clean = validate_status(incoming)
+    fields = ("attemptedTargets", "unresolvedTargets", "emptyTargets", "startedAt", "completedAt")
+    for field in fields:
+        assert field not in clean["lanes"][0]
+
+
+@pytest.mark.parametrize(
+    "field", ["attemptedTargets", "unresolvedTargets", "emptyTargets", "startedAt", "completedAt"]
+)
+@pytest.mark.parametrize("value", [True, None, "1", -1, 1.0, float("nan"), 10**15 + 1])
+def test_optional_lane_coverage_and_round_timestamps_reject_weak_types_and_unbounded_values(
+    field, value
+):
+    incoming = report()
+    incoming["lanes"][0][field] = value
+    with pytest.raises(ValueError, match="^Invalid scanner status$"):
+        validate_status(incoming)
 
 
 @pytest.mark.parametrize("field", ["tabActive", "tabFrozen", "windowFocused"])
@@ -425,7 +461,7 @@ def test_failed_atomic_save_preserves_previous_file_and_removes_temporary_files(
     def fail(*args):
         raise OSError("private path must never enter an HTTP response")
 
-    monkeypatch.setattr(scanner_control.os, failure, fail)
+    monkeypatch.setattr(atomic_json.os, failure, fail)
     with pytest.raises(OSError):
         store.save(factory())
     assert store.path.read_bytes() == before
@@ -454,6 +490,21 @@ def test_status_is_current_disk_backed_atomic_and_reports_staleness_without_affe
     changed["report"]["primary"]["page"] = 3
     store.path.write_text(json.dumps(changed), encoding="utf-8")
     assert store.snapshot() == {**changed, "stale": False}
+
+
+def test_verified_coverage_counters_and_round_times_survive_status_store_recreation(tmp_path):
+    incoming = report()
+    incoming["lanes"][0].update(
+        completedTargets=3,
+        attemptedTargets=5,
+        unresolvedTargets=2,
+        startedAt=10_000,
+        completedAt=100_000,
+        status="partial",
+    )
+    store = ScannerStatusStore(tmp_path / "scanner-status.json")
+    store.record_report(incoming)
+    assert ScannerStatusStore(store.path).snapshot()["report"] == incoming
 
 
 def test_bad_files_are_bounded_and_never_replaced_with_a_cached_copy(tmp_path):
@@ -500,7 +551,7 @@ def test_failed_status_replace_preserves_the_last_report_in_memory_and_on_disk(
     def fail_replace(*args):
         raise OSError("private replacement failure")
 
-    monkeypatch.setattr(scanner_control.os, "replace", fail_replace)
+    monkeypatch.setattr(atomic_json.os, "replace", fail_replace)
     with pytest.raises(OSError):
         store.record_report(updated)
     assert store.path.read_bytes() == encoded

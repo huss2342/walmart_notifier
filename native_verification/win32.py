@@ -15,7 +15,15 @@ import time
 from contextlib import contextmanager
 from dataclasses import replace
 
-from .contracts import MIN_IDLE_MS, PREPARE_TTL_MS, DesktopError, Target
+from .contracts import (
+    MAX_DPR,
+    MAX_VIEWPORT,
+    MIN_DPR,
+    MIN_IDLE_MS,
+    PREPARE_TTL_MS,
+    DesktopError,
+    Target,
+)
 
 DWORD = ctypes.c_uint32
 LONG = ctypes.c_int32
@@ -401,7 +409,8 @@ class WindowsDesktop:
             if any(type(value) not in (int, float) or not math.isfinite(value) for value in values):
                 raise DesktopError("invalid-request")
             width, height, dpr, x, y = values
-            if not (0 < width <= 20000 and 0 < height <= 20000 and 0.5 <= dpr <= 4
+            if not (0 < width <= MAX_VIEWPORT and 0 < height <= MAX_VIEWPORT
+                    and MIN_DPR <= dpr <= MAX_DPR
                     and 0 <= x < width and 0 <= y < height):
                 raise DesktopError("invalid-request")
             reason = self._guard(idle=True)

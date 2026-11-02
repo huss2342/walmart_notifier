@@ -27,9 +27,9 @@ def test_free_alert_waits_full_day_and_survives_restart_unavailability_and_updat
     store = JobStore(path)
     original = observation(image_url="https://i5.walmartimages.com/asr/original.jpeg")
     store.record([original], now=1000)
-    while job := store.claim(now=1300):
-        assert job["route"] != FREE_ROUTE
-        store.finish(job, "sent")
+    while batch := store.claim_batch(now=1300):
+        assert batch["route"] != FREE_ROUTE
+        store.finish_batch(batch, "sent")
     store.record(
         [
             observation(
@@ -42,8 +42,10 @@ def test_free_alert_waits_full_day_and_survives_restart_unavailability_and_updat
         now=2000,
     )
     store = JobStore(path)
-    assert store.claim(now=1000 + DAY - 0.001) is None
-    job = store.claim(now=1000 + DAY)
+    assert store.claim_batch(now=1000 + DAY - 0.001) is None
+    batch = store.claim_batch(now=1000 + DAY)
+    assert batch is not None
+    job = batch["jobs"][0]
     assert job is not None and job["route"] == FREE_ROUTE
     assert job["item"] == original
     assert job["first_seen"] == 1000
@@ -53,10 +55,10 @@ def test_free_alert_waits_full_day_and_survives_restart_unavailability_and_updat
     assert "newer-private" not in text
     assert "historical" in text and "24-hour" in text
     assert "no intentional delay" not in text
-    store.finish(job, "sent")
+    store.finish_batch(batch, "sent")
     store.record([original], now=1000 + DAY + 5)
-    assert store.claim(now=1000 + DAY + 5) is None
-    assert store.counts() == {"sent": 5}
+    assert store.claim_batch(now=1000 + DAY + 5) is None
+    assert store.counts() == {"sent": 4}
 
 
 @pytest.mark.parametrize("value", [None, 0, 19.99, 299.99])

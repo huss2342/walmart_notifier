@@ -16,6 +16,9 @@ from pathlib import Path
 
 _LOCKS: dict[str, threading.RLock] = {}
 _LOCKS_GUARD = threading.Lock()
+# A failed truncate must be repaired before another writer in this process can
+# append to or rotate the same path. Access is serialized by its existing lock.
+_ROLLBACKS: dict[str, int] = {}
 RETENTION_DAYS = 60
 
 
@@ -28,7 +31,7 @@ class RollingLog:
     """
 
     def __init__(
-        self, path, *, max_bytes=5 * 1024 * 1024, total_bytes=32 * 1024 * 1024,
+        self, path, *, max_bytes=10 * 1024 * 1024, total_bytes=64 * 1024 * 1024,
         retention_days=RETENTION_DAYS, backups=256, clock=None,
     ):
         if max_bytes < 1 or total_bytes < max_bytes or retention_days < 1 or backups < 1:
@@ -41,8 +44,9 @@ class RollingLog:
         self._archive_pattern = re.compile(
             re.escape(self.path.name) + r"\.(?:[1-9][0-9]*|\d{8}T\d{12}-[a-f0-9]{8}\.gz)"
         )
+        self._path_key = str(self.path.resolve())
         with _LOCKS_GUARD:
-            self._lock = _LOCKS.setdefault(str(self.path.resolve()), threading.RLock())
+            self._lock = _LOCKS.setdefault(self._path_key, threading.RLock())
 
     @contextmanager
     def _process_lock(self):
@@ -115,6 +119,14 @@ class RollingLog:
         if not encoded:
             return
         with self._lock, self._process_lock():
+            rollback = _ROLLBACKS.get(self._path_key)
+            if rollback is not None:
+                descriptor = os.open(self.path, os.O_WRONLY | getattr(os, "O_BINARY", 0))
+                try:
+                    os.ftruncate(descriptor, rollback)
+                finally:
+                    os.close(descriptor)
+                _ROLLBACKS.pop(self._path_key, None)
             now = self.clock()
             rotated = False
             if self.path.exists():
@@ -132,12 +144,25 @@ class RollingLog:
                 0o600,
             )
             try:
-                remaining = memoryview(encoded)
-                while remaining:
-                    written = os.write(descriptor, remaining)
-                    if written <= 0:
-                        raise OSError("log write did not advance")
-                    remaining = remaining[written:]
+                original_size = os.fstat(descriptor).st_size
+                try:
+                    remaining = memoryview(encoded)
+                    while remaining:
+                        written = os.write(descriptor, remaining)
+                        if written <= 0:
+                            raise OSError("log write did not advance")
+                        remaining = remaining[written:]
+                except BaseException:
+                    _ROLLBACKS[self._path_key] = original_size
+                    try:
+                        os.ftruncate(descriptor, original_size)
+                    except OSError:
+                        # Preserve the original write error and refuse later
+                        # appends until the pending rollback can be completed.
+                        pass
+                    else:
+                        _ROLLBACKS.pop(self._path_key, None)
+                    raise
             finally:
                 os.close(descriptor)
             os.utime(self.path, (now, now))

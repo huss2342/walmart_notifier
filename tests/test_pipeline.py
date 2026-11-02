@@ -59,6 +59,27 @@ def test_non_matching_item_is_marked_seen_but_not_sent(store):
     assert process(items, rules, store, notifier).new == 0
 
 
+@pytest.mark.parametrize("mode", ["matched", "filtered", "seeded"])
+def test_recorded_items_retain_original_filtering_context_across_restart(tmp_path, mode):
+    path = tmp_path / "seen.json"
+    store = SeenStore(path, autosave=False)
+    item = Item(
+        item_id="ip-123456789", title="Long product description " * 12 + "Refurbished",
+        category="Electronics > Phones", value_usd=70.0,
+        url="https://www.walmart.com/ip/budget-phone/123456789?variant=blue",
+    )
+    rules = [Rule(min_value_usd=1000 if mode == "filtered" else 10)]
+    process([item], rules, store, FakeNotifier(), seed_only=mode == "seeded")
+    store.flush()
+
+    [(item_id, record)] = SeenStore(path, autosave=False).iter_records()
+    assert item_id == item.item_id
+    assert record["title"] == item.title[:120]
+    assert record["filter_context"] == {
+        "title": item.title, "category": item.category, "url": item.url,
+    }
+
+
 def test_failed_delivery_is_retried_next_run(store, rules):
     failing = FakeNotifier(succeed=False)
     items = [Item(title="TV", value_usd=500.0)]
@@ -171,7 +192,7 @@ def test_concurrent_claim_is_reported_as_pending(store, rules):
     # someone else got there first.
     store.is_new = lambda item_id: True
     real_claim = store.claim
-    store.claim = lambda item_id, title="", value=None: False
+    store.claim = lambda item_id, title="", value=None, **context: False
 
     notifier = FakeNotifier()
     summary = process([item], rules, store, notifier)

@@ -18,6 +18,7 @@ STATE = {
         "price-10-20": "1700000000000000003",
         "starter-items": "1700000000000000004",
         "yesterday-recap": "1700000000000000005",
+        "type-pets": "1700000000000000006",
     },
 }
 
@@ -94,7 +95,7 @@ def test_burst_reduces_message_count_and_overlaps_independent_channels(tmp_path)
     assert result["sent"] == 90 and result["messages"] == 9
     assert 2 <= remote.peak <= 4
     assert len(set(remote.overlap_routes)) == 2
-    assert store.counts() == {"sent": 90, "pending": 60}
+    assert store.counts() == {"sent": 90, "pending": 30}
     assert len({payload["nonce"] for _, payload in remote.calls}) == 9
     assert all(len(payload["embeds"]) == 10 for _, payload in remote.calls)
 
@@ -196,15 +197,15 @@ def test_due_free_does_not_cause_audit_spins_while_paid_waits_on_learned_cooldow
     assert audits == remote.calls == []
 
 
-def test_future_starter_and_expired_pro_jobs_do_not_hold_due_free_history(tmp_path):
+def test_future_free_and_expired_pro_jobs_do_not_hold_due_free_history(tmp_path):
     store = JobStore(tmp_path / "q")
     store.record([product(999, available=False)], now=1000)
     store.record([product(1)], now=85600)  # Paid expiry is exactly87400.
-    store.record([product(2)], now=87300)  # Starter release is87600.
+    store.record([product(2)], now=87300)  # Free release is173700.
     with store._connect() as db:
         db.execute(
             "UPDATE jobs SET state='skipped' WHERE item_id=? "
-            "AND route NOT IN ('starter-items','yesterday-recap')",
+            "AND route!='yesterday-recap'",
             (product(2)["item_id"],),
         )
     remote = Remote()
@@ -226,7 +227,7 @@ def test_stop_during_audit_does_not_claim_or_submit_products(tmp_path):
         store, remote, STATE, live=True, now=1000, auditor=audited, stop_event=stopping
     )
     assert result["sent"] == 0 and remote.calls == []
-    assert store.counts() == {"pending": 5}
+    assert store.counts() == {"pending": 4}
 
 
 def test_audit_failure_blocks_every_channel_before_any_claim(tmp_path):
@@ -237,7 +238,7 @@ def test_audit_failure_blocks_every_channel_before_any_claim(tmp_path):
         store, remote, STATE, live=True, now=1000, auditor=lambda *_: {"ok": False}
     )
     assert result["blocked"] is True and not remote.calls
-    assert store.counts() == {"pending": 50}
+    assert store.counts() == {"pending": 40}
 
 
 def test_audit_429_defers_without_spending_item_attempts(tmp_path):
@@ -264,20 +265,20 @@ def test_single_alert_keeps_original_format_and_has_no_fill_delay(tmp_path):
     assert payload["components"][0]["components"][0]["label"] == "Open review item"
 
 
-def test_old_due_starter_cannot_starve_behind_three_fresh_paid_channels(tmp_path):
+def test_old_quiet_pro_category_cannot_starve_behind_three_fresh_paid_channels(tmp_path):
     store = JobStore(tmp_path / "q")
     store.record([product(998, available=False)], now=1000)
-    store.record([product(999)], now=87000)
+    store.record([product(999, category="pets")], now=87000)
     with store._connect() as db:
         db.execute(
-            "UPDATE jobs SET state='skipped' WHERE item_id=? AND route!='starter-items'",
+            "UPDATE jobs SET state='skipped' WHERE item_id=? AND route!='type-pets'",
             (product(999)["item_id"],),
         )
     # Pro/all/category/value remain freshly replenished throughout the cycle.
     store.record([product(i) for i in range(30)], now=87400)
     remote = Remote()
     run(store, remote, now=87400, limit=4)
-    assert any(STATE["channels"]["starter-items"] in route for route, _ in remote.calls)
+    assert any(STATE["channels"]["type-pets"] in route for route, _ in remote.calls)
 
 
 def test_full_privacy_audit_still_runs_before_each_four_channel_wave(tmp_path):

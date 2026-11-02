@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "hostName": "com.reviewer_item_relay.verification",
+  "extensionOrigin": "chrome-extension://oidgbnehgnikmniolojjkmhlpifdoiil/",
+  "limits": {
+    "messageBytes": 16384,
+    "holdMs": 30000,
+    "idleMs": 5000,
+    "prepareTtlMs": 2000,
+    "viewportMax": 20000,
+    "dprMin": 0.5,
+    "dprMax": 4
+  },
+  "errorCodes": [
+    "unsupported-platform", "invalid-request", "invalid-origin", "invalid-window",
+    "helper-busy", "desktop-locked", "user-busy", "button-held", "focus-changed",
+    "window-changed", "viewport-mismatch", "target-obscured", "target-expired",
+    "user-input", "input-failed", "release-failed", "watchdog-unavailable",
+    "already-used", "not-prepared", "host-unavailable", "max-duration", "closed"
+  ],
+  "phases": ["idle", "prepared", "holding", "released", "aborted", "closed"],
+  "operations": ["probe", "prepare", "press", "status", "release", "close"],
+  "requestIdPattern": "[A-Za-z0-9:_-]{1,80}",
+  "prepareTokenPattern": "[a-f0-9]{48}",
+  "stateTokenPattern": "[a-zA-Z0-9_-]{8,128}"
+}

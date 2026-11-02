@@ -1,0 +1,22 @@
+{
+  "prepare": [
+    {"name":"maximum", "valid":true, "viewport":{"width":20000,"height":20000,"dpr":4}, "point":{"x":19999,"y":19999}},
+    {"name":"width above maximum", "valid":false, "viewport":{"width":20001,"height":600,"dpr":1}, "point":{"x":1,"y":1}},
+    {"name":"height above maximum", "valid":false, "viewport":{"width":800,"height":20001,"dpr":1}, "point":{"x":1,"y":1}},
+    {"name":"old host-only maximum", "valid":false, "viewport":{"width":32768,"height":600,"dpr":1}, "point":{"x":1,"y":1}},
+    {"name":"minimum DPR", "valid":true, "viewport":{"width":800,"height":600,"dpr":0.5}, "point":{"x":0,"y":0}},
+    {"name":"DPR below minimum", "valid":false, "viewport":{"width":800,"height":600,"dpr":0.49}, "point":{"x":1,"y":1}},
+    {"name":"point at edge", "valid":false, "viewport":{"width":800,"height":600,"dpr":1}, "point":{"x":800,"y":1}}
+  ],
+  "state": [
+    {"name":"idle", "valid":true, "change":{}},
+    {"name":"holding", "valid":true, "change":{"phase":"holding","pressSent":true,"pressConfirmed":true}},
+    {"name":"aborted", "valid":true, "change":{"phase":"aborted","reason":"user-input"}},
+    {"name":"unknown reason", "valid":false, "change":{"reason":"private raw error"}},
+    {"name":"unknown phase", "valid":false, "change":{"phase":"pressing"}},
+    {"name":"nonboolean press", "valid":false, "change":{"pressSent":1}},
+    {"name":"negative hold", "valid":false, "change":{"holdMs":-1}},
+    {"name":"preparation token", "valid":true, "change":{"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
+    {"name":"invalid token", "valid":false, "change":{"token":"../private"}}
+  ]
+}

@@ -11,20 +11,21 @@ def test_paid_due_check_ignores_free_future_expired_and_terminal_jobs(tmp_path):
     assert store.has_due_paid(now=1000) is True
     with store._connect() as db:
         db.execute(
-            "UPDATE jobs SET state='sent' WHERE route!='starter-items' AND route!=?",
+            "UPDATE jobs SET state='sent' WHERE route NOT IN ('price-10-20',?)",
             (FREE_ROUTE_KEY,),
         )
+        db.execute("UPDATE jobs SET due=1300,next_attempt=1300 WHERE route='price-10-20'")
     assert store.has_due_paid(now=1299) is False
     assert store.has_due_paid(now=1300) is True
     with store._connect() as db:
         db.execute(
             "UPDATE jobs SET state='leased',lease_until=999999,next_attempt=999999 "
-            "WHERE route='starter-items'"
+            "WHERE route='price-10-20'"
         )
     assert store.has_due_paid(now=1301) is True  # Still prioritise paid retry/in-flight work.
     assert store.has_due_paid(now=999999) is False
     with store._connect() as db:
-        db.execute("UPDATE jobs SET state='failed' WHERE route='starter-items'")
+        db.execute("UPDATE jobs SET state='failed' WHERE route='price-10-20'")
     assert store.has_due_paid(now=87400) is False  # Free is due; paid is terminal.
 
 
@@ -158,15 +159,9 @@ def test_expensive_arrival_leads_next_paid_envelope_during_low_value_burst(tmp_p
     }
 
 
-def test_pro_precedes_overdue_starter_and_free_in_priority_slot(tmp_path):
+def test_pro_precedes_due_free_in_priority_slot(tmp_path):
     store = JobStore(tmp_path / "q")
     store.record([product(1, available=False)], now=0)
-    store.record([product(2, value_usd=39)], now=86000)
-    with store._connect() as db:
-        db.execute(
-            "UPDATE jobs SET state='skipped' WHERE item_id=? AND route!='starter-items'",
-            (product(2)["item_id"],),
-        )
     store.record([product(3, value_usd=999)], now=86400)
     batch = store.claim_batch(now=86400, size=1)
     assert batch["route"] == "pro-all" and values(batch) == [99900]
@@ -198,12 +193,7 @@ def test_catchup_within_busy_pro_channel_keeps_old_cheap_items_moving(tmp_path):
     assert values(catchup) == [500]
 
 
-def test_price_priority_never_releases_starter_or_free_early(tmp_path):
-    store = JobStore(tmp_path / "q")
-    store.record([product(1, value_usd=35)], now=1000)
-    only_route(store, "starter-items")
-    assert store.claim_batch(now=1299) is None
-    assert store.claim_batch(now=1300)["route"] == "starter-items"
+def test_price_priority_never_releases_free_early(tmp_path):
     free = JobStore(tmp_path / "free")
     free.record([product(2, value_usd=999)], now=1000)
     only_route(free, FREE_ROUTE_KEY)
@@ -223,19 +213,23 @@ def test_queue_metrics_distinguish_future_retry_throttle_and_terminal_history(tm
     assert metrics["by_tier"]["pro"]["due"] == 3
     assert metrics["by_tier"]["pro"]["retry_wait"] == 1
     assert metrics["by_tier"]["pro"]["throttled"] == 1
-    assert metrics["by_tier"]["starter"]["future"] == 1
+    assert metrics["by_tier"]["starter"]["future"] == 0
     assert metrics["by_tier"]["free"]["future"] == 2
     assert metrics["active_route_cooldowns"] == 1
-    assert metrics["expired_items"] == 4
-    assert metrics["reasons"]["expired"]["stale"] == 4
+    assert metrics["expired_items"] == 3
+    assert metrics["reasons"]["expired"]["stale"] == 3
 
 
 def test_delivery_latency_is_since_tier_due_and_omits_old_legacy_sends(tmp_path):
     store = JobStore(tmp_path / "q")
     store.record([product(1)], now=1000)
     with store._connect() as db:
+        # A sent legacy row stays available for historical latency reporting;
+        # current ingestion no longer creates a Starter destination.
         db.execute(
-            "UPDATE jobs SET state='sent',sent_at=due+7,message_id='1' WHERE route='starter-items'"
+            "INSERT INTO jobs (id,item_id,route,due,expires,state,next_attempt,sent_at,message_id) "
+            "SELECT 'legacy-sent',item_id,'starter-items',due+300,expires,'sent',due+300,"
+            "due+307,'1' FROM jobs WHERE route='pro-all'"
         )
         db.execute(
             "UPDATE jobs SET state='sent',sent_at=due+2,message_id='2' WHERE route='pro-all'"
@@ -261,6 +255,6 @@ def test_metrics_never_expose_arbitrary_stored_reason_text(tmp_path):
     with store._connect() as db:
         db.execute("UPDATE jobs SET state='failed',reason='Bearer secret-token'")
     metrics = store.delivery_metrics(now=1000)
-    assert metrics["failed_items"] == 5
-    assert metrics["reasons"]["failed"] == {"other": 5}
+    assert metrics["failed_items"] == 4
+    assert metrics["reasons"]["failed"] == {"other": 4}
     assert "secret-token" not in str(metrics)

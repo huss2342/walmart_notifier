@@ -57,7 +57,8 @@ if ($Remove) {
 $nativePython = Join-Path $nativeRoot '.venv\Scripts\python.exe'
 $nativeHost = Join-Path $nativeRoot 'native_verification\host.py'
 $nativeSource = Join-Path $nativeRoot 'native_verification\launcher.cs'
-foreach ($nativeRequired in @($nativePython, $nativeHost, $nativeSource)) {
+$nativeProtocol = Join-Path $nativeRoot 'native_verification\protocol.json'
+foreach ($nativeRequired in @($nativePython, $nativeHost, $nativeSource, $nativeProtocol)) {
     if (-not (Test-Path -LiteralPath $nativeRequired -PathType Leaf)) { throw 'Create the project .venv and preserve the native helper source before installing.' }
 }
 $nativeCompiler = @(

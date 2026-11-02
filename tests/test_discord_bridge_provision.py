@@ -211,10 +211,10 @@ def test_real_permission_aggregation_keeps_free_starter_and_interest_roles_priva
     for memberships, starter_access, pro_access in [
         ([], False, False),
         ([interest], False, False),
-        ([starter], True, False),
-        ([starter, interest], True, False),
-        ([pro], True, True),
-        ([starter, pro, interest], True, True),
+        ([starter], False, False),
+        ([starter, interest], False, False),
+        ([pro], False, True),
+        ([starter, pro, interest], False, True),
     ]:
         assert (
             bool(client.permissions(state["channels"]["starter-items"], memberships) & VIEW)
@@ -539,7 +539,7 @@ def test_simple_welcome_area_and_read_only_updates_do_not_expose_operator_guides
         "greeting",
         "how-to-use",
         "updates",
-        "🆓-free-24h-alerts",
+        "🆓24h-delayed-alerts",
     ]
     client, _, state = apply_server(tmp_path)
     for memberships in ([], [state["roles"]["starter"]], [state["roles"]["pro"]]):
@@ -620,21 +620,35 @@ def test_discoverable_server_requires_owner_change_without_administrator(tmp_pat
 
 def test_manifest_defines_prices_and_routes_without_credentials():
     manifest = server_manifest()
-    assert manifest["plans"]["starter"] == {
-        "role": "Starter",
-        "monthly_price_usd": 5,
-        "monthly_price_cents": 500,
-        "delay_seconds": 300,
-        "max_price_cents_exclusive": 4000,
-    }
-    assert manifest["plans"]["pro"]["monthly_price_usd"] == 20
+    assert set(manifest["plans"]) == {"free", "pro"}
+    assert manifest["plans"]["pro"]["monthly_price_usd"] == 30
+    assert manifest["plans"]["pro"]["monthly_price_cents"] == 3000
     assert manifest["plans"]["pro"]["delay_seconds"] == 0
     assert manifest["security"]["billing_enabled"] is False
     routes = {channel["key"]: channel for channel in manifest["channels"]}
     assert routes["pro-all"]["audience"] == "pro"
     assert routes["starter-items"]["bot_only_posting"] is True
+    assert routes["starter-items"]["audience"] == "operations"
     assert routes["collector-health"]["audience"] == "operations"
     assert "token" not in json.dumps(manifest).lower()
+
+
+@pytest.mark.parametrize("missing", [("starter-items",), ("starter", "starter-items")])
+def test_retired_starter_resources_can_be_deleted_without_blocking_active_feeds(tmp_path, missing):
+    client, _, state = apply_server(tmp_path)
+    removed = {state["categories" if key == "starter" else "channels"][key] for key in missing}
+    client.channels = [channel for channel in client.channels if channel["id"] not in removed]
+    assert audit(client, GUILD, state)["ok"]
+
+
+def test_deleted_active_pro_feed_still_blocks_delivery(tmp_path):
+    client, _, state = apply_server(tmp_path)
+    client.channels = [
+        channel for channel in client.channels if channel["id"] != state["channels"]["pro-all"]
+    ]
+    result = audit(client, GUILD, state)
+    assert not result["ok"]
+    assert any("pro-all is missing" in finding for finding in result["findings"])
 
 
 def test_temporary_setup_privileges_must_be_removed_before_delivery(tmp_path):

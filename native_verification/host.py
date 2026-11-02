@@ -9,6 +9,7 @@ import re
 import struct
 import sys
 import time
+import uuid
 from pathlib import Path
 
 if __package__ in {None, ""}:
@@ -16,16 +17,21 @@ if __package__ in {None, ""}:
 
 from native_verification.contracts import (
     ERROR_CODES,
+    EXTENSION_ORIGIN,
     HOST_NAME,
+    MAX_DPR,
     MAX_MESSAGE_BYTES,
+    MAX_VIEWPORT,
+    MIN_DPR,
+    OPS,
+    PREPARE_TOKEN_PATTERN,
     PROTOCOL_VERSION,
+    REQUEST_ID_PATTERN,
     DesktopError,
 )
 from native_verification.controller import NativeController
 
-EXTENSION_ORIGIN = "chrome-extension://oidgbnehgnikmniolojjkmhlpifdoiil/"
-OPS = frozenset({"probe", "prepare", "press", "status", "release", "close"})
-ID_PATTERN = re.compile(r"[A-Za-z0-9:_-]{1,80}\Z")
+ID_PATTERN = re.compile(REQUEST_ID_PATTERN + r"\Z")
 
 
 def _invalid():
@@ -109,7 +115,7 @@ def validate_request(value):
         if (
             set(payload) != {"token"}
             or not isinstance(payload["token"], str)
-            or not re.fullmatch(r"[a-f0-9]{48}", payload["token"])
+            or not re.fullmatch(PREPARE_TOKEN_PATTERN, payload["token"])
         ):
             _invalid()
     elif op == "prepare":
@@ -123,9 +129,9 @@ def validate_request(value):
         if not all(_number(item) for item in [*viewport.values(), *point.values()]):
             _invalid()
         if not (
-            0 < viewport["width"] <= 32768
-            and 0 < viewport["height"] <= 32768
-            and 0.5 <= viewport["dpr"] <= 4
+            0 < viewport["width"] <= MAX_VIEWPORT
+            and 0 < viewport["height"] <= MAX_VIEWPORT
+            and MIN_DPR <= viewport["dpr"] <= MAX_DPR
         ):
             _invalid()
         if not (0 <= point["x"] < viewport["width"] and 0 <= point["y"] < viewport["height"]):
@@ -162,28 +168,69 @@ def validate_launch(argv):
 
 
 def safe_logger():
-    root = Path(__file__).resolve().parent.parent / "data" / "native-verification"
-    root.mkdir(parents=True, exist_ok=True)
-    logger = logging.getLogger("native-verification")
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    if not logger.handlers:
-        handler = logging.handlers.RotatingFileHandler(
-            root / "host.log", maxBytes=65536, backupCount=2, encoding="utf-8"
-        )
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        logger.addHandler(handler)
-    return logger
+    global _log_failures
+    try:
+        root = Path(__file__).resolve().parent.parent / "data" / "native-verification"
+        root.mkdir(parents=True, exist_ok=True)
+        logger = logging.getLogger("native-verification")
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        if not logger.handlers:
+            handler = _NativeLogHandler(
+                root / "host.log", maxBytes=65536, backupCount=2, encoding="utf-8", delay=True
+            )
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            logger.addHandler(handler)
+        return logger
+    except Exception:
+        # Disk/log initialization cannot prevent protocol servicing or owned
+        # input cleanup. Never pass filesystem exception details to stderr.
+        _log_failures += 1
+        return None
+
+
+_log_failures = 0
+
+
+class _NativeLogHandler(logging.handlers.RotatingFileHandler):
+    def handleError(self, _record):  # noqa: N802
+        global _log_failures
+        _log_failures += 1
+
+
+def log_status():
+    return {"dropped_events": _log_failures,
+            "last_error": "log_unavailable" if _log_failures else None}
+
+
+def _session_log(logger, event, run_id, **fields):
+    global _log_failures
+    if logger is None:
+        return
+    try:
+        logger.info(json.dumps({"timestamp": round(time.time(), 3), "event": event,
+                                "entry_point": "native", "run_id": run_id,
+                                "dropped_events": _log_failures,
+                                **fields}, separators=(",", ":"), allow_nan=False))
+    except Exception:
+        # Logging cannot prevent the protocol reply or finally-release path.
+        _log_failures += 1
 
 
 def run_session(input_stream, output_stream, controller, logger=None):
+    run_id = uuid.uuid4().hex
+    session_started = time.monotonic()
+    _session_log(logger, "native-session-started", run_id)
     try:
         while True:
             request_id, op = "invalid", None
+            operation_started = time.monotonic()
             try:
                 value = read_frame(input_stream)
                 if value is None:
                     break
+                # Exclude idle time between Chrome requests from operation latency.
+                operation_started = time.monotonic()
                 if (
                     isinstance(value, dict)
                     and isinstance(value.get("id"), str)
@@ -213,6 +260,7 @@ def run_session(input_stream, output_stream, controller, logger=None):
                     "at": round(time.time(), 3),
                     "op": op if op in OPS else "invalid",
                     "ok": response["ok"],
+                    "duration_ms": round((time.monotonic()-operation_started)*1000, 3),
                 }
                 record.update(
                     {
@@ -228,11 +276,20 @@ def run_session(input_stream, output_stream, controller, logger=None):
                 )
                 if "error" in response:
                     record["error"] = response["error"]
-                logger.info(json.dumps(record, separators=(",", ":")))
+                if state.get("reason") in ERROR_CODES:
+                    record["reason"] = state["reason"]
+                _session_log(logger, "native-operation", run_id, **record)
             if op == "close" or response.get("error") == "invalid-request":
                 break
     finally:
         controller.close()
+        try:
+            state = controller.state()
+        except Exception:
+            state = {}
+        _session_log(logger, "native-session-closed", run_id,
+                     duration_ms=round((time.monotonic()-session_started)*1000, 3),
+                     releaseConfirmed=state.get("releaseConfirmed") is True)
 
 
 def main(argv=None):

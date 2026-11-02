@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import atomic_json
 import relay_settings
 from relay_settings import RelaySettingsStore, validate_settings
 
@@ -181,7 +182,7 @@ def test_failed_save_preserves_prior_file_and_cleans_temporary_sibling(
     def fail_write(*args):
         raise OSError("write unavailable")
 
-    monkeypatch.setattr(relay_settings.os, failure, fail_write)
+    monkeypatch.setattr(atomic_json.os, failure, fail_write)
     with pytest.raises(OSError, match="write unavailable"):
         store.save(incoming)
     assert path.read_bytes() == before

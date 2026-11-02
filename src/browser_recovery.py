@@ -24,9 +24,60 @@ from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 
+from atomic_json import write_atomic_json
 from relay_settings import RelaySettingsStore
 
 log = logging.getLogger("browser-recovery")
+_RECOVERY_LOG_FAILURES = 0
+_RECOVERY_EVENTS = frozenset({
+    "disabled", "refresh-disabled", "verification-paused", "healthy", "heartbeat-grace",
+    "startup-grace", "outage-already-handled", "launch-cooldown", "launch-hourly-limit",
+    "launch-chrome", "invalid-config", "invalid-relay-settings", "chrome-unavailable",
+    "chrome-profile-unavailable", "would-launch-chrome", "chrome-launched", "chrome-launch-failed",
+    "would-check-local-notifier", "notifier-start-requested", "notifier-start-failed",
+    "docker-start-requested", "docker-start-unavailable", "chrome-profile-selected",
+    "recovery-already-running", "recovery-check-failed", "recovery-state-unavailable",
+    "recovery-state-cleanup-unavailable", "recovery-started", "recovery-stopped",
+})
+
+
+class RecoveryJSONFormatter(logging.Formatter):
+    """Fixed decision labels and numeric timings; never paths or profile names."""
+
+    def format(self, record):
+        try:
+            candidate = record.getMessage().split(" ", 1)[0]
+        except Exception:
+            candidate = "other"
+        event = candidate if candidate in _RECOVERY_EVENTS else "other"
+        value = {"timestamp": record.created, "event": event, "entry_point": "recovery",
+                 "severity": record.levelname.lower(), "dropped_events": _RECOVERY_LOG_FAILURES}
+        elapsed = getattr(record, "duration_ms", None)
+        if type(elapsed) in {int, float} and 0 <= elapsed <= 1e15 and math.isfinite(elapsed):
+            value["duration_ms"] = elapsed
+        return json.dumps(value, separators=(",", ":"), allow_nan=False)
+
+
+def _recovery_file_handler(path):
+    from discord_bridge.rolling_logs import RollingLogHandler
+
+    class SafeHandler(RollingLogHandler):
+        def handleError(self, _record):  # noqa: N802
+            global _RECOVERY_LOG_FAILURES
+            _RECOVERY_LOG_FAILURES += 1
+
+    class UnavailableHandler(logging.Handler):
+        def emit(self, _record):
+            global _RECOVERY_LOG_FAILURES
+            _RECOVERY_LOG_FAILURES += 1
+
+    try:
+        return SafeHandler(path, max_bytes=256 * 1024, total_bytes=2 * 1024 * 1024)
+    except OSError:
+        global _RECOVERY_LOG_FAILURES
+        _RECOVERY_LOG_FAILURES += 1
+        return UnavailableHandler()
+
 REVIEWER_URL = "https://www.walmart.com/reviews/claim-product"
 HEALTH_URL = "http://127.0.0.1:8787/health"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -136,24 +187,9 @@ def _save_state(root: Path, state: dict) -> None:
     encoded = (json.dumps(state, indent=2, allow_nan=False) + "\n").encode("utf-8")
     if len(encoded) > _MAX_JSON:
         raise ValueError("Invalid recovery state")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            dir=path.parent, prefix=".browser-recovery-state.", suffix=".tmp",
-            mode="wb", delete=False,
-        ) as handle:
-            temporary = Path(handle.name)
-            handle.write(encoded)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        if temporary is not None:
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                log.warning("recovery-state-cleanup-unavailable")
+    write_atomic_json(
+        path, encoded, logger=log, cleanup_warning="recovery-state-cleanup-unavailable",
+    )
 
 
 @dataclass(frozen=True)
@@ -287,7 +323,7 @@ class RecoverySupervisor:
             if inspected_profile is None:
                 log.info("chrome-profile-unavailable")
             else:
-                log.info("chrome-profile-selected profile=%s", inspected_profile)
+                log.info("chrome-profile-selected")
         try:
             saved = RelaySettingsStore(self.root / "data" / "relay-settings.json").read()
         except (OSError, ValueError):
@@ -319,7 +355,7 @@ class RecoverySupervisor:
         if profile is None:
             return "chrome-profile-unavailable"
         if not self.dry_run:
-            log.info("chrome-profile-selected profile=%s", profile)
+            log.info("chrome-profile-selected")
         if self.dry_run:
             return "would-launch-chrome"
         # Commit the attempt first: a supervisor crash must not create an
@@ -540,7 +576,6 @@ class InstanceLock:
 
 def main(argv=None) -> int:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from discord_bridge.rolling_logs import RollingLogHandler
 
     parser = argparse.ArgumentParser(description="Recover the local reviewer browser heartbeat")
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
@@ -550,11 +585,8 @@ def main(argv=None) -> int:
     root = args.root.resolve()
     (root / "data").mkdir(parents=True, exist_ok=True)
     log.setLevel(logging.INFO)
-    file_handler = RollingLogHandler(
-        root / "data" / "browser-recovery.log", max_bytes=256 * 1024,
-        total_bytes=2 * 1024 * 1024,
-    )
-    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    file_handler = _recovery_file_handler(root / "data" / "browser-recovery.log")
+    file_handler.setFormatter(RecoveryJSONFormatter())
     log.addHandler(file_handler)
     # pythonw.exe intentionally has no stdout/stderr when launched at login.
     stream_handler = None
@@ -569,12 +601,17 @@ def main(argv=None) -> int:
             return 0
         runner = RecoverySupervisor(root, dry_run=args.dry_run)
         previous = None
+        last_receipt_at = 0
+        log.info("recovery-started")
         while True:
+            tick_started = time.monotonic()
             try:
                 result = runner.tick()
-                if result != previous or args.once:
-                    log.info("%s", result)
+                if result != previous or args.once or tick_started-last_receipt_at >= 60:
+                    log.info("%s", result, extra={
+                        "duration_ms": round((time.monotonic()-tick_started)*1000, 3)})
                     previous = result
+                    last_receipt_at = tick_started
             except (OSError, ValueError, RuntimeError):
                 log.warning("recovery-check-failed")
                 if args.once:
@@ -586,6 +623,7 @@ def main(argv=None) -> int:
         return 0
     finally:
         lock.release()
+        log.info("recovery-stopped")
         log.removeHandler(file_handler)
         file_handler.close()
         if stream_handler is not None:

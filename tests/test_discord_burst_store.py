@@ -287,21 +287,21 @@ def test_fresh_first_batch_fills_old_backlog_without_crossing_channels(tmp_path)
 def test_seed_or_ineligible_member_cancels_frozen_batch_without_repacking(tmp_path):
     store = core.JobStore(tmp_path / "q")
     store.record([product(i) for i in range(3)], now=1000)
-    only_route(store, "starter-items")
-    batch = store.claim_batch(now=1300)
-    store.retry_batch(batch, now=1300, delay=20, reason="remote_retry")
-    store.record([product(1, value_usd=99.99)], now=1301)
-    only_route(store, "starter-items")
-    assert store.claim_batch(now=1320) is None
+    only_route(store, "price-10-20")
+    batch = store.claim_batch(now=1000)
+    store.retry_batch(batch, now=1000, delay=20, reason="remote_retry")
+    store.record([product(1, value_usd=99.99)], now=1001)
+    only_route(store, "price-10-20")
+    assert store.claim_batch(now=1020) is None
     with store._connect() as db:
         assert db.execute("SELECT count(*) FROM jobs WHERE state='leased'").fetchone()[0] == 0
         assert (
             db.execute("SELECT state FROM dispatches WHERE id=?", (batch["id"],)).fetchone()[0]
             == "skipped"
         )
-    store.record([product(i) for i in range(3)], now=1321)
-    only_route(store, "starter-items")
-    assert store.claim_batch(now=1321) is None
+    store.record([product(i) for i in range(3)], now=1021)
+    only_route(store, "price-10-20")
+    assert store.claim_batch(now=1021) is None
 
 
 def test_restarted_active_channel_lease_suppresses_idle_audit_spins(tmp_path):

@@ -1,7 +1,7 @@
 """Only REST is faked: watches, matching, leases and restarts use SQLite."""
 
 import pytest
-from discord_bridge.api import DiscordError
+from discord_bridge.api import DeliveryOutcome, DiscordError
 from discord_bridge.request_delivery import RequestWorker
 from discord_bridge.request_store import RequestStore
 
@@ -65,6 +65,31 @@ def test_product_goes_only_to_dm_after_current_pro_verification(tmp_path):
     assert provider.calls[-2][1] == f"/guilds/{GUILD}/members/{USER}"
     RequestWorker(provider, STATE, RequestStore(store.path), enabled=True).tick(now=13)
     assert len(provider.messages) == 1
+
+
+def test_transport_proven_pre_submission_failure_retries_without_manual_review(tmp_path):
+    store, _, provider, worker = setup(tmp_path)
+    provider.send_error = DiscordError(outcome=DeliveryOutcome.NOT_SUBMITTED)
+    assert worker.tick(now=12)["retried"] == 1
+    assert store.stats()["review"] == 0
+    provider.send_error = None
+    assert worker.tick(now=60)["sent"] == 1
+
+
+@pytest.mark.parametrize("outcome", [DeliveryOutcome.UNKNOWN, DeliveryOutcome.ACCEPTED])
+def test_transport_outcomes_that_may_have_posted_never_blindly_repeat(tmp_path, outcome):
+    store, _, provider, worker = setup(tmp_path)
+    provider.send_error = DiscordError(outcome=outcome)
+    assert worker.tick(now=12)["review"] == 1
+    provider.send_error = None
+    assert worker.tick(now=60)["sent"] == 0
+    assert len(provider.messages) == 1
+    assert store.stats()["review"] == 1
+
+
+def test_explicit_outcome_cannot_downgrade_ambiguous_transport_evidence():
+    error = DiscordError(ambiguous=True, outcome=DeliveryOutcome.NOT_SUBMITTED)
+    assert error.outcome == DeliveryOutcome.UNKNOWN
 
 
 @pytest.mark.parametrize(
@@ -155,6 +180,23 @@ def test_unavailable_during_membership_check_prevents_delivery(tmp_path):
     provider.on_member = lambda: observe(store, [product(available=False)], now=12)
     worker.tick(now=12)
     assert provider.messages == []
+
+
+@pytest.mark.parametrize("latest_value", [9999, None])
+def test_value_below_minimum_at_submission_prevents_dm(tmp_path, monkeypatch, latest_value):
+    store, request, provider, worker = setup(tmp_path)
+    store.edit(USER, request["id"], "air fryer", min_value=100, now=11)
+    observe(store, [product(value_cents=10000)], now=11)
+    begin_send = store.begin_send
+
+    def value_changes_before_commit(job, **kwargs):
+        observe(store, [product(value_cents=latest_value)], now=12)
+        return begin_send(job, **kwargs)
+
+    monkeypatch.setattr(store, "begin_send", value_changes_before_commit)
+    assert worker.tick(now=12)["sent"] == 0
+    assert provider.messages == []
+    assert len(store.list(USER)) == 1
 
 
 def test_blocked_dm_has_no_public_fallback(tmp_path):

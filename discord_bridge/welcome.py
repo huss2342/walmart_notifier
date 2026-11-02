@@ -14,11 +14,13 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
 from .api import DiscordError
-from .monitoring import emit_event
+from .monitoring import emit_event, error_fields
+from .request_store import member_ref
 
 _ID = re.compile(r"[0-9]{17,20}\Z")
 _POLL_SECONDS = 30
@@ -37,6 +39,8 @@ def _snowflake(value):
 
 class WelcomeWorker:
     """One worker owns a small SQLite outbox; health exposes counters, not IDs."""
+
+    component = "welcome"
 
     def __init__(
         self,
@@ -67,6 +71,7 @@ class WelcomeWorker:
         self._configured = False
         self._thread = None
         self._new_activation = False
+        self._correlation_id = None
         if not enabled:
             return
         self.guild = state.get("guild_id")
@@ -301,11 +306,13 @@ class WelcomeWorker:
                 ]
                 if matches:
                     self._settle(row["event_id"], "sent", message=matches[0]["id"])
+                    self._delivery_event("dispatch_sent", row, reconciled=1)
                     result["reconciled"] += 1
                 else:
                     # A crash may have occurred before or after transmission.
                     # Prefer one missed welcome over another direct ping.
                     self._settle(row["event_id"], "review")
+                    self._delivery_event("dispatch_skipped", row, reason="ambiguous_send", review=1)
                     result["review"] += 1
                     self._last_error = "ambiguous_send"
                 continue
@@ -326,15 +333,19 @@ class WelcomeWorker:
                 self._settle(row["event_id"], "pending")
                 raise
             try:
+                self._delivery_event("dispatch_sending", row)
                 response = self.request("POST", f"/channels/{self.destination}/messages", payload)
                 if not isinstance(response, dict) or not _snowflake(response.get("id")):
                     raise DiscordError("Invalid welcome send response", ambiguous=True)
                 self._settle(row["event_id"], "sent", message=response["id"])
+                self._delivery_event("dispatch_sent", row, sent=1)
                 result["sent"] += 1
             except _Deferred:
                 self._settle(row["event_id"], "pending")
                 raise
             except DiscordError as exc:
+                self._delivery_event("welcome_error", row, status=exc.status,
+                                     provider_code=exc.provider_code, **error_fields(exc))
                 if exc.status == 429:
                     delay = exc.retry_after
                     delay = (
@@ -357,6 +368,14 @@ class WelcomeWorker:
                     self._last_error = "ambiguous_send"
                 break
 
+    def _delivery_event(self, event, row, **fields):
+        dispatch = hashlib.sha256(
+            f"welcome-delivery-v1:{self.component}:{row['event_id']}".encode()
+        ).hexdigest()[:32]
+        emit_event(self.event_sink, event, component=self.component, phase="send",
+                   correlation_id=self._correlation_id, dispatch_id=dispatch,
+                   member_ref=member_ref(row["user_id"]), **fields)
+
     def tick(self):
         result = {
             "sent": 0,
@@ -372,6 +391,8 @@ class WelcomeWorker:
             if not self.enabled or now < self._next_poll:
                 return result
             self._next_poll = now + _POLL_SECONDS
+            self._correlation_id = uuid.uuid4().hex
+            previous_error = self._last_error
             try:
                 self._available()
                 self._configured = False
@@ -401,6 +422,11 @@ class WelcomeWorker:
             except DiscordError as exc:
                 self._last_error = "rate_limited" if exc.status == 429 else "provider_error"
                 result["throttled"] = exc.status == 429
+                if self._last_error != previous_error:
+                    emit_event(self.event_sink, "welcome_error", component=self.component,
+                               phase="welcome", correlation_id=self._correlation_id,
+                               status=exc.status, provider_code=exc.provider_code,
+                               **error_fields(exc))
                 if (
                     exc.status == 429
                     and type(exc.retry_after) in (int, float)
@@ -410,10 +436,15 @@ class WelcomeWorker:
             except Exception as exc:
                 self._last_error = "worker_error"
                 emit_event(
-                    self.event_sink, "welcome_error", phase="welcome", error_type=type(exc).__name__
+                    self.event_sink, "welcome_error", component=self.component, phase="welcome",
+                    correlation_id=self._correlation_id, **error_fields(exc)
                 )
             finally:
-                emit_event(self.event_sink, "welcome_cycle", phase="welcome", **result)
+                if previous_error is not None and self._last_error is None:
+                    emit_event(self.event_sink, "worker_recovered", component=self.component,
+                               transition="recovered", correlation_id=self._correlation_id)
+                emit_event(self.event_sink, "welcome_cycle", component=self.component,
+                           phase="welcome", correlation_id=self._correlation_id, **result)
         return result
 
     def health(self):
@@ -446,9 +477,13 @@ class WelcomeWorker:
             return
 
         def work():
+            emit_event(self.event_sink, "worker_lifecycle", component=self.component,
+                       transition="started")
             while not self.stop_event.is_set():
                 self.tick()
                 self.stop_event.wait(_POLL_SECONDS)
+            emit_event(self.event_sink, "worker_lifecycle", component=self.component,
+                       transition="stopped")
 
         self._thread = threading.Thread(target=work, name="discord-welcome", daemon=True)
         self._thread.start()

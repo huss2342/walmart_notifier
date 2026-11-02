@@ -1,274 +1,40 @@
-"""Validated public observations and a durable, per-destination delivery queue."""
+"""Durable per-destination jobs and immutable dispatch envelopes.
+
+Observation and rendering names remain reexported for existing integrations.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import math
-import re
 import secrets
 import sqlite3
 import time
 from contextlib import contextmanager
-from decimal import Decimal
 from pathlib import Path
-from urllib.parse import urlencode, urlsplit
 
 from .api import encode_payload
-from .layout import FREE_DELAY_SECONDS, FREE_ROUTE_KEY, STARTER_DELAY_SECONDS
+from .messages import _embed_title as _embed_title
+from .messages import render_batch as render_batch
+from .messages import render_message as render_message
+from .monitoring import emit_event
+from .observations import CATEGORIES as CATEGORIES
+from .observations import MAX_BATCH as MAX_BATCH
+from .observations import SAMPLING_PARAMS as SAMPLING_PARAMS
+from .observations import _product_image as _product_image
+from .observations import _text as _text
+from .observations import normalize_item as normalize_item
+from .observations import route_keys as route_keys
+from .observations import validate_batch as validate_batch
+from .policy import FREE_DELAY_SECONDS, FREE_ROUTE_KEY, RETIRED_ROUTE_KEYS
+from .policy import FREE_JOB_LIFETIME_SECONDS as FREE_JOB_LIFETIME_SECONDS
+from .policy import JOB_LIFETIME_SECONDS as JOB_LIFETIME_SECONDS
+from .policy import PRICE_BANDS as PRICE_BANDS
 from .request_store import initialize_requests, match_requests
 
-CATEGORIES = (
-    "furniture",
-    "home-storage-decor",
-    "kitchen-appliances",
-    "electronics",
-    "tools-auto",
-    "beauty-health",
-    "clothing-accessories",
-    "toys-baby-books",
-    "pets",
-    "sports-office-travel",
-    "other",
-)
-PRICE_BANDS = (
-    (1000, "under-10"),
-    (2000, "10-20"),
-    (4000, "20-40"),
-    (8000, "40-80"),
-    (20000, "80-200"),
-)
-JOB_LIFETIME_SECONDS = 1800
-FREE_JOB_LIFETIME_SECONDS = 7 * 86400
-MAX_BATCH = 500
-# A conservative application cap after live rejection of 15–17KiB envelopes;
-# this is not a claim about Discord's documented attachment/request limits.
+# Application wire ceiling; kept here for existing dispatcher configuration/tests.
 MAX_MESSAGE_BYTES = 10 * 1024
-SAMPLING_PARAMS = {
-    "filters": '[{"intent":"sampling","values":["Sampling"]}]',
-    "classType": "REGULAR",
-    "from": "/reviews/claim-product",
-}
-
-
-def _text(value: object, field: str, limit: int) -> str:
-    if not isinstance(value, str) or not value.strip() or len(value) > limit:
-        raise ValueError(f"invalid {field}")
-    if any(ord(char) < 32 for char in value):
-        raise ValueError(f"invalid {field}")
-    return value.strip()
-
-
-def _product_image(value: object) -> str:
-    """Keep only public Walmart product photos, without query/fragment data.
-
-    Images are optional: bad evidence must never stop delivery of a valid item.
-    Discord fetches the photo; this service does not download or proxy it.
-    """
-    if (
-        not isinstance(value, str)
-        or not value
-        or len(value) > 2048
-        or any(char.isspace() or ord(char) < 32 for char in value)
-    ):
-        return ""
-    try:
-        parsed = urlsplit(value)
-    except ValueError:
-        return ""
-    if (
-        parsed.scheme != "https"
-        or parsed.netloc != "i5.walmartimages.com"
-        or not re.fullmatch(
-            r"/(?:asr|seo)/[A-Za-z0-9][A-Za-z0-9_.~-]*\.(?:avif|jpe?g|png|webp)",
-            parsed.path,
-            re.IGNORECASE,
-        )
-    ):
-        return ""
-    return f"https://i5.walmartimages.com{parsed.path}"
-
-
-def normalize_item(raw: dict) -> dict:
-    """Project only public product fields; never retain the owner's quota/raw data."""
-    if not isinstance(raw, dict):
-        raise ValueError("item must be an object")
-    item_id = _text(raw.get("item_id"), "item_id", 40)
-    if not re.fullmatch(r"ip-\d{6,20}", item_id):
-        raise ValueError("item_id must be ip- followed by the Walmart item number")
-    title = _text(raw.get("title"), "title", 2000)
-    if "value_cents" in raw and "value_usd" in raw:
-        raise ValueError("supply value_cents or value_usd, not both")
-    value = raw.get("value_cents", raw.get("value_usd"))
-    cents = None
-    if value is not None:
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise ValueError("value must be numeric or null")
-        if value < 0 or value > 100_000_000 or not math.isfinite(value):
-            raise ValueError("invalid retail value")
-        amount = Decimal(str(value)) * (1 if "value_cents" in raw else 100)
-        if amount != amount.to_integral_value():
-            raise ValueError("retail value must use whole cents")
-        cents = int(amount)
-    if raw.get("currency", "USD") != "USD":
-        raise ValueError("only USD is supported")
-    if "available" in raw and not isinstance(raw["available"], bool):
-        raise ValueError("available must be a boolean")
-    number = item_id.removeprefix("ip-")
-    url = raw.get("product_url", raw.get("url")) or f"https://www.walmart.com/ip/{number}"
-    url = _text(url, "product_url", 4096)
-    parsed = urlsplit(url)
-    match = re.fullmatch(r"/ip/(?:[^/?#]+/)?(\d{6,20})/?", parsed.path)
-    if (
-        parsed.scheme != "https"
-        or parsed.netloc != "www.walmart.com"
-        or not match
-        or match.group(1) != number
-    ):
-        raise ValueError("product_url must be the matching HTTPS Walmart item")
-    product_url = f"https://www.walmart.com{parsed.path.rstrip('/')}"
-    if len(product_url + "?" + urlencode(SAMPLING_PARAMS)) > 512:
-        product_url = f"https://www.walmart.com/ip/{number}"
-    category = raw.get("primary_category", raw.get("category", "other"))
-    category = category if isinstance(category, str) and category in CATEGORIES else "other"
-    return {
-        "item_id": item_id,
-        "title": title,
-        "value_cents": cents,
-        "currency": "USD",
-        "category": category,
-        "product_url": product_url,
-        "image_url": _product_image(raw.get("image_url")),
-        "review_url": product_url + "?" + urlencode(SAMPLING_PARAMS),
-        "review_url_status": "constructed-unverified",
-        "available": raw.get("available") is not False,
-    }
-
-
-def validate_batch(payload: object) -> list[dict]:
-    if isinstance(payload, dict) and "items" in payload:
-        payload = payload["items"]
-    elif isinstance(payload, dict):
-        payload = [payload]
-    if not isinstance(payload, list) or not 1 <= len(payload) <= MAX_BATCH:
-        raise ValueError("expected 1 to 500 items")
-    return [normalize_item(raw) for raw in payload]
-
-
-def route_keys(item: dict) -> list[str]:
-    if not item["available"]:
-        return [FREE_ROUTE_KEY]
-    routes = ["pro-all", f"type-{item['category']}"]
-    value = item["value_cents"]
-    if value is not None and value > 0:
-        band = next((name for maximum, name in PRICE_BANDS if value < maximum), "200-plus")
-        routes.append(f"price-{band}")
-        if value < 4000:
-            routes.append("starter-items")
-    return [*routes, FREE_ROUTE_KEY]
-
-
-def _embed_title(text: str) -> str:
-    # A conservative UTF-16 bound also covers non-BMP titles; never split a
-    # surrogate pair at Discord's per-title limit.
-    return text.encode("utf-16-le", errors="replace")[:512].decode("utf-16-le", errors="ignore")
-
-
-def render_message(item: dict, *, first_seen: float, last_seen: float, route: str) -> dict:
-    value = item["value_cents"]
-    money = f"${value / 100:,.2f}" if value else "Retail value unverified"
-    title = item["title"].replace("@", "@\u200b")
-    historical = route == FREE_ROUTE_KEY
-    if historical:
-        delay = "Historical alert — 24-hour delay"
-    elif route == "starter-items":
-        delay = "5-minute delay"
-    else:
-        delay = "No intentional delay"
-    description = (
-        f"Category: {item['category']}\n{delay}\n"
-        f"First detected: <t:{int(first_seen)}:f>\n"
-        f"Last observed: <t:{int(last_seen)}:R>\n"
-        "Eligibility and availability depend on your Walmart account.\n"
-        "The review link is constructed and needs cross-account verification."
-    )
-    if historical:
-        description += (
-            "\nTitle and retail value are from the original captured observation. "
-            "This is a historical listing, not a current availability alert."
-        )
-    embed = {
-        "title": _embed_title(f"{money} | {title}"),
-        "url": item["product_url"],
-        "description": description,
-        "footer": {"text": item["item_id"]},
-    }
-    if image := _product_image(item.get("image_url")):
-        embed["thumbnail"] = {"url": image}
-    return {
-        "allowed_mentions": {"parse": []},
-        "embeds": [embed],
-        "components": [
-            {
-                "type": 1,
-                "components": [
-                    {"type": 2, "style": 5, "label": label, "url": url}
-                    for label, url in (
-                        ("Open review item", item["review_url"]),
-                        ("View product", item["product_url"]),
-                    )
-                ],
-            }
-        ],
-    }
-
-
-def render_batch(jobs: list[dict]) -> dict:
-    """Bundle only already-ready items from one destination, without a fill timer."""
-    maximum = 5 if jobs and jobs[0]["route"] == FREE_ROUTE_KEY else 10
-    if not 1 <= len(jobs) <= maximum or len({job["route"] for job in jobs}) != 1:
-        raise ValueError("invalid dispatch item count or destination")
-    messages = [
-        render_message(
-            job["item"],
-            first_seen=job["first_seen"],
-            last_seen=job["last_seen"],
-            route=job["route"],
-        )
-        for job in jobs
-    ]
-    if len(messages) == 1:
-        return messages[0]
-    result = {
-        "content": f"**{len(jobs)} item alerts**",
-        "allowed_mentions": {"parse": []},
-        "embeds": [],
-        "components": [],
-    }
-    for index, message in enumerate(messages, 1):
-        embed = message["embeds"][0]
-        embed["title"] = _embed_title(f"[{index}] {embed['title']}")
-        # Each card itself opens review context; members needn't scroll through
-        # the other cards to reach the numbered button rows below the bundle.
-        embed["url"] = jobs[index - 1]["item"]["review_url"]
-        result["embeds"].append(embed)
-        row = message["components"][0]
-        for button in row["components"]:
-            button["label"] = f"{index} · {button['label']}"
-        # Two item pairs share each row only for larger paid bursts. All
-        # review/product links survive within five rows and four buttons/row.
-        if len(jobs) > 5 and index % 2 == 0:
-            result["components"][-1]["components"].extend(row["components"])
-        else:
-            result["components"].append(row)
-    characters = sum(
-        len((embed["title"] + embed["description"] + embed["footer"]["text"]).encode("utf-16-le"))
-        // 2
-        for embed in result["embeds"]
-    )
-    if characters > 6000:
-        raise ValueError("dispatch exceeds Discord embed text budget")
-    return result
 
 
 class JobStore:
@@ -337,6 +103,20 @@ class JobStore:
             """)
             db.execute("PRAGMA user_version=4")
             initialize_requests(db)
+            # Retire old pending/retry envelopes before any worker can resume
+            # them. Keep payloads, nonces and terminal history for inspection.
+            for route in RETIRED_ROUTE_KEYS:
+                db.execute(
+                    "UPDATE dispatches SET state='skipped' "
+                    "WHERE route=? AND state IN ('pending','leased')",
+                    (route,),
+                )
+                db.execute(
+                    "UPDATE jobs SET state='skipped',reason='route_retired',"
+                    "lease_token=NULL,lease_until=NULL "
+                    "WHERE route=? AND state IN ('pending','leased')",
+                    (route,),
+                )
 
     @contextmanager
     def _connect(self):
@@ -349,13 +129,23 @@ class JobStore:
         finally:
             db.close()
 
-    def record(self, items: list[dict], *, now: float | None = None, seed_only=False) -> dict:
+    def record(
+        self,
+        items: list[dict],
+        *,
+        now: float | None = None,
+        seed_only=False,
+        request_event_sink=None,
+        event_sink=None,
+    ) -> dict:
         # Validate the entire batch before any side effect, even for direct Python callers.
         if not isinstance(items, list) or not 1 <= len(items) <= MAX_BATCH:
             raise ValueError("expected 1 to 500 normalized items")
         items = [normalize_item(item) for item in items]
         now = time.time() if now is None else now
         new = duplicates = queued = 0
+        activity = {} if request_event_sink is not None else None
+        routed = [] if event_sink is not None else None
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             for item in items:
@@ -390,12 +180,7 @@ class JobStore:
                 added = False
                 for route in route_keys(item):
                     historical = route == FREE_ROUTE_KEY
-                    if historical:
-                        delay = FREE_DELAY_SECONDS
-                    elif route == "starter-items":
-                        delay = STARTER_DELAY_SECONDS
-                    else:
-                        delay = 0
+                    delay = FREE_DELAY_SECONDS if historical else 0
                     # A newly captured free snapshot always waits a full day,
                     # including old items first seen before this feature existed.
                     due = (now if historical else first_seen) + delay
@@ -421,82 +206,82 @@ class JobStore:
                         ),
                     )
                     added = added or inserted.rowcount == 1
-                    db.execute(
+                    rearmed = db.execute(
                         "UPDATE jobs SET state='pending',next_attempt=due,reason=NULL "
                         "WHERE item_id=? AND route=? AND state='skipped' AND expires>? "
                         "AND batch_id IS NULL AND reason='observation_no_longer_matches'",
                         (item["item_id"], route, now),
                     )
+                    if routed is not None and (inserted.rowcount or rearmed.rowcount):
+                        routed.append({"phase": "intake", "route": route,
+                                       "item_ids": [item["item_id"]], "job_ids": [key],
+                                       "transition": "queued" if inserted.rowcount else "rearmed",
+                                       "due": due, "expires": expires})
                 queued += int(added)
-            match_requests(db, items, now=now, seed_only=seed_only)
+            match_requests(db, items, now=now, seed_only=seed_only, activity=activity)
+        # Receipts describe durable work only; a later transaction failure must
+        # never leave logs claiming a route was queued when it was rolled back.
+        groups = {}
+        for fields in routed or ():
+            group = groups.setdefault((fields["route"], fields["transition"]), {
+                "phase": "intake", "route": fields["route"], "transition": fields["transition"],
+                "item_ids": [], "job_ids": [],
+                "due_at_min": fields["due"], "due_at_max": fields["due"],
+                "expires_at_min": fields["expires"], "expires_at_max": fields["expires"],
+            })
+            group["item_ids"].extend(fields["item_ids"])
+            group["job_ids"].extend(fields["job_ids"])
+            group["due_at_min"] = min(group["due_at_min"], fields["due"])
+            group["due_at_max"] = max(group["due_at_max"], fields["due"])
+            group["expires_at_min"] = min(group["expires_at_min"], fields["expires"])
+            group["expires_at_max"] = max(group["expires_at_max"], fields["expires"])
+        for fields in groups.values():
+            emit_event(event_sink, "observation_routed", component="channel", **fields,
+                       observation_item_ids=fields["item_ids"],
+                       observation_job_ids=fields["job_ids"], items=len(fields["item_ids"]))
+        for fields in (activity or {}).values():
+            emit_event(request_event_sink, "request_match", audience="personal", **fields)
         return {"accepted": len(items), "new": new, "duplicates": duplicates, "queued": queued}
 
     def claim(self, *, now: float | None = None) -> dict | None:
-        now = time.time() if now is None else now
-        with self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            db.execute(
-                "UPDATE jobs SET state='expired',reason='stale' "
-                "WHERE state IN ('pending','leased') AND expires<=?",
-                (now,),
-            )
-            row = db.execute(
-                """SELECT jobs.*,items.payload,items.first_seen,items.last_seen
-                FROM jobs JOIN items USING(item_id)
-                WHERE (state='pending' OR (state='leased' AND lease_until<=?))
-                AND due<=? AND next_attempt<=?
-                ORDER BY CASE WHEN route=? THEN 1 ELSE 0 END,due,id LIMIT 1""",
-                (now, now, now, FREE_ROUTE_KEY),
-            ).fetchone()
-            if row is None:
-                return None
-            result = dict(row)
-            result["lease_token"] = secrets.token_hex(16)
-            db.execute(
-                "UPDATE jobs SET state='leased',lease_token=?,lease_until=?,attempts=attempts+1 "
-                "WHERE id=?",
-                (result["lease_token"], now + 60, result["id"]),
-            )
-            result["attempts"] += 1
-            snapshot = result.pop("payload_snapshot")
-            payload = result.pop("payload")
-            result["item"] = json.loads(snapshot if snapshot is not None else payload)
-            if result["route"] == FREE_ROUTE_KEY:
-                result["first_seen"] = result["due"] - FREE_DELAY_SECONDS
-                result["last_seen"] = result["first_seen"]
-            return result
+        """Compatibility API backed by the canonical single-item dispatch path.
+
+        A frozen multi-item envelope cannot be represented by this interface and
+        stays available exclusively to claim_batch; it must never be split.
+        """
+        batch = self.claim_batch(now=now, size=1, singles_only=True)
+        return {**batch["jobs"][0], "_dispatch": batch} if batch is not None else None
+
+    @staticmethod
+    def _single_dispatch(job):
+        batch = job.get("_dispatch")
+        if batch is not None:
+            return batch
+        # Preserve handoff support for a previously serialized single-job lease.
+        return {
+            "id": job.get("batch_id") or job["id"],
+            "route": job["route"],
+            "jobs": [job],
+            "lease_token": job["lease_token"],
+        }
 
     def finish(
         self, job: dict, state: str, *, message_id: str | None = None, reason: str | None = None
     ) -> bool:
-        if state not in {"sent", "failed", "skipped"}:
-            raise ValueError("invalid terminal state")
-        with self._connect() as db:
-            return (
-                db.execute(
-                    "UPDATE jobs SET state=?,message_id=?,reason=?,lease_token=NULL,"
-                    "lease_until=NULL WHERE id=? AND state='leased' AND lease_token=?",
-                    (state, message_id, reason, job["id"], job["lease_token"]),
-                ).rowcount
-                == 1
-            )
+        return self.finish_batch(
+            self._single_dispatch(job), state, message_id=message_id, reason=reason
+        )
 
     def retry(
         self, job: dict, *, now: float, delay: float, reason: str, count_attempt: bool = True
     ) -> None:
-        with self._connect() as db:
-            db.execute(
-                "UPDATE jobs SET state='pending',next_attempt=?,reason=?,"
-                "attempts=MAX(0,attempts-?),lease_token=NULL,"
-                "lease_until=NULL WHERE id=? AND state='leased' AND lease_token=?",
-                (
-                    now + max(1, delay),
-                    reason,
-                    int(not count_attempt),
-                    job["id"],
-                    job["lease_token"],
-                ),
-            )
+        self.retry_batch(
+            self._single_dispatch(job),
+            now=now,
+            delay=max(1, delay),
+            reason=reason,
+            count_attempt=count_attempt,
+        )
 
     def counts(self) -> dict[str, int]:
         with self._connect() as db:
@@ -529,7 +314,16 @@ class JobStore:
         db.execute(sql, args)
         db.execute("UPDATE dispatches SET state='skipped' WHERE id=?", (batch_id,))
 
-    def claim_batch(self, *, now=None, exclude_routes=(), audience="any", size=5, fair=False):
+    def claim_batch(
+        self,
+        *,
+        now=None,
+        exclude_routes=(),
+        audience="any",
+        size=5,
+        fair=False,
+        singles_only=False,
+    ):
         """Atomically reserve one immutable envelope, at most one active per route."""
         now = time.time() if now is None else now
         if audience not in {"any", "paid", "free"} or not 1 <= size <= 10:
@@ -556,6 +350,9 @@ class JobStore:
                     AND sibling.batch_id=jobs.batch_id AND sibling.state='pending'
                     AND sibling.next_attempt>?)"""
             args = [now] * 6
+            if singles_only:
+                sql += """ AND NOT EXISTS (SELECT 1 FROM dispatches captured
+                    WHERE captured.id=jobs.batch_id AND json_array_length(captured.members)>1)"""
             if exclude_routes:
                 sql += " AND jobs.route NOT IN (" + ",".join("?" for _ in exclude_routes) + ")"
                 args.extend(exclude_routes)
@@ -572,9 +369,8 @@ class JobStore:
                 # Priority slots favor Pro, then descending observed retail value.
                 # The separate fair slot still services oldest/quieter routes.
                 sql += (
-                    " ORDER BY CASE WHEN jobs.route=? THEN 2 "
-                    "WHEN jobs.route='starter-items' THEN 1 ELSE 0 END,"
-                    "CASE WHEN jobs.route NOT IN (?,'starter-items') THEN "
+                    " ORDER BY CASE WHEN jobs.route=? THEN 1 ELSE 0 END,"
+                    "CASE WHEN jobs.route!=? THEN "
                     "COALESCE(json_extract(items.payload,'$.value_cents'),-1) "
                     "ELSE -1 END DESC,CASE WHEN jobs.due>=? THEN 0 ELSE 1 END,"
                     "CASE WHEN jobs.route='pro-all' THEN 0 ELSE 1 END,"
@@ -615,7 +411,7 @@ class JobStore:
                         # Priority bundles put the most valuable Pro items first;
                         # catch-up bundles retain age order. Never repack retries.
                         fill_order = "jobs.due,jobs.id"
-                        if not fair and first["route"] not in {FREE_ROUTE_KEY, "starter-items"}:
+                        if not fair and first["route"] != FREE_ROUTE_KEY:
                             fill_order = (
                                 "COALESCE(json_extract(items.payload,'$.value_cents'),-1) "
                                 "DESC,jobs.due,jobs.id"
@@ -644,7 +440,7 @@ class JobStore:
                             not fair
                             and batch_size > 1
                             and len(rows) == batch_size
-                            and first["route"] not in {FREE_ROUTE_KEY, "starter-items"}
+                            and first["route"] != FREE_ROUTE_KEY
                         ):
                             # A hot route may always occupy a priority slot and
                             # be excluded from the fair-route slot. Reserve its
@@ -1004,6 +800,7 @@ class JobStore:
                 "seeded",
                 "observation_no_longer_matches",
                 "dispatch_invalidated",
+                "route_retired",
                 "rate_limited",
                 "remote_retry",
                 "stopping",

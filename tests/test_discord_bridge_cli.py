@@ -9,9 +9,9 @@ from discord_bridge.provision import ProvisionError
 def test_preview_is_offline_and_has_exact_plans(capsys):
     assert cli.main(["plan"]) == 0
     result = json.loads(capsys.readouterr().out)
-    assert result["plans"]["starter"]["monthly_price_cents"] == 500
-    assert result["plans"]["pro"]["monthly_price_cents"] == 2000
-    assert result["plans"]["starter"]["delay_seconds"] == 300
+    assert set(result["plans"]) == {"free", "pro"}
+    assert result["plans"]["pro"]["monthly_price_cents"] == 3000
+    assert result["plans"]["pro"]["delay_seconds"] == 0
     assert result["plans"]["free"]["delay_seconds"] == 86400
 
 

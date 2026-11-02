@@ -438,3 +438,72 @@ def test_compaction_removes_the_log_only_after_the_snapshot_lands(tmp_path):
     store.save()
     assert not store.log_path.exists()
     assert json.loads(path.read_text(encoding="utf-8"))["seen"]["ip-1"]["title"] == "TV"
+
+
+@pytest.mark.parametrize("tail", [
+    b'{"t":"item","k":"torn","v":{"title":',
+    b'{"t":"item","k":"torn","v":{"title":"\xe2\x82',
+])
+def test_first_append_after_a_torn_tail_survives_another_restart(tmp_path, tail):
+    path = tmp_path / "seen.json"
+    original = SeenStore(path, autosave=False)
+    original.mark_seen("ip-before", "Before the interruption", 10.0)
+    original.flush()
+    with original.log_path.open("ab") as handle:
+        handle.write(tail)
+
+    restarted = SeenStore(path, autosave=False)
+    restarted.mark_seen("ip-after", "After the interruption", 20.0)
+    restarted.set_marker("page", "next-page")
+    assert restarted.flush() == 2
+
+    recovered = SeenStore(path, autosave=False)
+    assert not recovered.is_new("ip-before")
+    assert not recovered.is_new("ip-after")
+    assert recovered.get_marker("page") == "next-page"
+
+
+def test_complete_final_record_without_newline_is_preserved_before_append(tmp_path):
+    path = tmp_path / "seen.json"
+    original = SeenStore(path, autosave=False)
+    original.mark_seen("ip-before", "Before", 10.0)
+    original.flush()
+    original.log_path.write_bytes(original.log_path.read_bytes().rstrip(b"\r\n"))
+
+    restarted = SeenStore(path, autosave=False)
+    restarted.mark_seen("ip-after", "After", 20.0)
+    restarted.flush()
+
+    recovered = SeenStore(path, autosave=False)
+    assert not recovered.is_new("ip-before")
+    assert not recovered.is_new("ip-after")
+
+
+def test_snapshot_failure_keeps_unflushed_records_retryable(tmp_path):
+    path = tmp_path / "seen.json"
+    store = SeenStore(path, autosave=False)
+    store.mark_seen("ip-pending", "Not yet appended", 20.0)
+    store.set_marker("page", "retained")
+    path.mkdir()  # The snapshot cannot replace a directory.
+    store.save()
+    path.rmdir()
+
+    assert store.flush() == 2
+    recovered = SeenStore(path, autosave=False)
+    assert not recovered.is_new("ip-pending")
+    assert recovered.get_marker("page") == "retained"
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_log_replay_ignores_nonrecord_json_without_losing_later_items(tmp_path):
+    from datetime import UTC, datetime
+
+    path = tmp_path / "seen.json"
+    valid = {"t": "item", "k": "ip-valid", "v": {
+        "title": "TV", "seen_at": datetime.now(UTC).isoformat(timespec="seconds"),
+    }}
+    path.with_suffix(".log").write_bytes(
+        b"null\n[]\n42\n" + json.dumps(valid).encode("utf-8") + b"\n"
+    )
+    recovered = SeenStore(path, autosave=False)
+    assert not recovered.is_new("ip-valid")
