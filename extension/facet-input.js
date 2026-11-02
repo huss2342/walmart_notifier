@@ -15,7 +15,7 @@ var ReviewerFacetInput = (() => {
   function inspect(wanted, parent) {
     const url = new URL(location.href);
     if (url.protocol !== 'https:' || url.hostname !== 'www.walmart.com' || url.port ||
-        !/^\/reviews\/claim-product\/?$/.test(url.pathname) || document.visibilityState !== 'visible' ||
+        !/^\/reviews\/claim-product\/?$/.test(url.pathname) ||
         ['q', 'queryNups'].some(key => url.searchParams.getAll(key).some(v => v.trim()))) return { ok: false };
     function normalized(raw) {
       const u = new URL(raw);

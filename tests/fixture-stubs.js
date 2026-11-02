@@ -40,10 +40,12 @@ window.chrome = {
       }
       if (message.type === 'reviewer:role') return { active: false, tabId: 1, generation: 9 };
       if (message.type === 'reviewer:aux-status') return { ok: true, lanes: [
-        { lane: 'departments', status: 'partial', completedTargets: 4, totalTargets: 4,
+        { lane: 'departments', status: 'partial', completedTargets: 3, totalTargets: 4,
+          attemptedTargets: 4, unresolvedTargets: 1,
           pages: 27, failures: 1, coverageLimitedTargets: 1,
           lastError: 'A department changed; other targets continued.' },
         { lane: 'keywords', status: 'complete', completedTargets: 2, totalTargets: 2,
+          attemptedTargets: 2, unresolvedTargets: 0,
           pages: 4, failures: 0 }
       ] };
       if (message.type === 'reviewer:pagination-fallback') {

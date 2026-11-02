@@ -11,8 +11,10 @@
 <script src="/fixture-stubs.js"></script>
 <script src="/sweep-modes.js"></script>
 <script src="/runtime-policy.js"></script>
+<script src="/verification-observation.js"></script>
 <script src="/page-controls.js"></script>
 <script src="/page-scroll.js"></script>
+<script src="/document-session.js"></script>
 <script src="/live-observer.js"></script>
 <script src="/facet-controls.js"></script>
 <script src="/content.js"></script>
@@ -35,11 +37,17 @@
     lastNavigationAt = Date.now() - 6_000;
     const originalRandom = Math.random;
     Math.random = () => 0; // Exercise the bounded settling correction in real DOM.
-    await continueSweep({ generation: 9, mode: 'none', total: 19, visited: [1],
-      endRetries: {}, startedAt: Date.now() - 6_000 }, 9);
-    Math.random = originalRandom;
-    const originalDeadline = nextActionAt;
-    await wait(950);
+    let originalDeadline;
+    try {
+      await continueSweep({ generation: 9, mode: 'none', total: 19, visited: [1],
+        endRetries: {}, startedAt: Date.now() - 6_000 }, 9);
+      originalDeadline = nextActionAt;
+      // Focus preparation yields before starting its animation. Keep the
+      // deterministic correction policy until that async preparation finishes.
+      const animationDeadline = Date.now() + 5000;
+      do { await wait(25); }
+      while (Date.now() < animationDeadline && (motionSamples.length < 10 || pageControlScroll));
+    } finally { Math.random = originalRandom; }
     window.removeEventListener('scroll', recordMotion);
     const preparedRect = next.getBoundingClientRect();
     assert(preparedRect.top >= 0 && preparedRect.bottom <= window.innerHeight,

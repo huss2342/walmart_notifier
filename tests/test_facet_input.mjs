@@ -133,10 +133,18 @@ test('fixed DOM reader requires the exact visible associated option in an unsear
   assert.equal(f.inspect().ok, false);
   for (const mutate of [f => f.challenge(), f => f.occlude(), f => f.duplicate(),
     f => { f.label.control = {}; }, f => { f.radio.checked = true; },
-    f => { f.doc.visibilityState = 'hidden'; }, f => { f.label.isConnected = false; },
+    f => { f.label.isConnected = false; },
     f => { f.location.href += '?catId=4044'; }]) {
     const g = readerFixture(); mutate(g); assert.equal(g.inspect().ok, false);
   }
+});
+
+test('ordinary department hit-testing works in a background document with an exact rendered label', () => {
+  const f = readerFixture();
+  f.doc.visibilityState = 'hidden';
+  assert.equal(f.inspect().ok, true);
+  f.occlude();
+  assert.equal(f.inspect().ok, false);
 });
 
 test('authority loss after a press still releases, and an uncertain release prevents further presses', async () => {

@@ -12,6 +12,30 @@ let verificationCaptureTail = Promise.resolve();
 const verificationCapturesInFlight = new Map();
 let verificationCapturedLastAt = 0;
 
+function verificationCaptureGuard(tabId, windowId) {
+  let changed = false;
+  const listeners = [];
+  const watch = (event, listener) => {
+    if (!event?.addListener || !event?.removeListener) throw new Error('Capture observation unavailable');
+    event.addListener(listener);
+    listeners.push(() => event.removeListener(listener));
+  };
+  try {
+    watch(chrome.tabs.onActivated, info => { if (info.windowId === windowId) changed = true; });
+    watch(chrome.tabs.onUpdated, (id, info) => {
+      if (id === tabId && (info.url !== undefined || info.pendingUrl !== undefined ||
+          info.status === 'loading' || info.discarded === true)) changed = true;
+    });
+    watch(chrome.tabs.onRemoved, id => { if (id === tabId) changed = true; });
+    watch(chrome.tabs.onReplaced, (_added, removed) => { if (removed === tabId) changed = true; });
+    watch(chrome.windows?.onFocusChanged, () => { changed = true; });
+  } catch (error) {
+    for (const remove of listeners) remove();
+    throw error;
+  }
+  return { valid: () => !changed, close() { for (const remove of listeners) remove(); } };
+}
+
 async function verificationCaptureStatus(status, error = '') {
   try {
     await chrome.storage.local.set({
@@ -55,18 +79,20 @@ async function visibleVerificationTab(tabId, expected = null) {
 }
 
 async function captureVerificationEvidenceUnlocked(tabId) {
+  let guard;
   try {
     const before = Number.isInteger(tabId) ? await visibleVerificationTab(tabId) : null;
     if (!before) {
       await verificationCaptureStatus('unavailable', VERIFICATION_CAPTURE_CHANGED);
       return { ok: false, error: VERIFICATION_CAPTURE_CHANGED };
     }
+    guard = verificationCaptureGuard(tabId, before.windowId);
     const cached = (await chrome.storage.session.get([VERIFICATION_CAPTURE_KEY]))[VERIFICATION_CAPTURE_KEY];
     if (verificationCapturedLastAt === before.lastAt || cached?.lastAt === before.lastAt) {
       return { ok: true, captured: false };
     }
     // Revalidate after the storage read, before requesting any pixels.
-    if (!await visibleVerificationTab(tabId, before)) {
+    if (!await visibleVerificationTab(tabId, before) || !guard.valid()) {
       await verificationCaptureStatus('unavailable', VERIFICATION_CAPTURE_CHANGED);
       return { ok: false, error: VERIFICATION_CAPTURE_CHANGED };
     }
@@ -80,7 +106,7 @@ async function captureVerificationEvidenceUnlocked(tabId) {
     }
     // captureVisibleTab targets the window's active tab, not a tab ID. Discard
     // its result if navigation, focus, or verification changed during capture.
-    if (!await visibleVerificationTab(tabId, before)) {
+    if (!await visibleVerificationTab(tabId, before) || !guard.valid()) {
       await verificationCaptureStatus('unavailable', VERIFICATION_CAPTURE_CHANGED);
       return { ok: false, error: VERIFICATION_CAPTURE_CHANGED };
     }
@@ -111,6 +137,8 @@ async function captureVerificationEvidenceUnlocked(tabId) {
   } catch {
     await verificationCaptureStatus('unavailable', VERIFICATION_CAPTURE_UNAVAILABLE);
     return { ok: false, error: VERIFICATION_CAPTURE_UNAVAILABLE };
+  } finally {
+    guard?.close();
   }
 }
 

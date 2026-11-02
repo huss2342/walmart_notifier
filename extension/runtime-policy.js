@@ -9,9 +9,10 @@ function effectiveRefreshMinutes(settings) {
 function effectivePageSeconds(settings, sweep) {
   let seconds = Math.min(60, Math.max(5, Number(settings.pageDelaySeconds) || 15));
   const minutes = effectiveRefreshMinutes(settings);
-  // Allocate about 75% of the regular-mode interval to browsing. Never skip
-  // pages or shorten a user's delay to try to meet the target.
-  if (sweep && sweepRecordMode(sweep) === 'none' && minutes > 0 && sweep.total > 0) {
+  // Allocate about 75% of the homepage interval to browsing. Auxiliary scopes
+  // carry targetKey and already wait between full rounds; allocating that same
+  // interval to every individual keyword/department makes revisits needlessly slow.
+  if (sweep && !sweep.targetKey && sweepRecordMode(sweep) === 'none' && minutes > 0 && sweep.total > 0) {
     seconds = Math.max(seconds, Math.min(90, minutes * 60 * 0.75 / sweep.total));
   }
   return seconds;

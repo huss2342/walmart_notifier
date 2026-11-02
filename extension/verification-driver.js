@@ -16,48 +16,10 @@ var VerificationChrome = (() => {
     } catch { return false; }
   }
 
-  // Self-contained read-only page function. No account text or URL is returned.
+  // Compatible local wrapper. Page-world calls serialize observePage itself so
+  // they do not depend on extension globals. No account text or URL is returned.
   function readPage(doc = document, current = location) {
-    const eligible = current.protocol === 'https:' && current.hostname === 'www.walmart.com' &&
-      !current.port && (/^\/reviews\/claim-product\/?$/.test(current.pathname) ||
-        /^\/blocked\/?$/.test(current.pathname));
-    if (!eligible) return { eligible: false };
-    function visible(el) {
-      if (!el?.getClientRects().length) return false;
-      const rect = el.getBoundingClientRect();
-      if (rect.width <= 0 || rect.height <= 0) return false;
-      for (let p = el, depth = 0; p && depth < 20; p = p.parentElement, depth++) {
-        const style = getComputedStyle(p);
-        if (style.display === 'none' || ['hidden', 'collapse'].includes(style.visibility) ||
-            style.opacity === '0') return false;
-      }
-      return true;
-    }
-    const markers = [...doc.querySelectorAll('#px-captcha, #px-captcha-wrapper')].filter(visible);
-    const heading = [...doc.querySelectorAll('[role="dialog"] h1,[role="dialog"] h2')]
-      .some(e => visible(e) && /robot\s+or\s+human/i.test(e.textContent || ''));
-    const frame = [...doc.querySelectorAll(
-      'iframe[src*="captcha.px-cloud.net"],iframe[src*="px-captcha"],iframe[title*="human challenge" i]'
-    )].some(visible);
-    const blocked = /^\/blocked\/?$/.test(current.pathname);
-    const challenge = blocked || heading || frame || markers.length > 0;
-    const targets = new Map();
-    for (const marker of markers) {
-      const r = marker.getBoundingClientRect();
-      if (r.width < 200 || r.width > 700 || r.height < 50 || r.height > 250) continue;
-      const x = Math.round(r.x + r.width * 0.6);
-      const y = Math.round(r.y + r.height * 0.5);
-      if (x < 0 || y < 0 || x >= doc.documentElement.clientWidth ||
-          y >= doc.documentElement.clientHeight) continue;
-      const hit = doc.elementFromPoint(x, y);
-      if (hit && (hit === marker || marker.contains(hit))) targets.set(`${x}:${y}`, { x, y });
-    }
-    const products = [...doc.querySelectorAll('main a[href*="/ip/"]')].some(visible);
-    const empty = visible(doc.getElementById('search-item-stack-no-results-header'));
-    return { eligible, challenge, clock: performance.timeOrigin,
-      ready: !blocked && !challenge && (products || empty),
-      target: targets.size === 1 ? [...targets.values()][0] : null,
-      viewport: { width: innerWidth, height: innerHeight, dpr: devicePixelRatio } };
+    return ReviewerVerificationObservation.observePage('driver', doc, current);
   }
 
   async function open(api, tabId, enabled) {
@@ -123,7 +85,8 @@ var VerificationChrome = (() => {
     async function page() {
       if (stopped || !allowedUrl((await api.tabs.get(tabId))?.url)) return { eligible: false };
       const r = await command('Runtime.evaluate', {
-        expression: `(${readPage.toString()})()`, returnByValue: true, timeout: 1500
+        expression: `(${ReviewerVerificationObservation.observePage.toString()})('driver')`,
+        returnByValue: true, timeout: 1500
       });
       if (r.exceptionDetails || !r.result?.value) throw new Error('page-unavailable');
       return r.result.value;
@@ -207,5 +170,5 @@ var VerificationChrome = (() => {
       }
     };
   }
-  return { open, readPage, allowedUrl };
+  return { open, readPage, observePage: ReviewerVerificationObservation.observePage, allowedUrl };
 })();

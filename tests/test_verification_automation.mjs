@@ -3,9 +3,12 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
 
-function source(name) {
-  const canonical = { engine: 'verification-engine', 'chrome-driver': 'verification-driver' };
-  const path = canonical[name] ? `../extension/${canonical[name]}.js` : `../verification_helper/${name}.js`;
+function source(name, bundle = 'canonical') {
+  const canonical = { engine: 'verification-engine', 'chrome-driver': 'verification-driver',
+    observation: 'verification-observation' };
+  assert.ok(bundle === 'frozen' || canonical[name], `Unknown canonical module: ${name}`);
+  const path = bundle === 'frozen' ? `../verification_helper/${name}.js` :
+    `../extension/${canonical[name]}.js`;
   return fs.readFileSync(new URL(path, import.meta.url), 'utf8');
 }
 function loadEngine() {
@@ -171,7 +174,7 @@ function event() {
   return { listeners, addListener: fn => listeners.push(fn),
     removeListener(fn) { const i = listeners.indexOf(fn); if (i >= 0) listeners.splice(i, 1); } };
 }
-function chromeFixture() {
+function chromeFixture({ bundle = 'canonical' } = {}) {
   const state = { tab: { id: 11, status: 'complete', url: 'https://www.walmart.com/reviews/claim-product' },
     page: { eligible: true, challenge: true, ready: false, clock: 123, target: { x: 400, y: 300 } },
     calls: [], attachError: false, downError: false, invisibleHint: false, failBudget: false,
@@ -220,7 +223,9 @@ function chromeFixture() {
     setTimeout(fn, ms) { const id = ++state.nextTimer; state.timers.set(id, { fn, ms }); return id; },
     clearTimeout(id) { state.timers.delete(id); }
   });
-  vm.runInContext(source('engine') + '\n' + source('chrome-driver'), context);
+  const modules = bundle === 'frozen' ? ['engine', 'chrome-driver'] :
+    ['observation', 'engine', 'chrome-driver'];
+  vm.runInContext(modules.map(name => source(name, bundle)).join('\n'), context);
   return { api, state, context, adapter: context.VerificationChrome };
 }
 
@@ -248,6 +253,30 @@ test('another debugger is never detached after attachment refusal', async () => 
   assert.deepEqual(f.state.calls.map(c => c[0]), ['attach']);
   assert.equal(f.api.tabs.onUpdated.listeners.length, 0);
   assert.equal(f.api.debugger.onDetach.listeners.length, 0);
+});
+
+test('Chrome adapter serializes shared observations without extension globals', async () => {
+  const f = chromeFixture();
+  const original = f.api.debugger.sendCommand;
+  const isolated = vm.createContext({
+    location: { protocol: 'https:', hostname: 'www.walmart.com', port: '', pathname: '/blocked' },
+    document: { querySelectorAll: () => [], getElementById: () => null,
+      documentElement: { clientWidth: 800, clientHeight: 600 } },
+    performance: { timeOrigin: 123 }, innerWidth: 800, innerHeight: 600, devicePixelRatio: 1,
+  });
+  f.api.debugger.sendCommand = async (target, method, params) => {
+    if (method !== 'Runtime.evaluate') return original(target, method, params);
+    assert.doesNotMatch(params.expression, /ReviewerVerificationObservation|VerificationChrome/);
+    return { result: { value: vm.runInContext(params.expression, isolated) } };
+  };
+  const driver = await f.adapter.open(f.api, 11, async () => true);
+  try {
+    const result = await driver.page();
+    assert.equal(result.challenge, true);
+    assert.equal(result.eligible, true);
+    assert.equal(result.target, null);
+  } finally { await driver.detach(); }
+  assert.equal(f.state.calls.some(call => call[0] === 'Input.dispatchMouseEvent'), false);
 });
 
 test('slow Chrome move acknowledgement has a ten-second window; presses keep five', async () => {
@@ -384,12 +413,14 @@ test('readable shadow-tree hints must have visible layout before they affect rel
   }
 });
 
-function loadController() {
-  const f = chromeFixture();
+function loadFrozenController() {
+  // The frozen companion is tested with its own complete bundle. Never combine
+  // its controller with the evolving canonical engine/driver implementation.
+  const f = chromeFixture({ bundle: 'frozen' });
   const runFixture = fixture();
   let opened = 0;
   f.context.VerificationChrome.open = async () => { opened++; return runFixture.driver; };
-  vm.runInContext(source('background').replace(/^importScripts\([^\n]+\);/, ''), f.context);
+  vm.runInContext(source('background', 'frozen').replace(/^importScripts\([^\n]+\);/, ''), f.context);
   f.dispatch = (message = { type: 'verification-observed', episode: 1 }, sender = {}) => new Promise(resolve => {
     f.api.runtime.onMessage.listeners[0](message, {
       tab: { ...f.state.tab }, frameId: 0, documentId: 'chrome-document-1', url: f.state.tab.url, ...sender
@@ -399,8 +430,8 @@ function loadController() {
   f.runFixture = runFixture;
   return f;
 }
-test('companion is inert until enabled and refuses forged frame/origin/document messages', async () => {
-  const f = loadController();
+test('frozen companion is inert until enabled and refuses forged frame/origin/document messages', async () => {
+  const f = loadFrozenController();
   await f.dispatch();
   assert.equal(f.opened(), 0);
   f.state.local.enabled = true;
@@ -409,8 +440,8 @@ test('companion is inert until enabled and refuses forged frame/origin/document 
   }
   assert.equal(f.opened(), 0);
 });
-test('durable reservation precedes input and duplicate detections cannot start another hold', async () => {
-  const f = loadController();
+test('frozen companion reserves before input and deduplicates detections', async () => {
+  const f = loadFrozenController();
   f.state.local.enabled = true;
   const beforeDown = f.runFixture.driver.down;
   f.runFixture.driver.down = async point => {
@@ -423,8 +454,8 @@ test('durable reservation precedes input and duplicate detections cannot start a
   assert.equal(f.state.local.lastResult.outcome, 'verified');
   assert.doesNotMatch(JSON.stringify(f.state.local), /walmart|private|cookie|credential|target|document-1.*url/i);
 });
-test('a failed reservation write blocks all browser input', async () => {
-  const f = loadController();
+test('frozen companion blocks input after a failed reservation write', async () => {
+  const f = loadFrozenController();
   f.state.local.enabled = true;
   f.state.failBudget = true;
   await f.dispatch();
@@ -432,11 +463,11 @@ test('a failed reservation write blocks all browser input', async () => {
   assert.equal(f.state.local.lastResult.outcome, 'unavailable');
 });
 
-test('a controller restart preserves the completed episode reservation', async () => {
-  const first = loadController();
+test('frozen companion restart preserves the completed episode reservation', async () => {
+  const first = loadFrozenController();
   first.state.local.enabled = true;
   await first.dispatch();
-  const restarted = loadController();
+  const restarted = loadFrozenController();
   restarted.state.local = JSON.parse(JSON.stringify(first.state.local));
   await restarted.dispatch();
   assert.equal(restarted.opened(), 0);
@@ -480,7 +511,7 @@ test('detector coalesces widget replacement and emits a new episode only after s
     getComputedStyle: () => ({ display: 'block', visibility: 'visible', opacity: '1' }),
     chrome: { runtime: { sendMessage: async message => { messages.push({ ...message }); } } }
   });
-  vm.runInContext(source('detector'), context);
+  vm.runInContext(source('detector', 'frozen'), context);
   async function advance(ms) { clock += ms; tick(); await Promise.resolve(); await Promise.resolve(); }
   await advance(2000);
   assert.equal(messages.at(-1).episode, 1);

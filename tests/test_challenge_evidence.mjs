@@ -33,6 +33,13 @@ function loadEvidence({ local = null, session = null, url = CHALLENGE_URL } = {}
       token: 'private-auth-token', url: 'https://private-url', title: 'private-product-title' }]
   });
   session ||= storageArea();
+  const event = () => {
+    const listeners = new Set();
+    return { addListener: listener => listeners.add(listener),
+      removeListener: listener => listeners.delete(listener),
+      emit(...args) { for (const listener of listeners) listener(...args); },
+      get count() { return listeners.size; } };
+  };
   const state = {
     tab: { id: 11, windowId: 4, active: true, status: 'complete', url },
     activeId: 11, probe: { ready: true, botCheck: true },
@@ -43,6 +50,7 @@ function loadEvidence({ local = null, session = null, url = CHALLENGE_URL } = {}
     storage: { local, session },
     runtime: { getManifest: () => ({ version: 'test' }) },
     tabs: {
+      onActivated: event(), onUpdated: event(), onRemoved: event(), onReplaced: event(),
       async query(info) {
         assert.deepEqual({ ...info }, { active: true, currentWindow: true });
         if (state.queryImpl) return state.queryImpl();
@@ -55,6 +63,7 @@ function loadEvidence({ local = null, session = null, url = CHALLENGE_URL } = {}
         return state.captureImpl ? state.captureImpl() : JPEG;
       }
     },
+    windows: { onFocusChanged: event() },
     downloads: {
       async download(options) {
         if (state.downloadImpl) await state.downloadImpl(options);
@@ -80,7 +89,29 @@ function loadEvidence({ local = null, session = null, url = CHALLENGE_URL } = {}
     normalizeSweepMode: value => value
   });
   vm.runInContext(`${diagnosticsSource}\n${evidenceSource}`, context);
-  return { capture: context.captureVerificationEvidence, local, session, state };
+  return { capture: context.captureVerificationEvidence, local, session, state, chrome };
+}
+
+for (const transition of ['activation', 'navigation', 'window-focus']) {
+  test(`a temporary ${transition} change during capture discards pixels even after returning`, async () => {
+    const helper = loadEvidence();
+    helper.state.captureImpl = () => {
+      if (transition === 'activation') {
+        helper.chrome.tabs.onActivated.emit({ tabId: 99, windowId: 4 });
+        helper.chrome.tabs.onActivated.emit({ tabId: 11, windowId: 4 });
+      } else if (transition === 'navigation') {
+        helper.chrome.tabs.onUpdated.emit(11, { status: 'loading' });
+        helper.chrome.tabs.onUpdated.emit(11, { status: 'complete' });
+      } else {
+        helper.chrome.windows.onFocusChanged.emit(-1);
+        helper.chrome.windows.onFocusChanged.emit(4);
+      }
+      return JPEG;
+    };
+    assert.equal((await helper.capture(11)).ok, false);
+    assert.equal(helper.state.downloads.length, 0);
+    assert.equal(helper.chrome.tabs.onActivated.count, 0, 'Capture listeners are always released');
+  });
 }
 
 test('an unrelated active tab is never captured or downloaded', async () => {

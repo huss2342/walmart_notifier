@@ -1,21 +1,7 @@
 // Inspect the site's normal controls. No injected input telemetry or changes
 // to Walmart's verification scripts, cookies, or browser identity.
 function verificationReason(doc = document, currentLocation = location) {
-  if (/^\/blocked(?:\/|$)/i.test(currentLocation.pathname)) return 'redirect';
-  const markers = doc.querySelectorAll(
-    '#px-captcha, #px-captcha-wrapper, iframe[src*="captcha.px-cloud.net"], ' +
-    'iframe[src*="px-captcha"], iframe[title*="human challenge" i]'
-  );
-  for (const marker of markers) {
-    const style = getComputedStyle(marker);
-    if (marker.getClientRects().length && style.display !== 'none' &&
-        style.visibility !== 'hidden' && style.visibility !== 'collapse') return 'dom-marker';
-  }
-  const text = doc.body?.innerText || '';
-  const press = /press\s*(?:&|and)\s*hold/i.test(text);
-  return press && (/robot\s+or\s+human\s*\?/i.test(text) ||
-    /(?:confirm|verify)\s+(?:that\s+)?you(?:'re|\s+are)\s+(?:a\s+)?human/i.test(text))
-    ? 'text' : null;
+  return ReviewerVerificationObservation.observePage('passive', doc, currentLocation).reason;
 }
 
 function comparablePageUrl(raw, base) {
@@ -42,6 +28,65 @@ function pageControlRoot() {
   return document.querySelector('[data-automation-id="page-number"]')
     ?.closest('ul, ol, nav, [role="navigation"]') ||
     document.querySelector('nav[aria-label*="pagination" i]');
+}
+
+// A numeric pager can be a moving window. Only a visible, current-page Next
+// control supplies end evidence; missing/hydrating/stale controls do not.
+function visiblePagerNode(node) {
+  if (!node?.getClientRects?.().length) return false;
+  const style = getComputedStyle(node);
+  return style.display !== 'none' && !['hidden', 'collapse'].includes(style.visibility);
+}
+
+function renderedPaginationPage(pager = pageControlRoot()) {
+  const marker = pager?.querySelector?.('[aria-current="page"], [aria-current="true"]');
+  if (marker) {
+    if (marker.getClientRects && !visiblePagerNode(marker)) return null;
+    const number = Number(marker.textContent?.trim());
+    return Number.isSafeInteger(number) && number > 0 ? number : null;
+  }
+  // Walmart renders the selected numeric page as a plain div inside its list.
+  // Link/button labels and hidden responsive copies cannot supply this proof.
+  const numbers = [...(pager?.querySelectorAll?.('*') || [])].filter(node =>
+    !node.children?.length && !/^(?:A|BUTTON)$/.test(node.tagName || '') &&
+    !node.closest?.('a, button, [role="button"], [role="link"]') && visiblePagerNode(node))
+    .map(node => (node.textContent || '').trim()).filter(text => /^\d+$/.test(text)).map(Number);
+  return numbers.length === 1 && Number.isSafeInteger(numbers[0]) && numbers[0] > 0 ? numbers[0] : null;
+}
+
+function omittedNextTerminalPage() {
+  const pager = pageControlRoot();
+  const page = renderedPaginationPage(pager);
+  if (!page || page < 2) return null;
+  const controls = [...(pager?.querySelectorAll?.('a, button, [role="button"], [role="link"]') || [])];
+  // A hidden Next is ambiguous responsive/hydrating markup, not an omitted Next.
+  const label = node => (node.getAttribute?.('aria-label') || node.textContent || '').trim();
+  if (controls.some(node => /^(?:go to )?next(?: page)?$/i.test(label(node)))) return null;
+  const usable = controls.filter(node => visiblePagerNode(node) && !node.disabled &&
+    node.getAttribute?.('aria-disabled') !== 'true' && !node.hasAttribute?.('disabled'));
+  const pages = usable.map(node => label(node).match(/^(?:(?:go to\s+)?page\s+)?(\d+)$/i))
+    .filter(Boolean).map(match => Number(match[1]));
+  return usable.some(node => /^(?:go to )?previous(?: page)?$/i.test(label(node))) &&
+    pages.includes(page - 1) && pages.every(number => number < page) ? page : null;
+}
+
+function paginationNextState(page) {
+  const pager = pageControlRoot();
+  const marked = renderedPaginationPage(pager);
+  if (marked !== page) return 'unknown';
+  const states = [];
+  for (const control of pager?.querySelectorAll?.('a, button, [role="button"], [role="link"]') || []) {
+    const label = (control.getAttribute('aria-label') || control.textContent || '').trim();
+    if (!/^(?:go to )?next(?: page)?$/i.test(label)) continue;
+    const style = getComputedStyle(control);
+    if (!control.getClientRects().length || style.display === 'none' ||
+        style.visibility === 'hidden' || style.visibility === 'collapse') continue;
+    states.push(control.disabled || control.getAttribute('aria-disabled') === 'true' ||
+      control.hasAttribute?.('disabled') ? 'disabled' : 'enabled');
+  }
+  // Responsive duplicate controls must agree before certifying the end.
+  return states.includes('enabled') ? 'enabled' : states.length ? 'disabled' :
+    omittedNextTerminalPage() === page ? 'omitted' : 'unknown';
 }
 
 function placeholderPageHref(href) {
@@ -105,8 +150,7 @@ function findPageControl(target, page) {
   const scoped = visible.filter(control => scopedControls.includes(control) &&
     placeholderPageHref(control.getAttribute('href')));
   const current = Number(new URL(location.href).searchParams.get('page') || 1);
-  const marked = Number(pager?.querySelector?.('[aria-current="page"], [aria-current="true"]')
-    ?.textContent?.trim());
+  const marked = renderedPaginationPage(pager);
   if (current > 0 && page === current + 1 && marked === current) {
     const next = scoped.find(control => /^(?:go to )?next(?: page)?$/i.test(
       (control.getAttribute('aria-label') || control.textContent || '').trim()));
@@ -122,7 +166,10 @@ function findPageControl(target, page) {
 let pageControlScroll = null;
 
 function cancelPageControlScroll() {
-  if (pageControlScroll) window.cancelAnimationFrame(pageControlScroll.frame);
+  if (pageControlScroll) {
+    window.cancelAnimationFrame?.(pageControlScroll.frame);
+    clearTimeout(pageControlScroll.timer);
+  }
   pageControlScroll = null;
 }
 
@@ -130,8 +177,8 @@ function cancelPageControlScroll() {
 // movement and landing point; this remains DOM scrolling, not human input.
 function scrollPageControlIntoView(control, canContinue = () => true) {
   cancelPageControlScroll();
-  if (document.visibilityState !== 'visible') return false;
   try {
+    if (!canContinue()) return false;
     const rect = control?.getBoundingClientRect();
     if (!rect || !(window.innerHeight > 0 && window.innerWidth > 0)) return false;
     if (rect.top >= 0 && rect.bottom <= window.innerHeight &&
@@ -155,13 +202,25 @@ function scrollPageControlIntoView(control, canContinue = () => true) {
       Math.min(correction, Math.abs(target - start) * 0.04));
     const split = peak === target ? 1 : 0.82;
     const started = window.performance.now();
-    const animation = { frame: null };
+    const animation = { frame: null, timer: null };
     pageControlScroll = animation;
+    const nextFrame = () => {
+      let delivered = false;
+      const deliver = timestamp => {
+        if (delivered || pageControlScroll !== animation) return;
+        delivered = true;
+        window.cancelAnimationFrame?.(animation.frame);
+        clearTimeout(animation.timer);
+        step(timestamp);
+      };
+      animation.frame = window.requestAnimationFrame(deliver);
+      animation.timer = setTimeout(() => deliver(window.performance.now()), 64);
+    };
     const ease = t => t * t * (3 - 2 * t);
     const step = timestamp => {
       if (pageControlScroll !== animation) return;
       try {
-        if (document.visibilityState !== 'visible' || control.isConnected === false ||
+        if (control.isConnected === false ||
             window.matchMedia?.('(prefers-reduced-motion: reduce)').matches || !canContinue()) {
           cancelPageControlScroll();
           return;
@@ -172,11 +231,11 @@ function scrollPageControlIntoView(control, canContinue = () => true) {
           : peak + (target - peak) * ease((progress - split) / (1 - split));
         // Avoid the page's CSS scroll-behavior applying a second animation.
         window.scrollTo({ top, left: window.scrollX, behavior: 'instant' });
-        if (progress < 1) animation.frame = window.requestAnimationFrame(step);
+        if (progress < 1) nextFrame();
         else pageControlScroll = null;
       } catch { cancelPageControlScroll(); }
     };
-    animation.frame = window.requestAnimationFrame(step);
+    nextFrame();
     return true;
   } catch { cancelPageControlScroll(); return false; } // Never cancel the scan.
 }

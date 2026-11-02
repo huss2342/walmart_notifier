@@ -118,7 +118,7 @@
   Search item names in an additional tab
 </label>
 <label for="auxiliaryKeywordQueries">Item names and keywords</label>
-<p id="auxiliaryKeywordsHint" class="hint">One search per line, up to 100 searches
+<p id="auxiliaryKeywordsHint" class="hint">One search per line, up to 128 searches
   and 80 characters per search. Repeated terms are combined without regard to case.
   Include both broad categories and specific item names, such as Furniture, Chair,
   Couch and Pet. The preset terms are editable.</p>
@@ -126,11 +126,31 @@
   spellcheck="false"></textarea>
 <div id="auxiliaryKeywordError" class="err" role="alert"></div>
 
+<label class="toggle" for="auxiliaryPriority">
+  <input id="auxiliaryPriority" type="checkbox" aria-describedby="auxiliaryPriorityHint">
+  Hunt high-value products in a fourth tab
+</label>
+<p id="auxiliaryPriorityHint" class="hint">Runs a shorter, furniture-focused search
+  cycle independently of the full keyword round. It reads every results page and
+  shares reading turns, saved items, traffic waiting and verification pauses with
+  the other scans. These are search targets, not a price filter.</p>
+<label for="auxiliaryPriorityQueries">Priority item names</label>
+<textarea id="auxiliaryPriorityQueries" rows="5" maxlength="2000"
+  aria-describedby="auxiliaryPriorityHint auxiliaryPriorityError" spellcheck="false"></textarea>
+<p class="hint">One search per line, up to 24 searches and 80 characters per search.</p>
+<label for="auxiliaryPriorityRefreshMinutes">Priority break after a round (minutes)</label>
+<input id="auxiliaryPriorityRefreshMinutes" type="number" min="1" max="120" step="1" value="1"
+  aria-describedby="auxiliaryPriorityIntervalHint auxiliaryPriorityError">
+<p id="auxiliaryPriorityIntervalHint" class="hint">Default 1 minute. Long searches
+  finish their pages before the next round. Auto-refresh set to 0 also stops
+  automatic priority rounds; unfinished recovery remains available.</p>
+<div id="auxiliaryPriorityError" class="err" role="alert"></div>
+
 <label class="toggle" for="groupScannerTabs">
   <input id="groupScannerTabs" type="checkbox" aria-describedby="groupScannerTabsHint">
   Group scanner tabs
 </label>
-<p id="groupScannerTabsHint" class="hint">Keeps the home, department and keyword
+<p id="groupScannerTabsHint" class="hint">Keeps the home, department, keyword and priority
   scans together in a Chrome tab group. Enabled by default.</p>
 <label class="toggle" for="rotateScannerTabs">
   <input id="rotateScannerTabs" type="checkbox" aria-describedby="rotateScannerTabsHint">
@@ -140,10 +160,10 @@
   they can read each results page with a smooth downward scroll and varying steps
   and timing. Long pages resume in later turns. The scanner waits for a settled
   bottom and selects its tab again before changing page. Yields when you use the
-  browser, select another tab or verification is active. While enabled, scanning
-  waits on its current page when Chrome is minimized or another app is in front.
-  Select a scanner tab in the foreground to resume. Disabling rotation permits
-  background scanning without a guaranteed visible reading pass.
+  browser or verification is active. Scanning continues when another app is in
+  front, selecting scanner tabs inside Chrome without bringing its window forward.
+  Background scrolling uses a timer fallback when animation frames are suspended.
+  A manual tab stays selected while you are using that Chrome window.
   Enabled by default; fewer verification checks are not guaranteed.</p>
 
 <button id="save">Save settings</button>
@@ -174,7 +194,7 @@
   <button id="restartAuxiliary" class="secondary" type="button" aria-describedby="auxiliaryRestartHint">Restart additional scans</button>
   <span id="auxiliaryActionStatus" role="status" aria-live="polite"></span>
   <p id="auxiliaryRestartHint" class="hint">Save changes first. Restarts the enabled
-    department and keyword scans from their first target. Recorded items remain deduplicated.</p>
+    department, keyword and priority scans from their first target. Recorded items remain deduplicated.</p>
 </div>
 
 <h2>Automatic verification</h2>
@@ -220,6 +240,6 @@
 
 <script src="sweep-modes.js"></script>
 <script src="runtime-policy.js"></script>
-<script src="relay-settings.js"></script>
-<script src="scanner-control.js"></script>
+<script src="local-client.js"></script>
+<script src="scanner-settings.js"></script>
 <script src="options.js"></script>

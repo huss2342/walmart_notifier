@@ -2,11 +2,7 @@
 // only the narrowly scoped Native Messaging host can move/hold the OS pointer.
 var VerificationNative = (() => {
   const PERMISSIONS = { permissions: ['nativeMessaging', 'scripting'] };
-  const REASONS = new Set(['unsupported-platform', 'invalid-request', 'invalid-origin', 'invalid-window',
-    'helper-busy', 'desktop-locked', 'user-busy', 'button-held', 'focus-changed', 'window-changed',
-    'viewport-mismatch', 'target-obscured', 'target-expired', 'user-input', 'input-failed',
-    'release-failed', 'watchdog-unavailable', 'already-used', 'not-prepared', 'host-unavailable',
-    'max-duration', 'closed']);
+  const REASONS = new Set(VerificationNativeProtocol.errorCodes);
   const failure = (stage, reason = 'host-unavailable') => Object.assign(new Error('Windows input unavailable'),
     { verificationStage: stage, verificationReason: 'command-failed',
       nativeReason: REASONS.has(reason) ? reason : 'host-unavailable' });
@@ -18,13 +14,6 @@ var VerificationNative = (() => {
       ['deadline', 'failed', 'stalled', 'max-duration'].includes(result.releaseReason) &&
       result.pressSent === true && result.pressConfirmed === true && result.releaseConfirmed === true &&
       Number.isFinite(result.holdMs) && result.holdMs > 0;
-  }
-  function validState(s) {
-    return s && typeof s.ready === 'boolean' && (s.reason === null || REASONS.has(s.reason)) &&
-      ['idle', 'prepared', 'holding', 'released', 'aborted', 'closed'].includes(s.phase) &&
-      ['pressSent', 'pressConfirmed', 'releaseConfirmed'].every(k => typeof s[k] === 'boolean') &&
-      Number.isFinite(s.idleMs) && s.idleMs >= 0 && Number.isFinite(s.holdMs) && s.holdMs >= 0 &&
-      (s.token === undefined || (typeof s.token === 'string' && /^[a-zA-Z0-9_-]{8,128}$/.test(s.token)));
   }
   async function bounded(promise, ms, stage = 'inspect') {
     let timer;
@@ -60,7 +49,8 @@ var VerificationNative = (() => {
         const p = pending.get(response?.id);
         if (!p) return;
         pending.delete(response.id);
-        if (response.v !== 1 || typeof response.ok !== 'boolean' || !validState(response.state)) {
+        if (response.v !== VerificationNativeProtocol.version || typeof response.ok !== 'boolean' ||
+            !VerificationNativeProtocol.validState(response.state)) {
           p.reject(failure(p.stage)); port.disconnect(); return;
         }
         if (!response.ok) {
@@ -101,7 +91,8 @@ var VerificationNative = (() => {
         try {
           return await bounded(new Promise((resolve, reject) => {
             pending.set(id, { resolve, reject, stage });
-            try { port.postMessage({ type: 'request', request: { v: 1, id, op, payload } }); }
+            try { port.postMessage({ type: 'request',
+              request: { v: VerificationNativeProtocol.version, id, op, payload } }); }
             catch { reject(failure(stage)); }
           }), 2500, stage);
         } finally { pending.delete(id); }
@@ -150,7 +141,7 @@ var VerificationNative = (() => {
       if (tab.windowId !== initial.windowId || !VerificationChrome.allowedUrl(tab.url) ||
           tab.status !== 'complete' || (tab.pendingUrl && tab.pendingUrl !== tab.url)) return { eligible: false };
       const reads = await bounded(api.scripting.executeScript({ target: { tabId },
-        func: VerificationChrome.readPage, world: 'ISOLATED' }), 2000);
+        func: VerificationChrome.observePage, args: ['driver'], world: 'ISOLATED' }), 2000);
       if (reads.length !== 1 || reads[0].frameId !== 0 || !reads[0].documentId || !reads[0].result) {
         throw failure('inspect');
       }
@@ -201,7 +192,7 @@ var VerificationNative = (() => {
     }
     try {
       const probe = await rpc('probe');
-      if (!await permitted() || probe.idleMs < 5000 ||
+      if (!await permitted() || probe.idleMs < VerificationNativeProtocol.limits.idleMs ||
           (!probe.ready && probe.reason !== 'focus-changed')) throw failure('inspect', probe.reason || 'user-busy');
       await api.tabs.update(tabId, { active: true });
       await api.windows.update(initial.windowId, { focused: true });

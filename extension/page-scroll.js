@@ -1,6 +1,7 @@
 // A bounded page-reading pass. Focus, scan ownership and navigation belong to
 // the caller; this helper only moves the page while its current lease is valid.
 var ReviewerPageScroll = (() => {
+  const FRAME_FALLBACK_MS = 64;
   async function run(options = {}) {
     const win = options.window || globalThis.window;
     const doc = options.document || win?.document;
@@ -80,15 +81,30 @@ var ReviewerPageScroll = (() => {
     function wait(frame, ms = 0) {
       if (outcome) return Promise.resolve(false);
       return new Promise(resolve => {
-        let id;
-        const cancel = () => {
-          (frame ? cancelFrame : clearTimer)(id);
+        let frameId;
+        let timerId;
+        let settled = false;
+        const finish = ready => {
+          if (settled) return;
+          settled = true;
+          if (frameId !== undefined) cancelFrame(frameId);
+          if (timerId !== undefined) clearTimer(timerId);
           pending.delete(cancel);
-          resolve(false);
+          resolve(ready);
         };
-        const done = () => { pending.delete(cancel); resolve(true); };
-        id = frame ? requestFrame(done) : setTimer(done, ms);
+        const cancel = () => finish(false);
+        const done = () => finish(true);
         pending.add(cancel);
+        if (frame) {
+          frameId = requestFrame(done);
+          // Occluded/minimized pages may suppress RAF entirely. Normal visible
+          // frames still win; a timer permits guarded progress without treating
+          // missing frames as proof that the page was read or settled.
+          if (settled) cancelFrame(frameId);
+          else timerId = setTimer(done, FRAME_FALLBACK_MS);
+        } else timerId = setTimer(done, ms);
+        // Injected schedulers may complete synchronously; retain no late handle.
+        if (settled && timerId !== undefined) clearTimer(timerId);
       });
     }
     async function pause(ms) {

@@ -1,23 +1,16 @@
 // Owns the one reviewer tab that is allowed to relay, posts its items to the
 // local notifier, and restarts its sweep on a Chrome alarm.
 
-importScripts('sweep-modes.js', 'runtime-policy.js', 'diagnostics.js', 'relay-settings.js', 'scanner-control.js', 'challenge-evidence.js', 'verification-engine.js', 'verification-driver.js', 'verification-native.js', 'verification-automation.js', 'department-data.js', 'auxiliary-scans.js', 'tab-workspace.js', 'facet-input.js');
+importScripts('sweep-modes.js', 'runtime-policy.js', 'diagnostics.js', 'local-client.js', 'scanner-settings.js', 'relay-settings.js', 'scanner-control.js', 'challenge-evidence.js', 'verification-engine.js', 'verification-observation.js', 'verification-protocol.js', 'verification-driver.js', 'verification-native.js', 'verification-automation.js', 'department-data.js', 'auxiliary-scans.js', 'tab-workspace.js', 'facet-input.js');
 
 const DEFAULTS = {
+  ...Object.fromEntries(Object.entries(ReviewerScannerSettings.defaults)
+    .filter(([key]) => key !== 'schemaVersion')),
   endpoint: 'http://127.0.0.1:8787/ingest',
   token: '',
   refreshMinutes: 30,
   pageDelaySeconds: 15,
-  sweepMode: 'none',
-  auxiliaryDepartments: true,
-  auxiliaryKeywords: true,
-  auxiliaryBrands: false,
-  auxiliaryKeywordQueries: null,
-  groupScannerTabs: true,
-  rotateScannerTabs: true,
-  verificationAssistEnabled: false,
-  verificationNativeEnabled: false,
-  pathPattern: '^/reviews/claim-product'
+  sweepMode: 'none'
 };
 
 const REFRESH_ALARM = 'refresh';
@@ -54,6 +47,7 @@ const BOT_BACKOFF_BASE_MIN = 60;
 const BOT_BACKOFF_MAX_MIN = 24 * 60;
 // Checks further apart than this are treated as unrelated; the backoff resets.
 const BOT_COUNT_RESET_MS = 24 * 60 * 60_000;
+const BOT_ALERT_INTERVAL_MS = 15 * 60_000;
 const VERIFICATION_RECHECK_MS = 60_000;
 let pendingVerificationEvents = 0;
 let verificationPauseFailed = false;
@@ -68,19 +62,58 @@ const verificationAutomation = ReviewerVerificationAutomation.create(chrome, {
     return selected.state.tabId != null && !(await pausedUntil());
   }
 });
+function browserFailure(component) {
+  return () => {
+    recordDiagnostic('browser-error', { component, outcome: 'error' });
+    console.warn(`Reviewer Item Relay: ${component} operation failed`);
+  };
+}
+
 function triggerVerificationAutomation() {
-  verificationAutomation.runPending({ recheck: true }).catch(() => undefined);
+  verificationAutomation.runPending({ recheck: true }).catch(browserFailure('verification'));
+}
+
+// Observe only the controller's existing persisted phases/results. This never
+// invokes input, inspection, recovery or a new verification attempt.
+function recordVerificationChanges(changes) {
+  const describe = (name, value) => {
+    if (!value || typeof value !== 'object') return null;
+    const details = name === 'verificationAssistStatus' ? { outcome: 'status', statusCode: value.code }
+      : { outcome: value.outcome, resultAt: value.at, attempt: value.attempt,
+        durationMs: value.holdMs, cleanupConfirmed: value.cleanupConfirmed,
+        ...Object.fromEntries(['errorStage', 'errorReason', 'releaseReason', 'transport']
+          .map(k => [k, value[k]])) };
+    const identity = typeof value.key === 'string' ? /^(\d{1,15}):(\d{1,15})$/.exec(value.key) : null;
+    if (identity) { details.tabId = Number(identity[1]); details.episodeAt = Number(identity[2]); }
+    const entry = cleanDiagnostic('verification-state', details, 0);
+    if (entry) delete entry.at;
+    return entry;
+  };
+  for (const name of ['verificationAssistStatus', 'verificationAssistLastResult']) {
+    const change = changes[name];
+    if (!change) continue;
+    const next = describe(name, change.newValue);
+    if (next && JSON.stringify(next) !== JSON.stringify(describe(name, change.oldValue))) {
+      recordDiagnostic('verification-state', next);
+    }
+  }
 }
 
 const auxiliaryScans = ReviewerAuxiliaryScans.create(chrome, {
   home: REVIEWER_HOME, config, paused: pausedUntil, post: enqueuePost,
   diagnostic: recordDiagnostic, probe: probeOnce, onBotCheck: handleBotCheck,
   initialStartDelay: (settings, name) => Math.max(5, Math.min(60, Number(settings.pageDelaySeconds) || 15)) * 1000 *
-    (name === 'keywords' && settings.auxiliaryDepartments === true ? 2 : 1)
+    (1 + ReviewerAuxiliaryScans.lanes.slice(0, ReviewerAuxiliaryScans.lanes.indexOf(name))
+      .filter(lane => ReviewerAuxiliaryScans.enabled(lane, settings)).length)
 });
 
 const tabWorkspace = ReviewerTabWorkspace.create(chrome, {
-  config, paused: pausedUntil, authorize: authorizedScanner
+  config, paused: pausedUntil, authorize: authorizedScanner,
+  isManaged: async tabId => {
+    const state = await readCoordinator();
+    return state.tabId === tabId || state.interruptedTabId === tabId ||
+      await auxiliaryScans.ownsTab(tabId);
+  }
 });
 
 const facetInput = ReviewerFacetInput.create(chrome, { authorize: authorizedFacetInput });
@@ -111,17 +144,11 @@ const scannerControl = ReviewerScannerControl.create(chrome, {
 });
 
 function scannerSettingsForConfig(settings) {
-  return validatedScannerSettings({ schemaVersion: 1,
-    auxiliaryDepartments: settings.auxiliaryDepartments === true,
-    auxiliaryKeywords: settings.auxiliaryKeywords === true,
-    auxiliaryBrands: settings.auxiliaryBrands === true,
+  return ReviewerScannerSettings.project(settings, {
     auxiliaryKeywordQueries: settings.auxiliaryKeywordQueries == null ? null
       : auxiliaryQueries(settings.auxiliaryKeywordQueries),
-    groupScannerTabs: settings.groupScannerTabs !== false,
-    rotateScannerTabs: settings.rotateScannerTabs !== false,
-    verificationAssistEnabled: settings.verificationAssistEnabled === true,
-    verificationNativeEnabled: settings.verificationNativeEnabled === true,
-    pathPattern: settings.pathPattern || DEFAULTS.pathPattern });
+    auxiliaryPriorityQueries: settings.auxiliaryPriorityQueries == null ? null
+      : priorityQueries(settings.auxiliaryPriorityQueries) });
 }
 
 async function scannerStatusSnapshot() {
@@ -141,8 +168,8 @@ async function scannerStatusSnapshot() {
   catch { scannerSettings = scannerSettingsForConfig(DEFAULTS); errors.push({ component: 'settings', code: 'invalid-settings' }); }
   let lanes = [];
   try { lanes = (await auxiliaryScans.status()).lanes; }
-  catch { errors.push({ component: 'departments', code: 'status-unavailable' },
-    { component: 'keywords', code: 'status-unavailable' }); }
+  catch { errors.push(...ReviewerAuxiliaryScans.lanes.map(component =>
+    ({ component, code: 'status-unavailable' }))); }
   const tabId = state.tabId ?? state.interruptedTabId ?? null;
   let tab;
   try { if (tabId != null) tab = await chrome.tabs.get(tabId); } catch { /* Closed tab is unreachable. */ }
@@ -152,7 +179,8 @@ async function scannerStatusSnapshot() {
   const sweep = storedSweep[`sweep:${tabId}`] || (await readReviewerResume())?.sweep;
   const phase = await pausedUntil() ? 'waiting-verification'
     : !probe ? 'unreachable' : probe.phase === 'complete' ? 'complete'
-      : ['waiting-user', 'ingest-retry', 'passive', 'starting'].includes(probe.phase) ? probe.phase
+      : probe.phase === 'waiting-focus' ? 'waiting-user'
+        : ['waiting-user', 'waiting-traffic', 'ingest-retry', 'passive', 'starting'].includes(probe.phase) ? probe.phase
         : probe.sweeping ? 'scanning' : 'idle';
   let page = 0;
   try { page = number(Number(new URL(tab.url).searchParams.get('page') || 1)); } catch { /* Missing/invalid URL. */ }
@@ -186,9 +214,9 @@ async function scannerStatusSnapshot() {
       page, totalPages: Number.isSafeInteger(sweep?.total) && sweep.total >= 0 ? sweep.total : null,
       visitedPages: Array.isArray(sweep?.visited) ? sweep.visited.length : 0,
       lastActivityAt: number(probe?.lastActivityAt), nextActionAt: number(probe?.nextActionAt) },
-    lanes: ['departments', 'keywords'].map(name => {
+    lanes: ReviewerAuxiliaryScans.lanes.map(name => {
       const lane = lanes.find(entry => entry.lane === name);
-      const enabled = name === 'departments' ? settings.auxiliaryDepartments === true : settings.auxiliaryKeywords === true;
+      const enabled = ReviewerAuxiliaryScans.enabled(name, settings);
       return { lane: name, enabled, owned: managed.includes(lane?.tabId),
         runtime: scannerRuntimeProbe(laneProbes.get(name)),
         tabId: Number.isInteger(lane?.tabId) ? lane.tabId : null,
@@ -196,6 +224,7 @@ async function scannerStatusSnapshot() {
         targetLabel: typeof lane?.targetLabel === 'string' ? lane.targetLabel.slice(0, 150) : '',
         ...Object.fromEntries(['completedTargets', 'totalTargets', 'pages', 'failures', 'truncatedTargets',
           'coverageLimitedTargets', 'nextAt', 'round'].map(key => [key, number(lane?.[key])])),
+        ...scannerLaneCoverage(lane),
         lastErrorCode: lane?.lastError ? 'target-error' : errors.some(error => error.component === name)
           ? 'status-unavailable' : 'none', lastFailureCode: scannerFailureCode(lane?.lastError) };
     }),
@@ -430,6 +459,20 @@ function saveVerificationAlert(outage, sent) {
 
 async function notifyBotCheck(minutes, outage) {
   try {
+    const reserved = await coordinatorMutation(async () => {
+      const current = await readBotCheck();
+      if (current.pausedUntil <= 0 || current.lastAt !== outage.lastAt || current.count !== outage.count) return false;
+      const stored = await chrome.storage.local.get(['lastVerificationAlertAttemptAt', 'lastVerificationAlert']);
+      const now = Date.now();
+      const previous = Math.max(Number(stored.lastVerificationAlertAttemptAt) || 0,
+        Number(stored.lastVerificationAlert?.at) || 0);
+      if (previous > 0 && now - previous < BOT_ALERT_INTERVAL_MS) return false;
+      // Reserve before HTTP and keep the marker even after an ambiguous failure.
+      // Repeated clear/reblock episodes and worker recreation cannot send a burst.
+      await chrome.storage.local.set({ lastVerificationAlertAttemptAt: now });
+      return true;
+    });
+    if (!reserved) return;
     const { endpoint: raw, token } = await config();
     const url = new URL('/bot-check', checkedEndpoint(raw)).toString();
     const headers = { 'Content-Type': 'application/json' };
@@ -562,28 +605,7 @@ async function pauseForBotCheck(tabId) {
 // --- ingest -----------------------------------------------------------------
 
 function checkedEndpoint(raw) {
-  let endpoint;
-  try {
-    endpoint = new URL(raw);
-  } catch {
-    throw new Error(`The ingest endpoint is not a valid URL: ${raw || '(blank)'}`);
-  }
-  const loopback = endpoint.hostname === '127.0.0.1' || endpoint.hostname === 'localhost';
-  if (endpoint.protocol !== 'http:' || !loopback) {
-    throw new Error(
-      'The ingest endpoint must use http://127.0.0.1 or http://localhost; ' +
-      'the extension is intentionally permitted to send only to this machine.'
-    );
-  }
-  if (endpoint.username || endpoint.password ||
-      endpoint.pathname.replace(/\/+$/, '') !== '/ingest' ||
-      endpoint.search || endpoint.hash) {
-    throw new Error(
-      'The ingest endpoint must end exactly in /ingest and must not contain ' +
-      'credentials, a query string, or a fragment.'
-    );
-  }
-  return endpoint.toString();
+  return ReviewerLocalClient.endpoint(raw);
 }
 
 async function recordIngestFailure(message) {
@@ -616,8 +638,13 @@ function batchLabel(index, count) {
   return count > 1 ? `Batch ${index + 1} of ${count}: ` : '';
 }
 
-async function postBatch(endpoint, headers, items, index, count) {
+async function postBatch(endpoint, headers, items, index, count, context = {}) {
   const label = batchLabel(index, count);
+  const startedAt = Date.now();
+  let responseStatus = 0;
+  const outcome = value => recordDiagnostic('ingest-stage', { ...context, stage: 'batch', outcome: value,
+    batchIndex: index + 1, batchCount: count, items: items.length, responseStatus,
+    durationMs: Date.now() - startedAt });
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   let resp;
@@ -633,8 +660,10 @@ async function postBatch(endpoint, headers, items, index, count) {
       // Chrome rejects it because the resolved address space is `loopback`.
       signal: controller.signal
     });
+    responseStatus = resp.status;
     text = await resp.text();
   } catch (err) {
+    outcome(err?.name === 'AbortError' ? 'timeout' : 'network');
     const message = `${label}${networkFailureMessage(endpoint, err)}`;
     console.error('Reviewer Item Relay: ingest failed', err);
     await recordIngestFailure(message);
@@ -651,6 +680,7 @@ async function postBatch(endpoint, headers, items, index, count) {
   }
 
   if (!resp.ok) {
+    outcome(resp.status === 408 || resp.status === 429 || resp.status >= 500 ? 'retry' : 'rejected');
     const detail = summary?.error || text.slice(0, 200) || `HTTP ${resp.status}`;
     const hint = resp.status === 403
       ? ' Check that the extension token matches INGEST_TOKEN.'
@@ -666,18 +696,21 @@ async function postBatch(endpoint, headers, items, index, count) {
   }
 
   if (!summary || typeof summary !== 'object' || Array.isArray(summary)) {
+    outcome('invalid-response');
     const message =
       `${label}The notifier returned a successful response that was not valid JSON.`;
     await recordIngestFailure(message);
     return { ok: false, retryable: true, error: message };
   }
   if (!Number.isInteger(summary.seen) || summary.seen !== items.length) {
+    outcome('invalid-response');
     const message =
       `${label}The notifier acknowledged ${summary.seen ?? 'an unknown number of'} of ` +
       `${items.length} items; this page will retry instead of advancing.`;
     await recordIngestFailure(message);
     return { ok: false, retryable: true, error: message };
   }
+  outcome('accepted');
   return { ok: true, summary };
 }
 
@@ -723,7 +756,7 @@ function emptySummary() {
   return summary;
 }
 
-async function post(items, page, canSend = async () => !(await pausedUntil())) {
+async function post(items, page, canSend = async () => !(await pausedUntil()), context = {}) {
   const { endpoint: rawEndpoint, token } = await config();
   let endpoint;
   try {
@@ -736,22 +769,34 @@ async function post(items, page, canSend = async () => !(await pausedUntil())) {
 
   const headers = { 'Content-Type': 'application/json' };
   if (token) headers['X-Ingest-Token'] = token;
+  const requestId = DIAGNOSTIC_HEX.test(context.requestId || '') ? context.requestId : diagnosticIdentifier();
+  headers['X-Request-ID'] = requestId;
+  context = { ...context, requestId, page };
 
+  if (!await canSend()) return { ok: false, retryable: false, reason: 'inactive' };
+  // The reviewer card owns availability. Never fetch individual product pages.
+  const availableItems = items.filter(item => item.available !== false)
+    .map(({ eligibility_url: _legacyOfferUrl, ...item }) => item);
+  const filteredCount = items.length - availableItems.length;
   const summary = emptySummary();
-  const batchCount = Math.max(1, Math.ceil(items.length / MAX_INGEST_ITEMS));
+  summary.seen = filteredCount;
+  summary.filtered = filteredCount;
+  const batchCount = Math.ceil(availableItems.length / MAX_INGEST_ITEMS);
+  let accepted = false;
   for (let index = 0; index < batchCount; index += 1) {
-    if (!await canSend()) return { ok: false, retryable: false, reason: 'inactive' };
+    if (!await canSend()) return { ok: false, retryable: false, reason: 'inactive', accepted };
     const start = index * MAX_INGEST_ITEMS;
-    const batch = items.slice(start, start + MAX_INGEST_ITEMS);
+    const batch = availableItems.slice(start, start + MAX_INGEST_ITEMS);
     // Deliberately wait for each acknowledgement before sending the next
     // batch. If a later request fails, the content script retries the complete
     // page; successful earlier batches are harmless duplicates on that retry.
-    const result = await postBatch(endpoint, headers, batch, index, batchCount);
-    if (!result.ok) return result;
+    const result = await postBatch(endpoint, headers, batch, index, batchCount, context);
+    if (!result.ok) return { ...result, accepted };
+    accepted = true;
     mergeSummary(summary, result.summary);
   }
 
-  if (!await canSend()) return { ok: false, retryable: false, reason: 'inactive' };
+  if (!await canSend()) return { ok: false, retryable: false, reason: 'inactive', accepted };
 
   const now = Date.now();
   await chrome.storage.local.set({
@@ -802,9 +847,27 @@ async function post(items, page, canSend = async () => !(await pausedUntil())) {
 // Mutation-heavy pages can produce another report before an earlier response
 // reaches the content script. Serializing makes status writes deterministic.
 let ingestTail = Promise.resolve();
-function enqueuePost(items, page, canSend) {
+function enqueuePost(items, page, canSend, context = {}) {
+  const queuedAt = Date.now();
+  context = { ...context, page, requestId: diagnosticIdentifier() };
+  recordDiagnostic('ingest-stage', { ...context, stage: 'queued', outcome: 'waiting', items: items.length });
+  const run = async () => {
+    const startedAt = Date.now();
+    const current = { ...context, queueMs: Math.max(0, startedAt - queuedAt) };
+    try {
+      const value = await post(items, page, canSend, current);
+      if (!value.ok) recordDiagnostic('ingest-stage', { ...current, stage: 'complete',
+        outcome: value.reason === 'inactive' && value.accepted ? 'accepted-stale' : value.reason === 'inactive' ? 'cancelled'
+          : value.retryable ? 'retry' : 'rejected', durationMs: Date.now() - startedAt });
+      return { ...value, requestId: context.requestId };
+    } catch (error) {
+      recordDiagnostic('ingest-stage', { ...current, stage: 'complete', outcome: 'retry',
+        durationMs: Date.now() - startedAt });
+      throw error;
+    }
+  };
   const result = ingestTail.then(
-    () => post(items, page, canSend), () => post(items, page, canSend)
+    run, run
   );
   ingestTail = result.catch(() => undefined);
   return result;
@@ -1248,17 +1311,22 @@ async function handlePageReport(msg, sender) {
   }
 
   const startedAt = Date.now();
+  const context = { tabId: before.tabId, generation: msg.generation, documentId: msg.documentId,
+    lane: 'home', intakePhase: ['late', 'live'].includes(msg.intakePhase) ? msg.intakePhase : 'initial' };
   const result = await enqueuePost(msg.items, msg.page,
-    async () => (await authorizedRole(sender, msg.generation)).authorized);
+    async () => (await authorizedRole(sender, msg.generation)).authorized, context);
   const after = await authorizedRole(sender, msg.generation);
   if (result.ok && after.authorized) {
     await chrome.storage.session.remove(`recovery:${after.tabId}`);
-    await recordDiagnostic('page-delivered', { tabId: after.tabId, generation: msg.generation,
+    await recordDiagnostic('page-delivered', { ...context, requestId: result.requestId,
       page: msg.page, items: msg.items.length, durationMs: Date.now() - startedAt,
       new: result.summary?.new || 0, duplicates: result.summary?.duplicates || 0,
       matched: result.summary?.matched || 0, notified: result.summary?.notified || 0,
       failed: result.summary?.failed || 0, pending: result.summary?.pending || 0 });
   }
+  if (result.ok && !after.authorized) await recordDiagnostic('ingest-stage', { ...context,
+    requestId: result.requestId, page: msg.page, items: msg.items.length,
+    stage: 'complete', outcome: 'accepted-stale', durationMs: Date.now() - startedAt });
   return {
     ...result,
     ...roleFor(after.tabId, after.state),
@@ -1281,7 +1349,7 @@ async function navigateToPageOne(tabId, state, native = false) {
   url.searchParams.delete('page');
   if (queries.length) {
     url.searchParams.set('q', queries[0]);
-    url.searchParams.set('queryNups', '');
+    url.searchParams.set('queryNups', queries[0]);
   } else {
     url.searchParams.delete('q');
     url.searchParams.delete('queryNups');
@@ -1567,12 +1635,28 @@ async function coordinatorStatus() {
   };
 }
 
+async function recordContentDiagnostic(msg, sender) {
+  const details = { ...msg.details, tabId: sender.tab.id };
+  // document_idle runs before its initial role reply. Resolve only this one
+  // startup attribution from existing ownership; never call it a home page
+  // solely because the document has not received its auxiliary lease yet.
+  if (msg.event === 'page-loaded' && !(details.generation > 0) &&
+      await auxiliaryScans.ownsTab(sender.tab.id)) {
+    const assigned = await auxiliaryScans.handle({ type: 'reviewer:role' }, sender);
+    if (assigned?.auxiliary) Object.assign(details, { generation: assigned.generation,
+      lane: assigned.auxiliary.lane, round: assigned.auxiliary.round,
+      targetIndex: assigned.auxiliary.targetIndex, attempt: assigned.auxiliary.attempt });
+  }
+  return recordDiagnostic(msg.event, details);
+}
+
 function respondAsync(task, sendResponse) {
   Promise.resolve(task)
     .then((value) => sendResponse(value))
     .catch(async (err) => {
       const message = err?.message || String(err);
       console.error('Reviewer Item Relay: message handler failed', err);
+      recordDiagnostic('browser-error', { component: 'message', outcome: 'error' });
       try {
         await chrome.storage.local.set({ lastError: message, lastErrorAt: Date.now() });
       } finally {
@@ -1597,6 +1681,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     return respondAsync(facetInput.click(sender.tab.id, msg.generation, msg.selection), sendResponse);
   }
+  if (msg?.type === 'reviewer:selection-check') {
+    return respondAsync((async () => ({ ok: true,
+      selected: await authorizedScanner(sender?.tab?.id, msg.generation) &&
+        await tabWorkspace.allowsSelection(sender.tab.id, msg.generation) }))(), sendResponse);
+  }
   if (msg?.type === 'reviewer:focus') {
     return respondAsync((async () => {
       if (!await authorizedScanner(sender?.tab?.id, msg.generation)) {
@@ -1609,6 +1698,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return tabWorkspace.request(sender.tab.id, msg.generation, expiresAt,
         ['page-scroll', 'facet-controls'].includes(msg.purpose) ? 10_000 : 3_000);
     })(), sendResponse);
+  }
+  if (msg?.type === 'reviewer:focus-release') {
+    // Chrome supplies the holder identity. Exact lease matching makes delayed
+    // completion messages harmless after a new page or scanner takes its turn.
+    if (sender?.frameId !== 0 || !Number.isInteger(sender?.tab?.id) ||
+        !Number.isInteger(msg.generation) || typeof msg.leaseId !== 'string') {
+      sendResponse({ ok: false, released: false }); return undefined;
+    }
+    return respondAsync(tabWorkspace.release(sender.tab.id, msg.generation, msg.leaseId), sendResponse);
   }
   if (msg?.type === 'reviewer:user-active') {
     const tabId = sender?.tab?.id;
@@ -1653,8 +1751,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           !(eligibleUrl(sender.tab.url, await pathRegex()) || isBotCheckUrl(sender.tab.url))) {
         return { ok: false };
       }
-      await recordDiagnostic(msg.event, { ...msg.details, tabId: sender.tab.id });
-      return { ok: true };
+      const recorded = await recordContentDiagnostic(msg, sender);
+      return { ok: recorded.recorded, recorded: recorded.recorded };
     })(), sendResponse);
   }
   if (msg?.type === 'reviewer:verification') {
@@ -1807,10 +1905,15 @@ async function refreshTick() {
       return;
     }
 
+    if (state.highTraffic === true) {
+      await scheduleRefresh(true);
+      return;
+    }
     if (state.sweeping) {
       const stale = state.lastActivityAt && Date.now() - state.lastActivityAt > STALE_SWEEP_MS;
       if (stale && !(state.nextActionAt > Date.now()) &&
-          state.phase !== 'ingest-retry' && state.phase !== 'waiting-user') {
+          state.phase !== 'ingest-retry' && state.phase !== 'waiting-user' &&
+          state.highTraffic !== true) {
         try {
           await chrome.tabs.sendMessage(selected.tab.id, {
             type: 'reviewer:recover', generation: selected.state.generation
@@ -1849,7 +1952,8 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === 'verificationRetry') triggerVerificationAutomation();
   if (alarm.name === REFRESH_ALARM) {
     refreshTick().catch((err) => {
-      console.error('Reviewer Item Relay: refresh failed', err);
+      recordDiagnostic('browser-error', { component: 'refresh', outcome: 'error' });
+      console.error('Reviewer Item Relay: refresh failed');
       // Named alarms are one-shot. Always arm a recovery attempt after an
       // unexpected coordinator/API error so auto-refresh cannot silently die.
       scheduleRefresh(true).catch((retryErr) =>
@@ -1860,8 +1964,10 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     syncVerificationBadge(true);
   }
   if (alarm.name === STATUS_ALARM) {
-    reportBrowserStatus().catch((err) =>
-      console.warn('Reviewer Item Relay: could not report browser status', err));
+    reportBrowserStatus().catch(() => {
+      recordDiagnostic('browser-error', { component: 'heartbeat', outcome: 'error' });
+      console.warn('Reviewer Item Relay: could not report browser status');
+    });
   }
 });
 
@@ -1889,7 +1995,8 @@ async function reportBrowserStatus() {
   const probe = status.primaryTabId == null ? null : await probeOnce(status.primaryTabId);
   const phase = status.pausedUntil ? 'waiting-verification'
     : !status.reachable ? 'unreachable'
-      : probe?.phase === 'waiting-user' ? 'waiting-user'
+      : ['waiting-user', 'waiting-focus'].includes(probe?.phase) ? 'waiting-user'
+        : probe?.phase === 'waiting-traffic' ? 'waiting-traffic'
         : probe?.phase === 'ingest-retry' ? 'ingest-retry'
           : probe?.phase === 'complete' ? 'complete'
             : probe?.sweeping ? 'sweeping' : 'ready';
@@ -1921,8 +2028,8 @@ const initialization = ensureAlarms().then(() => syncVerificationBadge()).then(a
   // Stored pauses survive upgrades/restarts. Start even if an old document has
   // not emitted a new content-script event since the extension was enabled.
   triggerVerificationAutomation();
-  auxiliaryScans.tick().then(syncScannerWorkspace).catch(console.error);
-}).catch(console.error);
+  auxiliaryScans.tick().then(syncScannerWorkspace).catch(browserFailure('coordinator'));
+}).catch(browserFailure('initialization'));
 
 chrome.action.onClicked.addListener(async (tab) => {
   try {
@@ -1955,7 +2062,8 @@ chrome.runtime.onStartup.addListener(async () => {
     await auxiliaryScans.tick();
     await syncScannerWorkspace();
   } catch (err) {
-    console.error('Reviewer Item Relay: could not restore monitoring', err);
+    recordDiagnostic('browser-error', { component: 'coordinator', outcome: 'error' });
+    console.error('Reviewer Item Relay: could not restore monitoring');
   }
 });
 
@@ -1977,18 +2085,27 @@ chrome.runtime.onInstalled.addListener(async () => {
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== 'local') return;
+  recordVerificationChanges(changes);
+  for (const [key, component] of [['diagnosticsSyncError', 'diagnostics'], ['scanSettingsSyncError', 'settings'],
+    ['scannerSettingsSyncError', 'settings'], ['scannerCommandsSyncError', 'commands'], ['scannerStatusSyncError', 'status']]) {
+    const change = changes[key];
+    if (change && Boolean(change.newValue) !== Boolean(change.oldValue)) {
+      recordDiagnostic('sync-state', { component, outcome: change.newValue ? 'error' : 'recovered' });
+    }
+  }
   if ('verificationAssistEnabled' in changes || 'verificationNativeEnabled' in changes ||
       'botCheck' in changes) triggerVerificationAutomation();
   if ('refreshMinutes' in changes) {
-    scheduleRefresh().catch(console.error);
-    auxiliaryScans.tick().catch(console.error);
+    scheduleRefresh().catch(browserFailure('coordinator'));
+    auxiliaryScans.tick().catch(browserFailure('coordinator'));
   }
   if ('pathPattern' in changes || 'sweepMode' in changes) {
-    selectPrimary().then(() => ensureReviewerTab()).catch(console.error);
+    selectPrimary().then(() => ensureReviewerTab()).catch(browserFailure('coordinator'));
   }
-  if (['auxiliaryDepartments', 'auxiliaryKeywords', 'auxiliaryBrands', 'auxiliaryKeywordQueries']
-      .some(key => key in changes)) auxiliaryScans.tick().catch(console.error);
-  if ('groupScannerTabs' in changes) syncScannerWorkspace().catch(console.error);
+  if (['auxiliaryDepartments', 'auxiliaryKeywords', 'auxiliaryBrands', 'auxiliaryKeywordQueries',
+    'auxiliaryPriority', 'auxiliaryPriorityQueries', 'auxiliaryPriorityRefreshMinutes']
+      .some(key => key in changes)) auxiliaryScans.tick().catch(browserFailure('coordinator'));
+  if ('groupScannerTabs' in changes) syncScannerWorkspace().catch(browserFailure('coordinator'));
   if ('rotateScannerTabs' in changes) tabWorkspace.revoke();
 });
 
@@ -1998,7 +2115,9 @@ chrome.tabs.onActivated?.addListener(({ tabId }) => {
     tabWorkspace.noteActivity(tabId).catch(() => undefined);
   }
 });
-chrome.windows?.onFocusChanged?.addListener(() => tabWorkspace.revoke());
+// Switching applications does not revoke a selected-tab turn. Actual tab
+// changes and trusted input still revoke it through the handlers above.
+chrome.windows?.onFocusChanged?.addListener(() => tabWorkspace.cancelPendingSelection());
 
 chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
   chrome.storage.session.remove(`recovery:${tabId}`).catch(() => undefined);
@@ -2025,7 +2144,7 @@ chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
       if (!removeInfo?.isWindowClosing) await ensureReviewerTab();
       if (changed) await selectPrimary();
     });
-  }).catch(console.error);
+  }).catch(browserFailure('coordinator'));
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
@@ -2033,7 +2152,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   // Any Walmart tab landing on the bot check pauses everything: the check is
   // about this browser session, not about one tab.
   if (isBotCheckUrl(changeInfo.url || tab?.url)) {
-    handleBotCheck(tabId).catch(console.error);
+    handleBotCheck(tabId).catch(browserFailure('coordinator'));
     return;
   }
   return auxiliaryScans.ownsTab(tabId).then(async managed => {
@@ -2064,7 +2183,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
       if (changed) await selectPrimary();
       if (changeInfo.url) await ensureReviewerTab();
     });
-  }).catch(console.error);
+  }).catch(browserFailure('coordinator'));
 });
 
 // 1.0.x stored settings in sync storage. Only the refresh interval is safe to

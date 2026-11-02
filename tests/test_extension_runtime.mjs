@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
+import { reviewerLocks } from './fixtures/reviewer-locks.mjs';
 
 const backgroundSource = fs.readFileSync(
   new URL('../extension/background.js', import.meta.url), 'utf8'
@@ -24,8 +25,13 @@ const facetInputSource = fs.readFileSync(new URL('../extension/facet-input.js', 
 const departmentDataSource = fs.readFileSync(new URL('../extension/department-data.js', import.meta.url), 'utf8');
 const scannerControlSource = fs.readFileSync(new URL('../extension/scanner-control.js', import.meta.url), 'utf8');
 const controlsSource = fs.readFileSync(new URL('../extension/page-controls.js', import.meta.url), 'utf8');
+const verificationObservationSource = fs.readFileSync(new URL('../extension/verification-observation.js', import.meta.url), 'utf8');
+const verificationProtocolSource = fs.readFileSync(new URL('../extension/verification-protocol.js', import.meta.url), 'utf8');
 const liveObserverSource = fs.readFileSync(new URL('../extension/live-observer.js', import.meta.url), 'utf8');
+const documentSessionSource = fs.readFileSync(new URL('../extension/document-session.js', import.meta.url), 'utf8');
 const relaySettingsSource = fs.readFileSync(new URL('../extension/relay-settings.js', import.meta.url), 'utf8');
+const localClientSource = fs.readFileSync(new URL('../extension/local-client.js', import.meta.url), 'utf8');
+const scannerSettingsSource = fs.readFileSync(new URL('../extension/scanner-settings.js', import.meta.url), 'utf8');
 const challengeEvidenceSource = fs.readFileSync(new URL('../extension/challenge-evidence.js', import.meta.url), 'utf8');
 const verificationAutomationSource = ['verification-engine.js', 'verification-driver.js',
   'verification-automation.js'].map(name => fs.readFileSync(new URL(`../extension/${name}`, import.meta.url), 'utf8')).join('\n');
@@ -113,6 +119,7 @@ function loadBackground({
       onRemoved: event(),
       onUpdated: event(),
       onActivated: event(),
+      onReplaced: event(),
       async query() { return tabs; },
       async get(id) { return tabs.find((tab) => tab.id === id); },
       async create(options) {
@@ -149,10 +156,12 @@ function loadBackground({
         }
         return { ok: true };
       }
-    }
+    },
+    windows: { onFocusChanged: event() }
   };
   const context = vm.createContext({
     chrome,
+    navigator: { locks: reviewerLocks() },
     URL,
     AbortController,
     setTimeout,
@@ -165,11 +174,11 @@ function loadBackground({
     }
   });
   vm.runInContext(
-    `${sweepModesSource}\n${policySource}\n${diagnosticsSource}\n${relaySettingsSource}\n${scannerControlSource}\n` +
+    `${sweepModesSource}\n${policySource}\n${diagnosticsSource}\n${localClientSource}\n${scannerSettingsSource}\n${relaySettingsSource}\n${scannerControlSource}\n` +
     // Legacy collector cases isolate the existing server contract; explicit
     // backend-control cases below and the dedicated suite run the real bridge.
     (scannerBackend ? '' : 'ReviewerScannerControl.create = () => ({syncSettings: async () => true, syncCommands: async () => true, syncStatus: async () => true});\n') +
-    `${challengeEvidenceSource}\n${verificationAutomationSource}\n${departmentDataSource}\n${auxiliaryScansSource}\n${tabWorkspaceSource}\n${facetInputSource}\n${backgroundSource.replace(/^importScripts\([^\n]+\);/m, '')}\n;globalThis.__test = {` +
+    `${challengeEvidenceSource}\n${verificationObservationSource}\n${verificationProtocolSource}\n${verificationAutomationSource}\n${departmentDataSource}\n${auxiliaryScansSource}\n${tabWorkspaceSource}\n${facetInputSource}\n${backgroundSource.replace(/^importScripts\([^\n]+\);/m, '')}\n;globalThis.__test = {` +
       'selectPrimary, readCoordinator, handlePageReport, restartPrimary, post, checkedEndpoint,' +
       'isBotCheckUrl, handleBotCheck, pausedUntil, refreshTick, scheduleRefresh,' +
       'initialization, ensureAlarms, reportBrowserStatus, verificationAutomation, auxiliaryScans, tabWorkspace, scannerControl, scannerStatusSnapshot, syncRelaySettings: () => syncRelaySettings()};',
@@ -196,6 +205,83 @@ function workerMessage(bg, message, sender = { id: 'fixture', url: 'chrome-exten
   });
 }
 
+test('catalogue reports relay every in-stock card without additional Walmart requests', async () => {
+  let walmartRequests = 0;
+  const bg = loadBackground({ fetchImpl: (url, init) => {
+    if (!url.startsWith('http://127.0.0.1:')) {
+      walmartRequests++;
+      throw new Error('Product pages must not be fetched');
+    }
+    return jsonResponse({ seen: JSON.parse(init.body).items.length });
+  } });
+  const items = Array.from({ length: 40 }, (_, i) => ({
+    item_id: `ip-${10000000 + i}`, title: 'Free card product', available: true, value_usd: 25
+  }));
+  const result = await bg.api.post(items, 1);
+  assert.equal(result.ok, true);
+  assert.equal(result.summary.seen, 40);
+  assert.equal(result.summary.pending, 0);
+  assert.equal(walmartRequests, 0);
+  assert.equal(bg.fetchCalls.length, 1);
+  assert.equal(JSON.parse(bg.fetchCalls[0].body).items.length, 40);
+});
+
+test('out-of-stock cards are filtered before ingest without being marked persistently seen', async () => {
+  const bg = loadBackground({ fetchImpl: (_url, init) =>
+    jsonResponse({ seen: JSON.parse(init.body).items.length }) });
+  const result = await bg.api.post([
+    { item_id: 'ip-10000001', available: true },
+    { item_id: 'ip-10000002', available: false }
+  ], 1);
+  assert.equal(result.ok, true);
+  assert.equal(result.summary.seen, 2);
+  assert.equal(result.summary.filtered, 1);
+  assert.deepEqual(JSON.parse(bg.fetchCalls[0].body).items.map(item => item.item_id), ['ip-10000001']);
+  const empty = await bg.api.post([{ item_id: 'ip-10000003', available: false }], 2);
+  assert.equal(empty.ok, true);
+  assert.equal(empty.summary.filtered, 1);
+  assert.equal(bg.fetchCalls.length, 1);
+});
+
+test('backend failures cannot acknowledge eligible IDs as completed', async () => {
+  for (const field of ['failed', 'pending']) {
+    const bg = loadBackground({ summary: { seen: 1, [field]: 1 } });
+    const result = await bg.api.post([{ item_id: 'ip-10000001', available: true }], 1);
+    assert.equal(result.ok, false);
+    assert.equal(result.acknowledgedIds, undefined);
+  }
+});
+
+test('rapid clear-and-reblock episodes reserve only one persistent alert attempt', async () => {
+  const local = storageArea();
+  const bg = loadBackground({ localArea: local });
+  await bg.api.initialization;
+  for (let i = 0; i < 13; i++) {
+    if (local.data.botCheck) local.data.botCheck.pausedUntil = 0;
+    await bg.api.handleBotCheck(11, 'text');
+  }
+  assert.equal(bg.fetchCalls.filter(call => call.body?.includes('paused_minutes')).length, 1);
+  const resumed = loadBackground({ localArea: local });
+  await resumed.api.initialization;
+  local.data.botCheck.pausedUntil = 0;
+  await resumed.api.handleBotCheck(11, 'text');
+  assert.equal(resumed.fetchCalls.filter(call => call.body?.includes('paused_minutes')).length, 0);
+  resumed.api.setNow(Date.now() + 15 * 60_000 + 1);
+  local.data.botCheck.pausedUntil = 0;
+  await resumed.api.handleBotCheck(11, 'text');
+  assert.equal(resumed.fetchCalls.filter(call => call.body?.includes('paused_minutes')).length, 1);
+});
+
+test('an ambiguous failed alert remains reserved through rapid subsequent episodes', async () => {
+  const bg = loadBackground({ fetchImpl: () => { throw new Error('response lost'); } });
+  await bg.api.initialization;
+  await bg.api.handleBotCheck(11, 'text');
+  bg.local.data.botCheck.pausedUntil = 0;
+  await bg.api.handleBotCheck(11, 'text');
+  assert.equal(bg.fetchCalls.filter(call => call.body?.includes('paused_minutes')).length, 1);
+  assert.ok(bg.local.data.botCheck.pausedUntil > 0);
+});
+
 test('production defaults start additional department and keyword lanes without Options setup', async () => {
   const bg = loadBackground({ productionDefaults: true });
   await bg.api.initialization;
@@ -205,7 +291,19 @@ test('production defaults start additional department and keyword lanes without 
   let departments = status.lanes.find(lane => lane.lane === 'departments');
   const keywords = status.lanes.find(lane => lane.lane === 'keywords');
   assert.equal(departments.status, 'waiting');
-  assert.equal(departments.tabId, null);
+  assert.ok(Number.isInteger(departments.tabId));
+  assert.ok(Number.isInteger(keywords.tabId));
+  assert.notEqual(departments.tabId, keywords.tabId);
+  const reserved = bg.tabActions.filter(action => action.type === 'create');
+  assert.equal(reserved.length, 2);
+  assert.ok(reserved.every(action => action.options.active === false &&
+    action.options.url === 'chrome-extension://fixture/scanner-wait.html'));
+  assert.equal(bg.tabActions.filter(action => action.type === 'update').length, 0);
+  for (const lane of [departments, keywords]) {
+    const assigned = await bg.api.auxiliaryScans.handle({ type: 'reviewer:role' },
+      { tab: { id: lane.tabId, url: 'chrome-extension://fixture/scanner-wait.html' } });
+    assert.equal(assigned.active, false);
+  }
   assert.ok(keywords.nextAt > departments.nextAt);
   bg.api.setNow(departments.nextAt);
   await bg.api.auxiliaryScans.tick();
@@ -213,9 +311,51 @@ test('production defaults start additional department and keyword lanes without 
   departments = status.lanes.find(lane => lane.lane === 'departments');
   assert.equal(departments.status, 'scanning');
   assert.ok(Number.isInteger(departments.tabId));
-  assert.equal(keywords.targetLabel, 'Furniture');
+  const starts = bg.tabActions.filter(action => action.type === 'update');
+  assert.equal(starts.length, 1);
+  assert.equal(starts[0].id, departments.tabId);
+  assert.equal(starts[0].options.active, false);
+  assert.equal(keywords.targetLabel, 'Large Appliance');
   assert.ok(['waiting', 'scanning'].includes(keywords.status));
   assert.ok(keywords.totalTargets >= 6);
+});
+
+test('background staggers the priority lane after enabled broad lanes and reports its shared ownership', async () => {
+  const bg = loadBackground({ productionDefaults: true, localArea: storageArea({
+    auxiliaryPriority: true, auxiliaryPriorityQueries: ['Furniture', 'Sofa'],
+    auxiliaryPriorityRefreshMinutes: 1, pageDelaySeconds: 15
+  }) });
+  bg.api.setNow(1_000_000);
+  await bg.api.initialization;
+  await bg.api.auxiliaryScans.tick();
+  const lanes = (await bg.api.auxiliaryScans.status()).lanes;
+  assert.deepEqual([...lanes.map(lane => lane.lane)], ['departments', 'keywords', 'priority']);
+  assert.equal(lanes[1].nextAt - lanes[0].nextAt, 15_000);
+  assert.equal(lanes[2].nextAt - lanes[1].nextAt, 15_000);
+  assert.equal(new Set(lanes.map(lane => lane.tabId)).size, 3);
+  assert.equal(bg.tabActions.filter(action => action.type === 'create').length, 3);
+  for (const lane of lanes) {
+    bg.api.setNow(lane.nextAt);
+    await bg.api.auxiliaryScans.tick();
+  }
+  const report = await bg.api.scannerStatusSnapshot();
+  assert.deepEqual([...report.lanes.map(lane => [lane.lane, lane.enabled, lane.owned])],
+    [['departments', true, true], ['keywords', true, true], ['priority', true, true]]);
+  assert.deepEqual(Array.from(report.settings.auxiliaryPriorityQueries), ['Furniture', 'Sofa']);
+  const starts = bg.tabActions.filter(action => action.type === 'update');
+  assert.equal(starts.length, 3);
+  const priorityStart = starts.find(action => action.id === lanes[2].tabId);
+  assert.equal(new URL(priorityStart.options.url).searchParams.get('q'), 'Furniture');
+});
+
+test('priority-only configuration gets one ordinary startup spacing interval', async () => {
+  const bg = loadBackground({ localArea: storageArea({ auxiliaryPriority: true, pageDelaySeconds: 7 }) });
+  bg.api.setNow(1_000_000);
+  await bg.api.initialization;
+  await bg.api.auxiliaryScans.tick();
+  const priority = (await bg.api.auxiliaryScans.status()).lanes[0];
+  assert.equal(priority.lane, 'priority');
+  assert.equal(priority.nextAt, 1_007_000);
 });
 
 test('native department input accepts only the current main-frame assignment and foreground authority', async () => {
@@ -306,7 +446,7 @@ test('real backend bridge overrides stale lane flags and exports ownership plus 
   await bg.api.auxiliaryScans.tick();
   const report = await bg.api.scannerStatusSnapshot();
   assert.deepEqual([...report.lanes.map(lane => [lane.lane, lane.enabled, lane.owned])],
-    [['departments', true, false], ['keywords', true, false]]);
+    [['departments', true, false], ['keywords', true, false], ['priority', false, false]]);
   assert.equal(report.verification.attempt, 10);
   assert.equal(report.verification.errorStage, 'move');
   assert.equal(report.verification.errorReason, 'timeout');
@@ -998,6 +1138,7 @@ function loadOptions({
   const context = vm.createContext({
     chrome,
     document,
+    navigator: { locks: reviewerLocks() },
     URL,
     AbortController,
     setTimeout,
@@ -1022,7 +1163,7 @@ function loadOptions({
     }
   });
   vm.runInContext(
-    `${sweepModesSource}\n${policySource}\n${relaySettingsSource}\n${scannerControlSource}\n${optionsSource}\n;globalThis.__test = {` +
+    `${sweepModesSource}\n${policySource}\n${localClientSource}\n${scannerSettingsSource}\n${optionsSource}\n;globalThis.__test = {` +
       'completedSweepPages, activeSweep, renderStatus};',
     context
   );
@@ -2090,6 +2231,7 @@ test('one-page auxiliary hints require matching fresh document scope and metadat
 
 function loadContent({ pageAck = { ok: false, retryable: true }, localArea = null,
   runtimeId = 'reviewer-fixture-extension', facetControls = null,
+  performance = null,
   pageScroll = { run: async () => ({ outcome: 'complete' }) },
   departmentData = false,
   initialUrl = 'https://www.walmart.com/reviews/claim-product?page=2' } = {}) {
@@ -2164,6 +2306,7 @@ function loadContent({ pageAck = { ok: false, retryable: true }, localArea = nul
     URL,
     URLSearchParams,
     AbortController,
+    performance: performance || undefined,
     ReviewerPageScroll: pageScroll || undefined,
     ReviewerFacetControls: facetControls,
     getComputedStyle() { return { display: 'block', visibility: 'visible' }; },
@@ -2175,17 +2318,18 @@ function loadContent({ pageAck = { ok: false, retryable: true }, localArea = nul
     console
   });
   vm.runInContext(
-    `${sweepModesSource}\n${policySource}\n${controlsSource}\n${liveObserverSource}\n${departmentData ? departmentDataSource : ''}\n${contentSource}\n;globalThis.__test = {role, nextUnvisited, handleEndPage, ` +
+    `${sweepModesSource}\n${policySource}\n${verificationObservationSource}\n${controlsSource}\n${documentSessionSource}\n${liveObserverSource}\n${departmentData ? departmentDataSource : ''}\n${contentSource}\n;globalThis.__test = {role, nextUnvisited, handleEndPage, ` +
       'queueWhenIdle, relay, scheduleRelay, pageDelayMs, preparePageNavigation, advanceDeliveredPage, readSweep, findPageControl, inspectPageControls, navigatePage, collect, ' +
       'navigateWithFocus: (...args) => navigateWithFocus(...args), ' +
-      'diagnostic, checkVerification, requestRole, revealPager, applyRole, keepMonitoringScope, ' +
-      'ensureAuxiliaryTarget, discoverAuxiliaryTargets, removeCurrentSweep, applyAckRole, selectAuxiliaryTarget, cancelPageWork, totalPages, ' +
+      'diagnostic, pageStateEvidence, recordPageState, reportUnusable, checkVerification, requestRole, revealPager, applyRole, keepMonitoringScope, ' +
+      'ensureAuxiliaryTarget, discoverAuxiliaryTargets, removeCurrentSweep, applyAckRole, selectAuxiliaryTarget, cancelPageWork, totalPages, continueSweep, ' +
       'scrollResultsPage: (...args) => scrollResultsPage(...args), cancelResultsScroll: () => cancelResultsScroll(), ' +
       'scrollPageControlIntoView: (...args) => scrollPageControlIntoView(...args), ' +
       'observeVisibleUpdate: (...args) => observeVisibleUpdate(...args), ' +
       'rememberAcknowledged: (...args) => rememberAcknowledged(...args), ' +
       'scheduleVisibleObservation: (...args) => scheduleVisibleObservation(...args), ' +
-      'setCollector(value) { collect = value; }, ' +
+      'itemSignature: () => itemSignature(), ' +
+      'setCollector(value) { collect = value; itemSignature = () => value().map(item => item.item_id).sort().join("|"); }, ' +
       'setLastInteraction(value) { lastInteraction = value; }, ' +
       'setRoleRequestInFlight(value) { roleRequestInFlight = value; }, ' +
       'setNow(value) { Date.now = () => value; }, ' +
@@ -2211,6 +2355,164 @@ function permitFacetFocus(content) {
     return send(message);
   };
 }
+
+function emptyAuxiliaryContent(options = {}) {
+  const targetUrl = 'https://www.walmart.com/reviews/claim-product?q=Empty&queryNups=Empty';
+  const content = loadContent({ initialUrl: targetUrl, ...options });
+  content.api.setNow(100_000);
+  Object.assign(content.api.role, { active: true, tabId: 1, generation: 9,
+    auxiliary: { lane: 'keywords', targetKey: 'keyword:empty', targetUrl } });
+  content.document.readyState = 'complete';
+  content.document.visibilityState = 'visible';
+  content.pager.innerText = '';
+  content.document.querySelector = selector => selector === 'main, [role="main"], #maincontent' ? content.body : null;
+  content.api.setCollector(() => []);
+  content.local.data['sweep:1'] = { generation: 9, targetKey: 'keyword:empty', mode: 'none',
+    total: null, visited: [], startedAt: 1 };
+  return content;
+}
+
+test('a stable visible empty auxiliary query completes as verified empty without retries or reloads', async () => {
+  const content = emptyAuxiliaryContent();
+  await content.api.handleEndPage(9);
+  assert.equal(content.sentMessages.some(msg => msg.type === 'reviewer:sweep-complete'), false);
+  content.api.setNow(102_000);
+  await content.api.handleEndPage(9);
+  const completion = content.sentMessages.find(msg => msg.type === 'reviewer:sweep-complete');
+  assert.equal(completion?.emptyResult, true);
+  assert.equal(completion?.pages, 0);
+  assert.equal(completion?.coverageLimited, false);
+  assert.equal(content.sentMessages.some(msg => msg.type === 'reviewer:unusable'), false);
+  assert.equal(content.local.data['sweep:1'].emptyResult, true);
+});
+
+for (const invalid of ['hidden', 'loading', 'http-error', 'signin', 'site-error', 'cards', 'interior', 'changed-target', 'footer', 'hidden-panel']) {
+  test(`an auxiliary empty proof cannot accept ${invalid}`, async () => {
+    const content = emptyAuxiliaryContent({ performance: {
+      getEntriesByType(kind) { return kind === 'navigation' ? [{ responseStatus: invalid === 'http-error' ? 520 : 200 }] : []; }
+    } });
+    await content.api.handleEndPage(9);
+    content.api.setNow(102_000);
+    if (invalid === 'hidden') content.document.visibilityState = 'hidden';
+    if (invalid === 'loading') content.document.querySelectorAll = selector => selector.includes('aria-busy') ? [{}] : [];
+    if (invalid === 'signin') content.document.querySelectorAll = selector => selector.includes('password') ? [{}] : [];
+    if (invalid === 'site-error') content.body.innerText += ' Something went wrong';
+    if (invalid === 'cards') content.api.setCollector(() => [{ item_id: 'late-card' }]);
+    if (invalid === 'interior') {
+      content.location.href += '&page=2'; content.location.search += '&page=2';
+      content.local.data['sweep:1'].visited = [1];
+    }
+    if (invalid === 'changed-target') content.api.role.auxiliary.targetKey = 'keyword:other';
+    if (invalid === 'footer') content.document.querySelector = () => null;
+    if (invalid === 'hidden-panel') content.body.hidden = true;
+    await content.api.handleEndPage(9);
+    assert.equal(content.sentMessages.some(msg => msg.type === 'reviewer:sweep-complete' && msg.emptyResult), false);
+  });
+}
+
+test('cards arriving while empty proof is persisted preserve the uncompleted checkpoint', async () => {
+  const content = emptyAuxiliaryContent();
+  await content.api.handleEndPage(9);
+  content.api.setNow(102_000);
+  const set = content.local.set;
+  content.local.set = async values => {
+    await set(values);
+    if (values['sweep:1']?.emptyResult) content.api.setCollector(() => [{ item_id: 'hydrated' }]);
+  };
+  await content.api.handleEndPage(9);
+  assert.equal(content.sentMessages.some(msg => msg.type === 'reviewer:sweep-complete'), false);
+});
+
+test('a hidden no-results target requests a guarded rendering opportunity before spending its timeout', async () => {
+  const content = emptyAuxiliaryContent();
+  content.document.visibilityState = 'hidden';
+  const send = content.chrome.runtime.sendMessage;
+  content.chrome.runtime.sendMessage = async message => {
+    if (message.type === 'reviewer:focus') {
+      content.sentMessages.push(message);
+      return { ok: true, enabled: true, granted: false, reason: 'waiting-turn' };
+    }
+    return send(message);
+  };
+  await content.api.handleEndPage(9);
+  content.api.setNow(131_000);
+  await content.api.handleEndPage(9);
+  assert.equal(content.sentMessages.filter(msg => msg.type === 'reviewer:focus').length, 2);
+  assert.equal(content.sentMessages.some(msg => msg.type === 'reviewer:unusable'), false);
+  assert.equal(content.api.getPhase(), 'waiting-focus');
+  content.document.visibilityState = 'visible';
+  await content.api.handleEndPage(9);
+  content.api.setNow(133_000);
+  await content.api.handleEndPage(9);
+  assert.equal(content.sentMessages.find(msg => msg.type === 'reviewer:sweep-complete')?.emptyResult, true);
+});
+
+test('a hidden empty target verifies inside its granted three-second focus turn', async () => {
+  const content = emptyAuxiliaryContent();
+  content.document.visibilityState = 'hidden';
+  const send = content.chrome.runtime.sendMessage;
+  content.chrome.runtime.sendMessage = async message => {
+    if (message.type === 'reviewer:focus') {
+      content.sentMessages.push(message);
+      content.document.visibilityState = 'visible';
+      return { ok: true, enabled: true, granted: true, until: 103_000, leaseId: 'empty-turn' };
+    }
+    return send(message);
+  };
+  await content.api.handleEndPage(9);
+  const readinessDelay = [...content.timerCallbacks.values()].at(-1).ms;
+  assert.ok(readinessDelay <= 100, 'A granted turn must leave room for both empty observations');
+  content.api.setNow(100_000 + readinessDelay);
+  await content.api.handleEndPage(9);
+  assert.equal(content.sentMessages.some(msg => msg.type === 'reviewer:sweep-complete'), false);
+  content.api.setNow(102_000 + readinessDelay);
+  assert.ok(content.api.getNow() < 103_000);
+  await content.api.handleEndPage(9);
+  assert.equal(content.sentMessages.find(msg => msg.type === 'reviewer:sweep-complete')?.emptyResult, true);
+});
+
+test('trusted input during empty verification defers without failing or completing its target', async () => {
+  const content = emptyAuxiliaryContent();
+  await content.api.handleEndPage(9);
+  content.api.setNow(131_000);
+  content.listeners.get('keydown')({ isTrusted: true });
+  await content.api.handleEndPage(9);
+  assert.equal(content.api.getPhase(), 'waiting-user');
+  assert.equal(content.sentMessages.some(msg => ['reviewer:unusable', 'reviewer:sweep-complete'].includes(msg.type)), false);
+  content.api.setNow(161_000);
+  await content.api.handleEndPage(9);
+  assert.equal(content.sentMessages.some(msg => msg.type === 'reviewer:sweep-complete'), false);
+  content.api.setNow(163_000);
+  await content.api.handleEndPage(9);
+  assert.equal(content.sentMessages.find(msg => msg.type === 'reviewer:sweep-complete')?.emptyResult, true);
+});
+
+test('an empty bound department receives the same verified empty outcome as a keyword', async () => {
+  const content = emptyAuxiliaryContent();
+  const targetUrl = 'https://www.walmart.com/reviews/claim-product?catId=123';
+  Object.assign(content.location, { href: targetUrl, search: '?catId=123' });
+  Object.assign(content.api.role.auxiliary, { lane: 'departments', targetKey: 'department:123', targetUrl });
+  content.local.data['sweep:1'].targetKey = 'department:123';
+  await content.api.handleEndPage(9);
+  content.api.setNow(102_000);
+  await content.api.handleEndPage(9);
+  assert.equal(content.sentMessages.find(msg => msg.type === 'reviewer:sweep-complete')?.emptyResult, true);
+});
+
+test('cards appearing between empty observations reset the stable-empty confirmation', async () => {
+  const content = emptyAuxiliaryContent();
+  await content.api.handleEndPage(9);
+  content.api.setNow(101_000);
+  content.api.setCollector(() => [{ item_id: 'transient-card' }]);
+  await content.api.handleEndPage(9);
+  content.api.setCollector(() => []);
+  content.api.setNow(102_000);
+  await content.api.handleEndPage(9);
+  assert.equal(content.sentMessages.some(msg => msg.type === 'reviewer:sweep-complete'), false);
+  content.api.setNow(104_000);
+  await content.api.handleEndPage(9);
+  assert.equal(content.sentMessages.find(msg => msg.type === 'reviewer:sweep-complete')?.emptyResult, true);
+});
 
 test('a synchronous invalidated-context error stops stale timers, observers and navigation', async () => {
   const content = loadContent();
@@ -2486,6 +2788,94 @@ function loadFinalLetterContent(options = {}) {
   return content;
 }
 
+test('page state captures bounded render and network evidence without text or request addresses', () => {
+  const content = loadContent({ performance: { getEntriesByType: kind => kind === 'navigation'
+    ? [{ type: 'reload', responseStatus: 503 }]
+    : [{ name: 'https://www.walmart.com/api/private?token=secret', initiatorType: 'fetch', responseStatus: 500 },
+      { name: 'https://third-party.example/private', initiatorType: 'fetch', responseStatus: 500 },
+      { name: 'https://www.walmart.com/ok', initiatorType: 'fetch', responseStatus: 200 }] } });
+  content.document.readyState = 'complete';
+  content.body.innerText = 'Recognized Reviewer\nNo search results\nPrivate member details';
+  const evidence = content.api.pageStateEvidence();
+  assert.equal(evidence.noResults, true);
+  assert.equal(evidence.responseStatus, 503);
+  assert.equal(evidence.navigationType, 'reload');
+  assert.equal(evidence.failedRequests, 1);
+  assert.equal(evidence.readyState, 'complete');
+  assert.equal(evidence.productLinks, 0);
+  assert.doesNotMatch(JSON.stringify(evidence), /private|secret|https|member/i);
+});
+
+test('page state repeated emptiness is rate limited but a new stage and document state survive', () => {
+  const content = loadContent();
+  Object.assign(content.api.role, { active: true, tabId: 1, generation: 9 });
+  content.api.setNow(100_000);
+  content.api.recordPageState('empty-observed');
+  content.api.recordPageState('empty-observed');
+  content.api.setNow(109_999);
+  content.api.recordPageState('empty-observed');
+  const events = () => content.sentMessages.filter(m => m.event === 'page-state');
+  assert.equal(events().length, 1);
+  content.api.recordPageState('unusable');
+  assert.equal(events().length, 2);
+  content.api.setNow(160_000);
+  content.api.recordPageState('empty-observed');
+  assert.equal(events().length, 3);
+  assert.equal(events()[0].details.documentId > 0, true);
+  assert.equal(events()[0].details.lane, 'home');
+  assert.doesNotThrow(() => content.api.recordPageState('private-stage'));
+  assert.equal(events().length, 3);
+});
+
+test('page state records empty confirmation and zero-page completion without changing completion', async () => {
+  const content = loadFinalLetterContent();
+  content.pager.innerText = '';
+  content.local.data['sweep:1'] = {
+    generation: 9, mode: 'sweep', query: 'z', visited: [], total: null, endRetries: {}
+  };
+  await content.api.handleEndPage(9);
+  assert.ok(content.sentMessages.some(m => m.event === 'page-state' && m.details.stage === 'empty-confirmation'));
+  // A fresh document after the one allowed reload consumes the persisted confirmation.
+  const fresh = loadContent({ localArea: content.local,
+    initialUrl: 'https://www.walmart.com/reviews/claim-product?q=z&queryNups=z' });
+  activateAlphabet(fresh, 'z', 1);
+  fresh.pager.innerText = '';
+  fresh.local.data['sweep:1'] = { generation: 9, mode: 'sweep', query: 'z',
+    visited: [], total: null, endRetries: { 1: 2 } };
+  await fresh.api.handleEndPage(9);
+  const snapshot = fresh.sentMessages.find(m => m.event === 'page-state' && m.details.stage === 'zero-page-complete');
+  assert.ok(snapshot);
+  assert.equal(snapshot.details.pages, 0);
+  assert.equal(snapshot.details.state.queryCount, 26);
+  assert.equal(snapshot.details.state.queryIndex, 26);
+  assert.equal(fresh.api.getPhase(), 'complete');
+  assert.equal(fresh.local.data.lastSweepPages, 0);
+});
+
+test('empty page state records recovery when cards appear before delivering the same page', async () => {
+  const content = loadContent({ pageAck: { ok: true } });
+  Object.assign(content.api.role, { active: true, tabId: 1, primaryTabId: 1, generation: 9 });
+  content.body.innerText = 'Loading items';
+  await content.api.relay();
+  assert.ok(content.sentMessages.some(m => m.event === 'page-state' && m.details.stage === 'empty-observed'));
+  content.api.cancelPageWork();
+  content.body.innerText = 'Free (Valued at $20)';
+  content.api.setCollector(() => [{ item_id: 'ip-12345678' }]);
+  await content.api.relay();
+  assert.ok(content.sentMessages.some(m => m.event === 'page-state' && m.details.stage === 'recovered'));
+  assert.ok(content.sentMessages.some(m => m.type === 'reviewer:page'));
+});
+
+test('page state capture failures cannot prevent the existing scan from reporting unusable', async () => {
+  const content = loadContent();
+  Object.assign(content.api.role, { active: true, tabId: 1, generation: 9 });
+  content.document.querySelectorAll = () => { throw new Error('capture-only failure'); };
+  assert.doesNotThrow(() => content.api.recordPageState('unusable'));
+  await content.api.reportUnusable('Selected filter did not render', 9);
+  assert.equal(content.sentMessages.filter(m => m.event === 'page-state').length, 0);
+  assert.ok(content.sentMessages.some(m => m.type === 'reviewer:unusable'));
+});
+
 async function fallbackRound() {
   const tab = { ...REVIEW_TAB, id: 1,
     url: 'https://www.walmart.com/reviews/claim-product?page=2' };
@@ -2564,6 +2954,95 @@ test('a recovered regular page cancels its queued empty-results reload', async (
   assert.equal(content.sentMessages.some(msg => msg.type === 'reviewer:pagination-fallback'), false);
 });
 
+test('a stalled empty-page checkpoint releases intake and retries the recovered page', async () => {
+  const content = loadContent({ pageAck: { ok: true },
+    initialUrl: 'https://www.walmart.com/reviews/claim-product?q=&page=10&affinityOverride=default' });
+  Object.assign(content.api.role, { active: true, tabId: 1, primaryTabId: 1, generation: 9 });
+  content.local.data['sweep:1'] = { generation: 9, mode: 'none', total: 16,
+    visited: Array.from({ length: 9 }, (_, index) => index + 1), endRetries: {} };
+  content.api.setNow(100_000);
+  await content.api.relay();
+  const send = content.chrome.runtime.sendMessage;
+  content.chrome.runtime.sendMessage = message => message.type === 'reviewer:checkpoint'
+    ? new Promise(() => {}) : send(message);
+  content.api.setNow(131_000);
+  const pending = content.api.relay();
+  await new Promise(resolve => setImmediate(resolve));
+  const deadline = [...content.timerCallbacks.entries()].find(([, timer]) => timer.ms === 15_000);
+  assert.ok(deadline, 'A checkpoint must have a finite reply deadline');
+  content.timerCallbacks.delete(deadline[0]);
+  deadline[1].callback();
+  await pending;
+  assert.equal(content.api.getPhase(), 'relay-retry');
+  assert.deepEqual([...content.local.data['sweep:1'].visited], [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+  content.chrome.runtime.sendMessage = send;
+  content.body.innerText = 'Recovered reviewer cards';
+  content.api.setCollector(() => [{ item_id: 'ip-recovered-page-ten' }]);
+  await content.api.relay();
+  assert.ok(content.local.data['sweep:1'].visited.includes(10));
+  assert.equal(content.sentMessages.some(message => message.type === 'reviewer:pagination-fallback'), false);
+});
+
+test('cards rendered during the last empty confirmation cannot be marked as an empty tail', async () => {
+  const content = loadContent({ pageAck: { ok: true },
+    initialUrl: 'https://www.walmart.com/reviews/claim-product?page=10' });
+  Object.assign(content.api.role, { active: true, tabId: 1, primaryTabId: 1, generation: 9 });
+  content.pager.innerText = '1 2 10';
+  content.local.data['sweep:1'] = { generation: 9, mode: 'none', total: 10,
+    visited: Array.from({ length: 9 }, (_, index) => index + 1), endRetries: { 10: 2 } };
+  const send = content.chrome.runtime.sendMessage;
+  content.chrome.runtime.sendMessage = async message => {
+    if (message.type === 'reviewer:checkpoint') {
+      content.body.innerText = 'Recovered reviewer cards';
+      content.api.setCollector(() => [{ item_id: 'ip-late-page-ten' }]);
+    }
+    return send(message);
+  };
+  await content.api.handleEndPage(9);
+  assert.equal(content.local.data.lastSweepDone, undefined);
+  assert.equal(content.local.data['sweep:1'].visited.includes(10), false);
+  setCoveragePager(content, { page: 10, next: 'disabled' });
+  await content.api.relay();
+  assert.equal(content.local.data.lastSweepPages, 10);
+});
+
+test('a new generation can relay while an earlier acknowledgement never returns', async () => {
+  const content = loadContent({ pageAck: { ok: true } });
+  Object.assign(content.api.role, { active: true, tabId: 1, primaryTabId: 1, generation: 9 });
+  content.api.setCollector(() => [{ item_id: 'ip-first-generation' }]);
+  const send = content.chrome.runtime.sendMessage;
+  let release;
+  content.chrome.runtime.sendMessage = message => message.type === 'reviewer:page' && message.generation === 9
+    ? new Promise(resolve => { release = resolve; }) : send(message);
+  const previous = content.api.relay();
+  await new Promise(resolve => setImmediate(resolve));
+  content.api.applyRole({ active: true, tabId: 1, primaryTabId: 1, generation: 10 });
+  await content.api.relay();
+  assert.ok(content.sentMessages.some(message => message.type === 'reviewer:page' && message.generation === 10),
+    'Revoked work must not keep the new generation locked');
+  release({ ok: true, active: true, generation: 9 });
+  await previous;
+  assert.equal(content.api.role.generation, 10);
+});
+
+test('results signatures retain eligible unique IDs without extracting card metadata', () => {
+  const content = loadContent();
+  let metadataReads = 0;
+  const anchor = (id, title) => ({
+    getAttribute(name) { return name === 'href' ? `/ip/${id}` : name === 'aria-label' ? title : null; },
+    querySelector() { return null; },
+    innerText: title,
+    get parentElement() { if (!title) return null; metadataReads++; throw new Error('A signature does not need card ancestors'); }
+  });
+  let links = [anchor('10000002', 'Second product'), anchor('10000001', 'First product'),
+    anchor('10000001', 'First product repeated'), anchor('10000003', ''), anchor('123', 'Invalid product')];
+  content.document.querySelectorAll = () => links;
+  assert.equal(content.api.itemSignature(), 'ip-10000001|ip-10000002');
+  assert.equal(metadataReads, 0);
+  links = [...links, anchor('10000004', 'Late product')];
+  assert.equal(content.api.itemSignature(), 'ip-10000001|ip-10000002|ip-10000004');
+});
+
 test('a confirmed empty regular interior page records why it starts the category fallback', async () => {
   const { bg, content, generation } = await fallbackRound();
   bg.local.data['sweep:1'] = { generation, mode: 'none', total: 24,
@@ -2624,7 +3103,7 @@ test('a confirmed unusable regular page scans each category once then retries pa
   resumed.location.search = new URL(tab.url).search;
   resumed.location.assign = content.location.assign;
   resumed.chrome.runtime.sendMessage = message => workerMessage(resumedBg, message, { tab: { ...tab } });
-  resumed.pager.innerText = '1';
+  setCoveragePager(resumed, { page: 1, next: 'disabled' });
   resumed.api.setCollector(() => [{ item_id: 'fallback-item' }]);
   const categories = [...vm.runInNewContext(`${sweepModesSource}; sweepQueries('high-value')`)];
   assert.equal(new Set(categories.map(query => query.toLowerCase())).size, categories.length);
@@ -2824,10 +3303,16 @@ test('a seventeen-page scan keeps coverage with fifteen-second navigation starts
       content.location.href = 'https://www.walmart.com/reviews/claim-product' + content.location.search;
     }
   }));
+  const numberedControls = content.pager.querySelectorAll;
+  const nextControl = { textContent: '', getClientRects: () => [1],
+    getAttribute: name => name === 'aria-label' ? 'Next Page' : null };
+  content.pager.querySelector = () => ({ textContent: String(renderedPage) });
+  content.pager.querySelectorAll = () => [...numberedControls(), nextControl];
   for (let page = 1; page <= 17; page += 1) {
     clock = starts.at(-1) + 2_500;
     content.api.setNow(clock);
     renderedPage = page;
+    nextControl.disabled = page === 17;
     if (page > 1) {
       await runNavigation(content); // Changed cards unlock the native navigation.
       assert.equal(content.api.getPhase(), 'waiting-content');
@@ -2973,6 +3458,7 @@ test('older verification alert responses cannot overwrite a newer outage status'
     await firstStarted;
     probes.set(11, { ready: true, reviewerReady: true, botCheck: false });
     await bg.api.selectPrimary();
+    bg.api.setNow(Date.now() + 15 * 60_000 + 1);
     probes.set(11, { ready: true, reviewerReady: false, botCheck: true });
     await bg.api.handleBotCheck(11, 'text');
     release();
@@ -3613,7 +4099,7 @@ test('alphabet mode starts at a page one before reading an arbitrary search', as
   assert.equal(collected, 0);
   assert.equal(target.searchParams.get('q'), 'a');
   assert.equal(target.searchParams.get('page'), null);
-  assert.equal(target.searchParams.get('queryNups'), '');
+  assert.equal(target.searchParams.get('queryNups'), target.searchParams.get('q'));
 });
 
 test('high value starts at Accessories before collecting an arbitrary search', async () => {
@@ -3629,7 +4115,7 @@ test('high value starts at Accessories before collecting an arbitrary search', a
   assert.equal(collected, 0);
   assert.equal(target.searchParams.get('q'), 'Accessories');
   assert.equal(target.searchParams.get('page'), null);
-  assert.equal(target.searchParams.get('queryNups'), '');
+  assert.equal(target.searchParams.get('queryNups'), target.searchParams.get('q'));
 });
 
 test('regular monitoring releases a manual search without collecting or navigating it', async () => {
@@ -3660,6 +4146,7 @@ test('alphabet mode visits all pages then persists the next letter before naviga
   assert.equal(target.searchParams.get('page'), '3');
   content.location.href = target.toString();
   content.location.search = target.search;
+  setCoveragePager(content, { page: 3, next: 'disabled' });
   await content.api.advanceDeliveredPage(9);
   assert.equal(content.local.data['sweep:1'].query, 'b');
   assert.equal(content.local.data['sweep:1'].visited.length, 0);
@@ -3713,7 +4200,7 @@ test('restarting alphabet mode resets the search and numbered-product filter', a
   assert.equal(result.ok, true);
   const target = new URL(bg.tabActions.at(-1).options.url);
   assert.equal(target.searchParams.get('q'), 'a');
-  assert.equal(target.searchParams.get('queryNups'), '');
+  assert.equal(target.searchParams.get('queryNups'), target.searchParams.get('q'));
   assert.equal(target.searchParams.get('page'), null);
 });
 
@@ -3745,6 +4232,7 @@ test('high value mode searches every keyword in order and finishes after Wood', 
     const sweep = await content.api.readSweep(9);
     assert.equal(sweep.query, keyword);
     content.local.data['sweep:1'] = { ...sweep, total: 3, visited: [1, 2] };
+    setCoveragePager(content, { page: 3, next: 'disabled' });
     await content.api.advanceDeliveredPage(9);
     if (index < keywords.length - 1) {
       let target;
@@ -3777,7 +4265,7 @@ test('restarting each search mode chooses the correct first query', async () => 
     const target = new URL(bg.tabActions.at(-1).options.url);
     assert.equal(target.searchParams.get('q'), mode === 'none' ? null : query);
     assert.equal(target.searchParams.get('page'), null);
-    assert.equal(target.searchParams.get('queryNups'), mode === 'none' ? null : '');
+    assert.equal(target.searchParams.get('queryNups'), mode === 'none' ? null : query);
   }
 });
 
@@ -3897,7 +4385,7 @@ test('empty-end confirmation rereads in two seconds and reloads only once before
 test('cards appearing during the first empty confirmation are delivered without reloading', async () => {
   const content = loadFinalLetterContent({ pageAck: { ok: true } });
   Object.assign(content.api.role, { active: true, tabId: 1, generation: 9 });
-  content.pager.innerText = '1 2';
+  setCoveragePager(content, { page: 2, next: 'disabled' });
   content.local.data['sweep:1'] = {
     generation: 9, mode: 'sweep', query: 'z', total: 2, visited: [1], endRetries: {}, startedAt: 1
   };
@@ -5037,6 +5525,19 @@ test('browser heartbeat describes disabled refreshing without relaying any items
   assert.equal('items' in report, false);
 });
 
+test('focus contention is mirrored as waiting instead of claiming an active page scan', async () => {
+  const tab = { ...REVIEW_TAB, id: 11 };
+  const probes = new Map([[11, { ready: true, reviewerReady: true, active: true, phase: 'waiting-focus',
+    sweeping: true, lastActivityAt: 100_000, nextActionAt: 105_000 }]]);
+  const bg = loadBackground({ tabs: [tab], probes });
+  await bg.api.initialization;
+  const selected = await bg.api.selectPrimary();
+  probes.get(11).generation = selected.state.generation;
+  await bg.api.reportBrowserStatus();
+  assert.equal((await bg.api.scannerStatusSnapshot()).primary.phase, 'waiting-user');
+  assert.equal(JSON.parse(bg.fetchCalls.at(-1).body).phase, 'waiting-user');
+});
+
 test('browser heartbeat retains page counts across all 26 letters', async () => {
   const bg = loadBackground();
   await bg.api.initialization;
@@ -5380,6 +5881,21 @@ function animateOffscreenPager(content) {
   };
 }
 
+test('background pager preparation completes when Chrome suppresses animation frames', async () => {
+  const content = loadContent();
+  const pager = animateOffscreenPager(content);
+  content.document.visibilityState = 'hidden';
+  await content.api.preparePageNavigation(2, 9, 9000);
+  const fallback = [...content.timerCallbacks.values()].find(timer => timer.ms === 64);
+  assert.ok(fallback, 'The pager cannot depend on animation frames');
+  content.viewport.performance.now = () => 900;
+  fallback.callback();
+  assert.ok(pager.positions.length > 0);
+  assert.equal(pager.frames.size, 0);
+  const rect = pager.control.getBoundingClientRect();
+  assert.ok(rect.top >= 0 && rect.bottom <= 800);
+});
+
 test('pager motion varies its bounded duration and landing point inside the existing navigation wait', async () => {
   const samples = [];
   for (const random of [0, 0.9]) {
@@ -5462,15 +5978,16 @@ test('real input immediately cancels pager animation and still postpones navigat
   }
 });
 
-test('pager animation stops for hidden, replaced, invalidated and challenged pages or an expired wait', async () => {
-  for (const scenario of ['hidden', 'detached', 'invalidated', 'challenge', 'expired', 'reduced-motion']) {
+test('pager animation stops for revoked, replaced, invalidated and challenged pages or an expired wait', async () => {
+  for (const scenario of ['revoked', 'detached', 'invalidated', 'challenge', 'expired', 'reduced-motion']) {
     const content = loadContent();
     const pager = animateOffscreenPager(content);
     await content.api.advanceDeliveredPage(9);
     assert.equal(pager.frames.size, 1, scenario);
     pager.tick(100);
     const before = pager.positions.length;
-    if (scenario === 'hidden') content.document.visibilityState = 'hidden';
+    if (scenario === 'revoked') await contentMessage(content,
+      { type: 'reviewer:selection-revoked', generation: 9 });
     if (scenario === 'detached') pager.control.isConnected = false;
     if (scenario === 'invalidated') {
       content.chrome.runtime.id = undefined;
@@ -5512,8 +6029,8 @@ test('offscreen pager scrolls during the existing wait without delaying navigati
   assert.equal(pager.clicks(), 1, 'The programmatic scroll must not look like new user activity');
 });
 
-test('pager preparation avoids hidden tabs, recent input, cooldowns and short waits', async () => {
-  for (const scenario of ['hidden', 'recent-input', 'cooldown', 'short-wait', 'in-view', 'challenge']) {
+test('pager preparation avoids recent input, cooldowns and short waits', async () => {
+  for (const scenario of ['recent-input', 'cooldown', 'short-wait', 'in-view', 'challenge']) {
     const content = loadContent();
     const pager = addOffscreenPager(content);
     if (scenario === 'hidden') content.document.visibilityState = 'hidden';
@@ -5774,7 +6291,16 @@ test('only current scanner documents can request focus and verification revokes 
   assert.equal((await workerMessage(bg, { type: 'reviewer:focus', generation: lane.generation })).granted, false);
   assert.equal((await request(lane.generation)).granted, true);
   assert.equal(tab.active, true);
+  const selection = generation => workerMessage(bg, { type: 'reviewer:selection-check', generation }, { tab });
+  const actionsBeforeCheck = bg.tabActions.length;
+  assert.equal((await selection(lane.generation)).selected, true);
+  assert.equal((await selection(lane.generation - 1)).selected, false);
+  assert.equal((await workerMessage(bg, { type: 'reviewer:selection-check', generation: lane.generation })).selected, false);
+  assert.equal(bg.tabActions.length, actionsBeforeCheck, 'Selection checks must be read-only');
+  for (const listener of bg.chrome.windows.onFocusChanged.listeners) listener(-1);
+  assert.equal((await selection(lane.generation)).selected, true, 'Switching applications must preserve the turn');
   await workerMessage(bg, { type: 'reviewer:user-active', generation: lane.generation }, { tab });
+  assert.equal((await selection(lane.generation)).selected, false);
   const busy = await request(lane.generation);
   assert.equal(busy.granted, false);
   assert.equal(busy.reason, 'user-active');
@@ -5937,6 +6463,7 @@ function resultsScrollFixture({ lane = 'home', run, finalPage = false, grant = n
   content.body.innerText = 'Rendered reviewer results';
   content.body.scrollHeight = 8000;
   content.pager.innerText = finalPage ? '1 2' : '1 2 3';
+  if (finalPage) setCoveragePager(content, { page: 2, next: 'disabled' });
   const auxiliary = lane === 'home' ? null : { lane, targetKind: lane === 'keywords' ? 'keyword' : 'department',
     targetKey: lane === 'keywords' ? 'Chair' : 'Home', targetUrl: target };
   Object.assign(content.api.role, { active: true, tabId: 1, primaryTabId: 1, generation: 9,
@@ -5980,8 +6507,8 @@ test('results reading scroll follows acknowledged home, keyword and department p
   }
 });
 
-test('results scroll holds the current page when focus or visible reading is unavailable', async () => {
-  for (const scenario of ['manual', 'unfocused', 'unavailable', 'no-response', 'hidden']) {
+test('results scroll holds the current page when tab selection is denied or unavailable', async () => {
+  for (const scenario of ['manual', 'unfocused', 'unavailable', 'no-response']) {
     let calls = 0;
     const grants = {
       manual: { enabled: true, granted: false, reason: 'manual-tab-active' },
@@ -6019,6 +6546,40 @@ test('an unfinished department scroll resumes below its previous position and ca
   await content.api.relay();
   assert.deepEqual(starts, [true, false]);
   assert.deepEqual([...content.local.data['sweep:1'].visited], [1, 2]);
+});
+
+test('background scheduling pauses preserve the target and reading budget until scrolling resumes', async () => {
+  let attempts = 0;
+  const starts = [];
+  const content = resultsScrollFixture({ lane: 'departments', run: async options => {
+    starts.push(options.startAtTop);
+    attempts++;
+    return attempts <= 20 ? { outcome: 'timeout', distance: attempts % 2 ? 0 : 100, durationMs: 60_000 }
+      : { outcome: 'complete', distance: 2000, durationMs: 2000 };
+  } });
+  content.document.visibilityState = 'hidden';
+  for (let index = 0; index < 20; index++) {
+    await content.api.relay();
+    assert.deepEqual([...content.local.data['sweep:1'].visited], [1]);
+    assert.equal(content.sentMessages.some(message => message.type === 'reviewer:unusable'), false);
+  }
+  await content.api.relay();
+  assert.deepEqual([...content.local.data['sweep:1'].visited], [1, 2]);
+  assert.equal(attempts, 21);
+  assert.equal(starts[0], true);
+  assert.ok(starts.slice(1).every(value => value === false));
+});
+
+test('on-time zero-distance unsettled reads still reach bounded target recovery', async () => {
+  const content = resultsScrollFixture({ lane: 'departments', run: async () =>
+    ({ outcome: 'timeout', distance: 0, durationMs: 8000 }) });
+  for (let index = 0; index < 14; index++) {
+    await content.api.relay();
+    assert.equal(content.sentMessages.some(message => message.type === 'reviewer:unusable'), false);
+  }
+  await content.api.relay();
+  assert.equal(content.sentMessages.some(message => message.type === 'reviewer:unusable'), true);
+  assert.deepEqual([...content.local.data['sweep:1'].visited], [1]);
 });
 
 test('focus waits reuse acknowledged intake and send only newly rendered cards', async () => {
@@ -6072,18 +6633,91 @@ test('automatic focus denial cannot change a page behind a different selected ta
   }
 });
 
-test('a visible scanner still waits for actual window focus before reading', async () => {
+test('a selected scanner reads and paginates while the Chrome window is unfocused or hidden', async () => {
+  for (const visibility of ['visible', 'hidden']) {
+    let calls = 0, navigations = 0;
+    const content = resultsScrollFixture({ lane: 'departments', run: async options => {
+      calls++;
+      assert.equal(options.canContinue(), true);
+      return { outcome: 'complete' };
+    } });
+    content.document.visibilityState = visibility;
+    content.document.hasFocus = () => false;
+    content.location.assign = () => { navigations++; };
+    await content.api.relay();
+    assert.equal(calls, 1, visibility);
+    assert.deepEqual([...content.local.data['sweep:1'].visited], [1, 2], visibility);
+    await runNavigation(content);
+    assert.equal(navigations, 1, visibility);
+  }
+});
+
+test('a selected scanner keeps reading when Chrome loses foreground focus', async () => {
   let focused = false, calls = 0;
   const content = resultsScrollFixture({ lane: 'departments', run: async () => {
     calls++; return { outcome: 'complete' };
   } });
   content.document.hasFocus = () => focused;
   await content.api.relay();
-  assert.equal(calls, 0);
-  assert.deepEqual([...content.local.data['sweep:1'].visited], [1]);
+  assert.equal(calls, 1);
+  assert.deepEqual([...content.local.data['sweep:1'].visited], [1, 2]);
   focused = true; await content.api.relay();
   assert.equal(calls, 1);
   assert.deepEqual([...content.local.data['sweep:1'].visited], [1, 2]);
+});
+
+test('a hidden selected scanner keeps its reading turn until explicit selection revocation', async () => {
+  let entered, options;
+  const started = new Promise(resolve => { entered = resolve; });
+  const content = resultsScrollFixture({ grant:
+    { ok: true, enabled: true, granted: true, until: 110_000, leaseId: 'new-selected-turn' }, run: async value => {
+    options = value; entered();
+    return new Promise(resolve => value.signal.addEventListener('abort',
+      () => resolve({ outcome: 'cancelled' }), { once: true }));
+  } });
+  const send = content.chrome.runtime.sendMessage;
+  content.chrome.runtime.sendMessage = async message => message.type === 'reviewer:selection-check'
+    ? { ok: true, selected: true } : send(message);
+  const reading = content.api.relay();
+  await started;
+  content.document.visibilityState = 'hidden';
+  content.listeners.get('visibilitychange')({ isTrusted: true });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(options.signal.aborted, false, 'Occlusion must not revoke a selected-tab turn');
+  await contentMessage(content, { type: 'reviewer:selection-revoked', generation: 8, leaseUntil: 110_000 });
+  await contentMessage(content, { type: 'reviewer:selection-revoked', generation: 9, leaseUntil: 109_999 });
+  await contentMessage(content, { type: 'reviewer:selection-revoked', generation: 9,
+    leaseUntil: 110_000, leaseId: 'old-selected-turn' });
+  assert.equal(options.signal.aborted, false, 'Old generations/leases must not cancel a newer turn');
+  await contentMessage(content, { type: 'reviewer:selection-revoked', generation: 9,
+    leaseUntil: 110_000, leaseId: 'new-selected-turn' });
+  await reading;
+  assert.equal(options.signal.aborted, true);
+  assert.deepEqual([...content.local.data['sweep:1'].visited], [1]);
+});
+
+test('revocation received before a delayed selection grant prevents reading and navigation', async () => {
+  for (const operation of ['reading', 'navigation']) {
+    let calls = 0, entered, release;
+    const requested = new Promise(resolve => { entered = resolve; });
+    const content = operation === 'reading' ? resultsScrollFixture({ run: async () => {
+      calls++; return { outcome: 'complete' };
+    } }) : navigationFocusFixture();
+    const send = content.chrome.runtime.sendMessage;
+    content.chrome.runtime.sendMessage = message => {
+      if (message.type !== 'reviewer:focus') return send(message);
+      entered(); return new Promise(resolve => { release = resolve; });
+    };
+    const pending = operation === 'reading' ? content.api.relay()
+      : content.api.navigateWithFocus(() => { calls++; }, 9);
+    await requested;
+    await contentMessage(content, { type: 'reviewer:selection-revoked', generation: 9,
+      leaseUntil: 110_000, leaseId: 'revoked-before-grant' });
+    release({ ok: true, enabled: true, granted: true, until: 110_000, leaseId: 'revoked-before-grant' });
+    await pending;
+    assert.equal(calls, 0, operation);
+    if (operation === 'reading') assert.deepEqual([...content.local.data['sweep:1'].visited], [1]);
+  }
 });
 
 test('a department page that extends during the navigation wait is read again before leaving', async () => {
@@ -6137,6 +6771,46 @@ test('results scroll contention defers the page with a bounded retry rather than
     assert.equal(content.api.getActionTimer(), null);
     assert.ok([...content.timerCallbacks.values()].some(timer => timer.ms === 5000));
   }
+});
+
+test('completed and failed reading return their exact focus lease before another page is scheduled', async () => {
+  for (const outcome of ['complete', 'timeout', 'error']) {
+    let running = false;
+    const content = resultsScrollFixture({ run: async () => {
+      running = true;
+      content.api.setNow(102_000);
+      running = false;
+      if (outcome === 'error') throw new Error('animation failure');
+      return { outcome, durationMs: 2_000 };
+    }, grant: { ok: true, enabled: true, granted: true, until: 110_000, leaseId: 'reading-lease' } });
+    const send = content.chrome.runtime.sendMessage;
+    content.chrome.runtime.sendMessage = message => {
+      if (message.type === 'reviewer:focus-release') assert.equal(running, false);
+      return send(message);
+    };
+    await content.api.relay();
+    const releases = content.sentMessages.filter(m => m.type === 'reviewer:focus-release');
+    assert.equal(releases.length, 1, outcome);
+    assert.equal(releases[0].leaseId, 'reading-lease');
+    assert.equal(releases[0].generation, 9);
+  }
+});
+
+test('reading that loses its role after a focus grant returns that grant without scrolling', async () => {
+  let reads = 0;
+  const content = resultsScrollFixture({ run: async () => { reads++; return { outcome: 'complete' }; } });
+  const send = content.chrome.runtime.sendMessage;
+  content.chrome.runtime.sendMessage = async message => {
+    if (message.type === 'reviewer:focus') {
+      content.api.applyRole({ active: false, tabId: 1, generation: 10 });
+      return { ok: true, enabled: true, granted: true, until: 110_000, leaseId: 'abandoned' };
+    }
+    return send(message);
+  };
+  await content.api.relay();
+  assert.equal(reads, 0);
+  assert.ok(content.sentMessages.some(m => m.type === 'reviewer:focus-release' &&
+    m.generation === 9 && m.leaseId === 'abandoned'));
 });
 
 test('a short first reading lease defers without consuming the start-at-top pass', async () => {
@@ -6393,9 +7067,6 @@ function facetInteractionFixture(operation, helper = null) {
   const perform = async args => {
     calls.push(args);
     if (helper) return helper(args, content);
-    if (content.document.visibilityState !== 'visible') {
-      throw Object.assign(new Error('Reviewer filter: missing-panel'), { code: 'missing-panel' });
-    }
     assert.equal(args.canAct(), true);
     if (operation === 'discover') return [{ kind: 'department', label: 'Auto & Tires', parentUrl }];
     content.location.href = selectedUrl;
@@ -6425,18 +7096,13 @@ function facetInteractionFixture(operation, helper = null) {
   setGrant(value) { grant = value; } };
 }
 
-test('hidden facet panels wait for focus and visibility without spending a department attempt', async () => {
+test('selected facet controls work while Chrome is hidden without spending a retry', async () => {
   for (const operation of ['discover', 'select']) {
     const content = facetInteractionFixture(operation);
     await content.invoke();
-    assert.equal(content.calls.length, 0, operation);
+    assert.equal(content.calls.length, 1, operation);
     assert.equal(content.sentMessages.some(message => message.type === 'reviewer:unusable'), false, operation);
     assert.equal(content.api.role.active, true, operation);
-    assert.equal(content.api.getPhase(), 'waiting-user', operation);
-    assert.ok([...content.timerCallbacks.values()].some(timer => timer.ms === 5000), operation);
-    content.document.visibilityState = 'visible';
-    await content.invoke();
-    assert.equal(content.calls.length, 1, operation);
     assert.ok(content.sentMessages.some(message => message.type === 'reviewer:focus' &&
       message.purpose === 'facet-controls'), operation);
     assert.ok(content.sentMessages.some(message => message.type ===
@@ -6479,25 +7145,22 @@ test('facet controls defer a short existing focus lease and use the next full le
   }
 });
 
-test('facet probe reports hidden, denied, short and successful focus states without free text', async () => {
-  const content = facetInteractionFixture('select');
-  await content.invoke();
-  assert.equal((await contentMessage(content, { type: 'reviewer:probe' })).focusReason, 'hidden');
-  content.document.visibilityState = 'visible';
-  content.setGrant({ ok: true, enabled: true, granted: false, reason: 'busy' });
-  await content.invoke();
-  assert.equal((await contentMessage(content, { type: 'reviewer:probe' })).focusReason, 'busy');
-  content.setGrant({ ok: true, enabled: true, granted: true, until: 107_000 });
-  await content.invoke();
-  assert.equal((await contentMessage(content, { type: 'reviewer:probe' })).focusReason, 'short-lease');
-  content.setGrant({ ok: true, enabled: true, granted: true, until: 110_000 });
-  await content.invoke();
-  assert.equal((await contentMessage(content, { type: 'reviewer:probe' })).focusReason, 'none');
+test('facet probe reports background selection, denied and short leases without free text', async () => {
+  for (const [grant, expected] of [
+    [{ ok: true, enabled: true, granted: true, until: 110_000 }, 'none'],
+    [{ ok: true, enabled: true, granted: false, reason: 'busy' }, 'busy'],
+    [{ ok: true, enabled: true, granted: true, until: 107_000 }, 'short-lease']
+  ]) {
+    const content = facetInteractionFixture('select');
+    content.setGrant(grant);
+    await content.invoke();
+    assert.equal((await contentMessage(content, { type: 'reviewer:probe' })).focusReason, expected);
+  }
 });
 
-test('facet visibility or lease loss during panel mounting yields without failing its target', async () => {
+test('facet selection or lease loss during panel mounting yields without failing its target', async () => {
   for (const operation of ['discover', 'select']) {
-    for (const interruption of ['visibility', 'lease']) {
+    for (const interruption of ['selection', 'lease']) {
       let entered;
       let release;
       const started = new Promise(resolve => { entered = resolve; });
@@ -6513,9 +7176,10 @@ test('facet visibility or lease loss during panel mounting yields without failin
       content.document.visibilityState = 'visible';
       const pending = content.invoke();
       await started;
-      if (interruption === 'visibility') {
+      if (interruption === 'selection') {
         content.document.visibilityState = 'hidden';
-        content.listeners.get('visibilitychange')({ isTrusted: true });
+        await contentMessage(content, { type: 'reviewer:selection-revoked', generation: 90,
+          leaseUntil: 110_000 });
       } else content.api.setNow(110_001);
       assert.equal(content.calls[0].canAct(), false, `${operation}: ${interruption} revokes the panel guard`);
       release();
@@ -6585,7 +7249,8 @@ test('navigation waits its turn instead of changing a page behind another scanne
   const content = navigationFocusFixture();
   let calls = 0;
   let navigations = 0;
-  content.chrome.runtime.sendMessage = async () => {
+  content.chrome.runtime.sendMessage = async message => {
+    if (message.type !== 'reviewer:focus') return { ok: true };
     calls++;
     if (calls === 1) return { ok: true, enabled: true, granted: false, reason: 'busy', retryAfterMs: 5000 };
     content.document.visibilityState = 'visible';
@@ -6601,15 +7266,82 @@ test('navigation waits its turn instead of changing a page behind another scanne
   assert.equal(calls, 2);
 });
 
-test('foreground page selection arriving before visibility cannot navigate prematurely', async () => {
+test('a proven scope-changing auxiliary pager uses bound URL navigation without accepting its modified scope', () => {
+  const content = navigationFocusFixture();
+  let clicked = 0;
+  let destination;
+  content.location.assign = value => { destination = value; };
+  const original = content.location.href;
+  content.api.role.auxiliary = { lane: 'keywords', targetKey: 'keyword:dog',
+    targetUrl: original, urlPagination: true };
+  addNativePageControl(content, () => { clicked++; });
+  content.api.navigatePage(2, 9);
+  assert.equal(clicked, 0, 'The already-proven scope-changing pager cannot be retried on each page');
+  assert.equal(new URL(destination).searchParams.get('page'), '2');
+  assert.equal(new URL(destination).searchParams.get('affinityOverride'), null);
+  assert.ok(content.sentMessages.some(m => m.type === 'reviewer:diagnostic' &&
+    m.event === 'navigation-fallback' && m.details.reason === 'not-authorized'));
+});
+
+test('focus availability wakes the exact pending retry and still requires a fresh grant', async () => {
+  const content = navigationFocusFixture();
+  let changes = 0;
+  let granted = false;
+  let requests = 0;
+  content.chrome.runtime.sendMessage = async message => {
+    if (message.type !== 'reviewer:focus') return { ok: true };
+    requests += 1;
+    return granted ? { ok: true, granted: true, enabled: true, until: 103_000 } :
+      { ok: true, granted: false, enabled: true, reason: 'busy', retryAfterMs: 5000 };
+  };
+  await content.api.navigateWithFocus(() => changes++, 9);
+  await contentMessage(content, { type: 'reviewer:focus-available', generation: 8 });
+  assert.equal(content.timerCallbacks.get(content.api.getActionTimer()).ms, 5000);
+  await contentMessage(content, { type: 'reviewer:focus-available', generation: 9 });
+  assert.equal(content.timerCallbacks.get(content.api.getActionTimer()).ms, 0);
+  await content.timerCallbacks.get(content.api.getActionTimer()).callback();
+  assert.equal(changes, 0, 'An advisory hint cannot grant navigation');
+  assert.equal(requests, 2);
+  granted = true;
+  await contentMessage(content, { type: 'reviewer:focus-available', generation: 9 });
+  await content.timerCallbacks.get(content.api.getActionTimer()).callback();
+  assert.equal(changes, 1);
+  assert.equal(requests, 3);
+});
+
+test('focus hint preserves trusted input and cannot bypass normal page pacing', async () => {
+  const content = navigationFocusFixture();
+  let changes = 0;
+  content.chrome.runtime.sendMessage = async () => ({ ok: true, enabled: true,
+    granted: false, reason: 'busy', retryAfterMs: 5000 });
+  await content.api.navigateWithFocus(() => changes++, 9);
+  content.listeners.get('wheel')({ isTrusted: true });
+  await contentMessage(content, { type: 'reviewer:focus-available', generation: 9 });
+  await content.timerCallbacks.get(content.api.getActionTimer()).callback();
+  assert.equal(changes, 0);
+  assert.ok(content.timerCallbacks.get(content.api.getActionTimer()).ms >= 30_000);
+  content.api.setNow(200_000);
+  content.api.setPhase('waiting-navigation');
+  const before = content.api.getActionTimer();
+  await contentMessage(content, { type: 'reviewer:focus-available', generation: 9 });
+  assert.equal(content.api.getActionTimer(), before, 'Normal paced actions cannot be accelerated');
+});
+
+test('focus hint wakes a reading/render relay without touching a paced action', async () => {
+  const content = navigationFocusFixture();
+  content.api.setPhase('waiting-focus');
+  await contentMessage(content, { type: 'reviewer:focus-available', generation: 9 });
+  assert.ok([...content.timerCallbacks.values()].some(timer => timer.ms === 0));
+  assert.equal(content.api.getActionTimer(), null);
+});
+
+test('confirmed tab selection permits navigation without waiting for window visibility', async () => {
   const content = navigationFocusFixture();
   let navigations = 0;
   content.chrome.runtime.sendMessage = async () => ({ ok: true, enabled: true, granted: true, until: 103_000 });
   await content.api.navigateWithFocus(() => navigations++, 9);
-  assert.equal(navigations, 0);
-  content.document.visibilityState = 'visible';
-  await content.timerCallbacks.get(content.api.getActionTimer()).callback();
   assert.equal(navigations, 1);
+  assert.equal(content.api.getActionTimer(), null);
 });
 
 test('a focus lease that expired during browser suspension cannot authorize page navigation', async () => {
@@ -6654,4 +7386,885 @@ test('late navigation focus acknowledgements cannot override user input, a chang
     await pending;
     assert.equal(navigations, 0, scenario);
   }
+});
+
+function setCoveragePager(content, { page, last = page, next = 'unknown' }) {
+  content.pager.innerText = `1 ${page} ${last}`;
+  const controls = [{ tagName: 'A', textContent: String(last), children: [], getClientRects: () => [1],
+    getAttribute(name) { return name === 'aria-label' ? `Go to page ${last}` : null; } }];
+  if (next !== 'unknown') controls.push({ tagName: 'BUTTON', textContent: '',
+    disabled: next === 'disabled', children: [], getClientRects: () => [1],
+    getAttribute(name) { return name === 'aria-label' ? 'Next Page' : null; } });
+  content.pager.querySelectorAll = () => controls;
+  content.pager.querySelector = () => ({ textContent: String(page) });
+}
+
+function coverageContent(page, visited, options = {}) {
+  const target = 'https://www.walmart.com/reviews/claim-product?catId=4044';
+  const content = loadContent({ pageAck: { ok: true }, initialUrl: `${target}&page=${page}`, ...options });
+  content.api.setNow(100_000);
+  content.body.innerText = 'Rendered results';
+  content.api.setCollector(() => [{ item_id: `ip-page-${page}` }]);
+  Object.assign(content.api.role, { active: true, tabId: 1, primaryTabId: 1, generation: 9,
+    auxiliary: { lane: 'departments', targetKind: 'department', targetKey: 'Home', targetUrl: target } });
+  content.local.data['sweep:1'] = { generation: 9, mode: 'none', targetKey: 'Home', discoveryDone: true,
+    visited, total: page };
+  return content;
+}
+
+// Observed Walmart layout: current page is a plain div and terminal Next is
+// omitted, rather than disabled. Numeric anchors have placeholder hrefs.
+function setOmittedNextPager(content, { current = 25, last = current, hiddenNext = false,
+  next = false, ambiguous = false, plainLater = false } = {}) {
+  const node = (tagName, text, label = null) => ({ tagName, textContent: String(text),
+    innerText: String(text), children: [], getClientRects: () => [1], closest: () => null,
+    getAttribute: name => name === 'aria-label' ? label : null });
+  const previous = node('A', '', 'Previous Page');
+  const controls = [previous, ...[1, current - 2, current - 1].filter(n => n > 0)
+    .map(n => node('A', n, `Go to Page ${n}`))];
+  if (last > current) controls.push(node('A', last, plainLater ? null : `Go to Page ${last}`));
+  if (next || hiddenNext) {
+    const control = node('A', '', 'Next Page');
+    if (hiddenNext) control.getClientRects = () => [];
+    controls.push(control);
+  }
+  const plain = [node('DIV', current)];
+  if (ambiguous) plain.push(node('DIV', current + 1));
+  content.pager.innerText = `1 ... ${current - 2} ${current - 1} ${current}${last > current ? ` ${last}` : ''}`;
+  content.pager.querySelector = () => null;
+  content.pager.querySelectorAll = selector => selector === '*' ? [...controls, ...plain] : controls;
+}
+
+test('coverage: a windowed plain-current pager uses its available native Next', () => {
+  const content = coverageContent(5, [1, 2, 3, 4]);
+  setOmittedNextPager(content, { current: 5, next: true });
+  const control = content.api.findPageControl('?catId=4044&page=6', 6);
+  assert.equal(control?.getAttribute('aria-label'), 'Next Page');
+});
+
+test('coverage: observed plain-current terminal pager completes after stable confirmation', async () => {
+  const content = coverageContent(25, Array.from({ length: 24 }, (_, i) => i + 1));
+  setOmittedNextPager(content);
+  await content.api.advanceDeliveredPage(9);
+  assert.equal(content.sentMessages.some(m => m.type === 'reviewer:sweep-complete'), false);
+  content.api.setNow(101_001);
+  await content.api.advanceDeliveredPage(9);
+  const done = content.sentMessages.find(m => m.type === 'reviewer:sweep-complete');
+  assert.equal(done?.coverageLimited, false);
+  assert.equal(done.pages, 25);
+});
+
+test('coverage: plain-current terminal pagers also preserve departments longer than 25 or 100 pages', async () => {
+  for (const page of [35, 121]) {
+    const content = coverageContent(page, Array.from({ length: page - 1 }, (_, i) => i + 1));
+    setOmittedNextPager(content, { current: page });
+    await content.api.advanceDeliveredPage(9);
+    content.api.setNow(101_001);
+    await content.api.advanceDeliveredPage(9);
+    const done = content.sentMessages.find(m => m.type === 'reviewer:sweep-complete');
+    assert.equal(done?.pages, page);
+    assert.equal(done.coverageLimited, false);
+  }
+});
+
+test('coverage: a late card resets omitted-Next terminal confirmation', async () => {
+  const content = coverageContent(25, Array.from({ length: 24 }, (_, i) => i + 1));
+  setOmittedNextPager(content);
+  await content.api.advanceDeliveredPage(9);
+  content.api.setNow(101_001);
+  content.api.setCollector(() => [{ item_id: 'ip-new-late-card' }]);
+  await content.api.advanceDeliveredPage(9);
+  assert.equal(content.sentMessages.some(m => m.type === 'reviewer:sweep-complete'), false);
+  content.api.setNow(102_002);
+  await content.api.advanceDeliveredPage(9);
+  assert.equal(content.sentMessages.find(m => m.type === 'reviewer:sweep-complete')?.coverageLimited, false);
+});
+
+test('coverage: omitted Next does not truncate higher, hidden, ambiguous or growing controls', async () => {
+  for (const scenario of ['higher', 'plain-higher', 'hidden', 'ambiguous', 'growth']) {
+    const content = coverageContent(25, Array.from({ length: 24 }, (_, i) => i + 1));
+    setOmittedNextPager(content, { last: ['higher', 'plain-higher'].includes(scenario) ? 35 : 25,
+      plainLater: scenario === 'plain-higher',
+      hiddenNext: scenario === 'hidden', ambiguous: scenario === 'ambiguous' });
+    await content.api.advanceDeliveredPage(9);
+    content.api.cancelPageWork();
+    content.api.setNow(101_001);
+    if (scenario === 'growth') setOmittedNextPager(content, { current: 25, last: 26, next: true });
+    await content.api.advanceDeliveredPage(9);
+    assert.equal(content.sentMessages.some(m => m.type === 'reviewer:sweep-complete'), false, scenario);
+    content.api.cancelPageWork();
+  }
+});
+
+test('coverage: visible plain numeric higher pages cannot trigger clamped recovery or discard receipts', async () => {
+  const content = coverageContent(35, Array.from({ length: 34 }, (_, i) => i + 1));
+  setOmittedNextPager(content, { current: 25, last: 35, plainLater: true });
+  await content.api.advanceDeliveredPage(9);
+  content.api.cancelPageWork();
+  content.api.setNow(101_001);
+  await content.api.advanceDeliveredPage(9);
+  assert.ok(content.local.data['sweep:1'].visited.includes(34));
+  assert.equal(content.sentMessages.some(m => m.type === 'reviewer:diagnostic' && m.event === 'pager-clamped'), false);
+});
+
+test('coverage: clamped page URL is reconciled before ingest or a false ready receipt', async () => {
+  const content = coverageContent(85, Array.from({ length: 84 }, (_, i) => i + 1));
+  content.document.visibilityState = 'visible';
+  setOmittedNextPager(content, { current: 25 });
+  await content.api.relay();
+  content.api.setNow(101_001);
+  await content.api.relay();
+  assert.equal(content.sentMessages.some(m => m.type === 'reviewer:page'), false);
+  assert.equal(content.sentMessages.some(m => m.type === 'reviewer:diagnostic' &&
+    m.event === 'results-page-ready'), false);
+  assert.deepEqual(Array.from(content.local.data['sweep:1'].visited),
+    Array.from({ length: 25 }, (_, i) => i + 1));
+  assert.equal(content.local.data['sweep:1'].terminalPage, undefined,
+    'Must revisit the actual terminal URL before completing');
+  const navigated = [];
+  content.location.assign = href => navigated.push(href);
+  const timer = content.timerCallbacks.get(content.api.getActionTimer());
+  assert.ok(timer, 'A paced recovery navigation is scheduled');
+  await timer.callback();
+  assert.equal(new URL(navigated[0]).searchParams.get('page'), '25');
+});
+
+test('coverage: identical consecutive results stay unresolved without counting another page', async () => {
+  const content = coverageContent(26, Array.from({ length: 25 }, (_, i) => i + 1));
+  content.api.setCollector(() => [{ item_id: 'ip-12345678' }]);
+  Object.assign(content.local.data['sweep:1'], { lastObservedPage: 25,
+    lastPageFingerprint: 'ip-12345678' });
+  content.pager.innerText = '';
+  // Avoid a lazy pager reveal in this isolated repetition case.
+  content.pager.innerText = '1 25';
+  await content.api.advanceDeliveredPage(9);
+  assert.equal(content.local.data['sweep:1'].visited.length, 25);
+  assert.equal(content.sentMessages.some(m => m.type === 'reviewer:sweep-complete'), false);
+  assert.ok(content.sentMessages.some(m => m.type === 'reviewer:unusable'));
+});
+
+test('coverage: a windowed numeric pager with enabled Next continues beyond its largest label', async () => {
+  const content = coverageContent(5, [1, 2, 3, 4]);
+  setCoveragePager(content, { page: 5, next: 'enabled' });
+  await content.api.advanceDeliveredPage(9);
+  assert.equal(content.sentMessages.some(message => message.type === 'reviewer:sweep-complete'), false);
+  assert.equal(content.api.nextUnvisited(content.local.data['sweep:1']), 6);
+});
+
+test('coverage: page 100 without a terminal proof stays unresolved and retains receipts', async () => {
+  const content = coverageContent(100, Array.from({ length: 99 }, (_, index) => index + 1));
+  content.pager.innerText = '';
+  content.local.data['sweep:1'].total = null;
+  const advance = content.api.advanceDeliveredPage(9);
+  for (const ms of [400, 50]) {
+    await new Promise(resolve => setImmediate(resolve));
+    const timer = [...content.timerCallbacks.entries()].find(([, timer]) => timer.ms === ms);
+    assert.ok(timer, `Lazy pager reveal waits ${ms}ms`);
+    content.timerCallbacks.delete(timer[0]);
+    timer[1].callback();
+  }
+  await advance;
+  const completion = content.sentMessages.find(message => message.type === 'reviewer:sweep-complete');
+  assert.equal(completion?.coverageLimited, true);
+  assert.equal(content.local.data['sweep:1'].visited.length, 100);
+  assert.equal(content.local.data['sweep:1'].terminalPage, undefined);
+});
+
+test('coverage: verified terminal page 35 is complete rather than a presumed 25-page cap', async () => {
+  const content = coverageContent(35, Array.from({ length: 34 }, (_, index) => index + 1));
+  setCoveragePager(content, { page: 35, next: 'disabled' });
+  await content.api.advanceDeliveredPage(9);
+  const completion = content.sentMessages.find(message => message.type === 'reviewer:sweep-complete');
+  assert.equal(completion?.coverageLimited, false);
+  assert.equal(completion.pages, 35);
+  assert.equal(content.local.data['sweep:1'].terminalPage, 35);
+});
+
+test('coverage: numeric totals and native Next allow departments beyond 100 pages', async () => {
+  const content = coverageContent(100, Array.from({ length: 99 }, (_, index) => index + 1));
+  setCoveragePager(content, { page: 100, last: 125, next: 'enabled' });
+  assert.equal(content.api.totalPages(), 125);
+  await content.api.advanceDeliveredPage(9);
+  assert.equal(content.sentMessages.some(message => message.type === 'reviewer:sweep-complete'), false);
+  assert.equal(content.api.nextUnvisited(content.local.data['sweep:1']), 101);
+});
+
+test('coverage: terminal proof still fills interior gaps and later enabled Next invalidates an old end', async () => {
+  const content = coverageContent(35, Array.from({ length: 33 }, (_, index) => index + 1));
+  setCoveragePager(content, { page: 35, next: 'disabled' });
+  await content.api.advanceDeliveredPage(9);
+  assert.equal(content.api.nextUnvisited(content.local.data['sweep:1']), 34);
+  assert.equal(content.sentMessages.some(message => message.type === 'reviewer:sweep-complete'), false);
+  content.api.cancelPageWork();
+  content.local.data['sweep:1'].visited.push(34);
+  setCoveragePager(content, { page: 35, last: 36, next: 'enabled' });
+  await content.api.advanceDeliveredPage(9);
+  assert.equal(content.api.nextUnvisited(content.local.data['sweep:1']), 36);
+  assert.equal(content.local.data['sweep:1'].terminalPage, undefined);
+});
+
+test('coverage: an unrecognized or stale disabled Next cannot certify completion', async () => {
+  for (const scenario of ['stale', 'hidden', 'absent']) {
+    const content = coverageContent(2, [1]);
+    setCoveragePager(content, { page: scenario === 'stale' ? 1 : 2, next: scenario === 'absent' ? 'unknown' : 'disabled' });
+    if (scenario === 'hidden') content.pager.querySelectorAll()[1].getClientRects = () => [];
+    await content.api.advanceDeliveredPage(9);
+    assert.equal(content.sentMessages.some(message => message.type === 'reviewer:sweep-complete'), false, scenario);
+    assert.equal(content.api.nextUnvisited(content.local.data['sweep:1']), 3, scenario);
+  }
+});
+
+test('coverage: a 121-page department preserves the full page and late-item union across document reloads', async () => {
+  const local = storageArea();
+  const acknowledged = new Set();
+  const pages = new Set();
+  const target = 'https://www.walmart.com/reviews/claim-product?catId=4044';
+  local.data['sweep:1'] = { generation: 9, mode: 'none', targetKey: 'Home', discoveryDone: true,
+    visited: [], total: null };
+  for (let page = 1; page <= 121; page++) {
+    let items = [{ item_id: `ip-${page}-initial` }];
+    const content = loadContent({ pageAck: { ok: true }, localArea: local,
+      initialUrl: `${target}&page=${page}`, pageScroll: { run: async () => {
+        items = [...items, { item_id: `ip-${page}-late` }];
+        return { outcome: 'complete' };
+      } } });
+    content.api.setNow(100_000 + page * 15_000);
+    content.document.visibilityState = 'visible';
+    content.body.innerText = 'Free reviewer cards';
+    content.api.setCollector(() => items);
+    Object.assign(content.api.role, { active: true, tabId: 1, primaryTabId: 1, generation: 9,
+      auxiliary: { lane: 'departments', targetKind: 'department', targetKey: 'Home', targetUrl: target } });
+    setCoveragePager(content, { page, last: Math.min(121, page + 2), next: page === 121 ? 'disabled' : 'enabled' });
+    await content.api.relay();
+    for (const message of content.sentMessages.filter(message => message.type === 'reviewer:page')) {
+      pages.add(message.page);
+      for (const item of message.items) acknowledged.add(item.item_id);
+    }
+    assert.equal(local.data['sweep:1'].visited.length, page, `Acknowledged through page ${page}`);
+    const completion = content.sentMessages.find(message => message.type === 'reviewer:sweep-complete');
+    if (page < 121) assert.equal(completion, undefined, `No premature completion at ${page}`);
+    else {
+      assert.equal(completion.pages, 121);
+      assert.equal(completion.coverageLimited, false);
+    }
+    content.api.cancelPageWork();
+  }
+  assert.equal(pages.size, 121);
+  assert.equal(acknowledged.size, 242);
+  for (let page = 1; page <= 121; page++) {
+    assert.ok(pages.has(page));
+    assert.ok(acknowledged.has(`ip-${page}-initial`));
+    assert.ok(acknowledged.has(`ip-${page}-late`));
+  }
+});
+
+test('coverage: disabled Next cannot override a visible later page number', async () => {
+  const content = coverageContent(5, [1, 2, 3, 4]);
+  setCoveragePager(content, { page: 5, last: 10, next: 'disabled' });
+  await content.api.advanceDeliveredPage(9);
+  assert.equal(content.sentMessages.some(message => message.type === 'reviewer:sweep-complete'), false);
+  assert.equal(content.local.data['sweep:1'].terminalPage, undefined);
+  assert.equal(content.api.nextUnvisited(content.local.data['sweep:1']), 6);
+});
+
+test('coverage: filling a gap rechecks the old terminal before completing', async () => {
+  const visited = Array.from({ length: 35 }, (_, index) => index + 1).filter(page => page !== 34);
+  const content = coverageContent(34, visited);
+  Object.assign(content.local.data['sweep:1'], { total: 35, terminalPage: 35,
+    terminalReason: 'disabled-next', lastObservedPage: 35 });
+  setCoveragePager(content, { page: 34, last: 35, next: 'enabled' });
+  await content.api.advanceDeliveredPage(9);
+  assert.equal(content.sentMessages.some(message => message.type === 'reviewer:sweep-complete'), false);
+  assert.equal(content.api.nextUnvisited(content.local.data['sweep:1']), 35);
+  content.api.cancelPageWork();
+  content.location.href = content.location.href.replace('page=34', 'page=35');
+  content.location.search = new URL(content.location.href).search;
+  setCoveragePager(content, { page: 35, last: 36, next: 'enabled' });
+  await content.api.advanceDeliveredPage(9);
+  assert.equal(content.local.data['sweep:1'].terminalPage, undefined);
+  assert.equal(content.api.nextUnvisited(content.local.data['sweep:1']), 36);
+});
+
+test('coverage: revisiting a persisted terminal without fresh controls cannot reuse old end evidence', async () => {
+  const content = coverageContent(35, Array.from({ length: 35 }, (_, index) => index + 1));
+  Object.assign(content.local.data['sweep:1'], { terminalPage: 35, terminalReason: 'disabled-next', lastObservedPage: 35 });
+  setCoveragePager(content, { page: 35, next: 'unknown' });
+  await content.api.advanceDeliveredPage(9);
+  assert.equal(content.sentMessages.some(message => message.type === 'reviewer:sweep-complete'), false);
+  assert.equal(content.api.nextUnvisited(content.local.data['sweep:1']), 36);
+});
+
+test('coverage: confirmed no-results cannot truncate a window whose current Next is enabled', async () => {
+  const content = loadFinalLetterContent();
+  content.location.href = 'https://www.walmart.com/reviews/claim-product?q=z&page=5';
+  content.location.search = '?q=z&page=5';
+  content.local.data['sweep:1'] = { generation: 9, mode: 'sweep', query: 'z', total: 5,
+    visited: [1, 2, 3, 4], endRetries: { 5: 2 } };
+  setCoveragePager(content, { page: 5, next: 'enabled' });
+  await content.api.handleEndPage(9);
+  assert.equal(content.sentMessages.some(message => message.type === 'reviewer:sweep-complete'), false);
+  assert.ok(content.sentMessages.some(message => message.type === 'reviewer:unusable'));
+  assert.deepEqual([...content.local.data['sweep:1'].visited], [1, 2, 3, 4]);
+});
+
+for (const checkpoint of [1, 2]) {
+  test(`coverage: Next hydration during checkpoint ${checkpoint} cannot confirm an empty tail`, async () => {
+    const content = loadFinalLetterContent();
+    content.location.href = 'https://www.walmart.com/reviews/claim-product?q=z&page=5';
+    content.location.search = '?q=z&page=5';
+    content.pager.innerText = '1 2 5';
+    content.local.data['sweep:1'] = { generation: 9, mode: 'sweep', query: 'z', total: 5,
+      visited: [1, 2, 3, 4], endRetries: { 5: 2 } };
+    let saves = 0;
+    const send = content.chrome.runtime.sendMessage;
+    content.chrome.runtime.sendMessage = async message => {
+      if (message.type === 'reviewer:checkpoint' && ++saves === checkpoint) {
+        setCoveragePager(content, { page: 5, next: 'enabled' });
+      }
+      return send(message);
+    };
+    await content.api.handleEndPage(9);
+    assert.equal(content.sentMessages.some(message => message.type === 'reviewer:sweep-complete'), false);
+    assert.equal(content.local.data.lastSweepDone, undefined);
+    assert.deepEqual([...content.local.data['sweep:1'].visited], [1, 2, 3, 4]);
+  });
+}
+
+test('coverage: a growing search restores its checkpoint before retrying a canceled query transition', async () => {
+  const content = loadContent();
+  activateAlphabet(content, 'a', 3);
+  content.local.data['sweep:1'] = { generation: 9, mode: 'sweep', query: 'a', total: 3,
+    visited: [1, 2] };
+  setCoveragePager(content, { page: 3, next: 'disabled' });
+  content.api.cancelPageWork();
+  let checkpoints = 0, release, entered;
+  const restoring = new Promise(resolve => { entered = resolve; });
+  const send = content.chrome.runtime.sendMessage;
+  content.chrome.runtime.sendMessage = message => {
+    if (message.type === 'reviewer:checkpoint') {
+      checkpoints++;
+      if (checkpoints === 1) setCoveragePager(content, { page: 3, last: 4, next: 'enabled' });
+      if (checkpoints === 2) {
+        entered();
+        return new Promise(resolve => { release = resolve; });
+      }
+    }
+    return send(message);
+  };
+  const advance = content.api.advanceDeliveredPage(9);
+  await restoring;
+  assert.equal(content.local.data['sweep:1'].query, 'a');
+  assert.equal([...content.timerCallbacks.values()].some(timer => timer.ms === 0), false);
+  release({ ok: true });
+  await advance;
+  assert.equal(content.local.data['sweep:1'].query, 'a');
+  assert.equal(content.api.getPhase(), 'waiting-content');
+  assert.ok([...content.timerCallbacks.values()].some(timer => timer.ms === 0));
+  assert.equal(content.sentMessages.some(message => message.type === 'reviewer:sweep-complete'), false);
+});
+
+for (const boundary of ['remove', 'status']) {
+  test(`coverage: primary ${boundary} storage cannot erase a changing terminal checkpoint or mark success`, async () => {
+    const content = loadFinalLetterContent();
+    content.location.href = 'https://www.walmart.com/reviews/claim-product?q=z&page=5';
+    content.location.search = '?q=z&page=5';
+    content.pager.innerText = '1 2 5';
+    content.local.data['sweep:1'] = { generation: 9, mode: 'sweep', query: 'z', total: 5,
+      visited: [1, 2, 3, 4], endRetries: { 5: 2 } };
+    if (boundary === 'status') Object.assign(content.local.data,
+      { lastSweepDone: 123, lastSweepStartedAt: 100, lastSweepPages: 7 });
+    const original = content.local[boundary === 'remove' ? 'remove' : 'set'];
+    content.local[boundary === 'remove' ? 'remove' : 'set'] = async values => {
+      await original(values);
+      if (boundary === 'remove' ? values === 'sweep:1' : Object.hasOwn(values, 'lastSweepDone')) {
+        setCoveragePager(content, { page: 5, next: 'enabled' });
+      }
+    };
+    await content.api.handleEndPage(9);
+    assert.equal(content.sentMessages.some(message => message.type === 'reviewer:sweep-complete'), false);
+    assert.deepEqual([...content.local.data['sweep:1'].visited], [1, 2, 3, 4]);
+    assert.equal(content.local.data.lastSweepDone, boundary === 'status' ? 123 : undefined);
+    assert.equal(content.local.data.lastSweepPages, boundary === 'status' ? 7 : undefined);
+  });
+}
+
+test('coverage: a search growing during the paced query transition resumes its unread pages', async () => {
+  const content = loadContent();
+  activateAlphabet(content, 'a', 3);
+  content.local.data['sweep:1'] = { generation: 9, mode: 'sweep', query: 'a', total: 3, visited: [1, 2] };
+  setCoveragePager(content, { page: 3, next: 'disabled' });
+  await content.api.advanceDeliveredPage(9);
+  assert.equal(content.local.data['sweep:1'].query, 'b');
+  let navigated = false;
+  content.location.assign = () => { navigated = true; };
+  setCoveragePager(content, { page: 3, last: 4, next: 'enabled' });
+  await runNavigation(content);
+  assert.equal(navigated, false);
+  assert.equal(content.local.data['sweep:1'].query, 'a');
+  assert.equal(content.api.getPhase(), 'waiting-content');
+});
+
+test('coverage: query transitions recheck terminal evidence after their navigation focus grant', async () => {
+  const content = loadContent();
+  activateAlphabet(content, 'a', 3);
+  content.local.data['sweep:1'] = { generation: 9, mode: 'sweep', query: 'a', total: 3, visited: [1, 2] };
+  setCoveragePager(content, { page: 3, next: 'disabled' });
+  await content.api.advanceDeliveredPage(9);
+  let entered, release;
+  const focused = new Promise(resolve => { entered = resolve; });
+  const send = content.chrome.runtime.sendMessage;
+  content.chrome.runtime.sendMessage = message => {
+    if (message.type === 'reviewer:focus' && message.purpose === 'page-navigation') {
+      entered();
+      return new Promise(resolve => { release = resolve; });
+    }
+    return send(message);
+  };
+  let navigated = false;
+  content.location.assign = () => { navigated = true; };
+  const navigation = runNavigation(content);
+  await focused;
+  setCoveragePager(content, { page: 3, last: 4, next: 'enabled' });
+  release({ ok: true, enabled: false, reason: 'disabled' });
+  await navigation;
+  assert.equal(navigated, false);
+  assert.equal(content.local.data['sweep:1'].query, 'a');
+  assert.equal(content.api.getPhase(), 'waiting-content');
+});
+
+
+function recoveryBlankDepartment(options = {}) {
+  const targetUrl = 'https://www.walmart.com/reviews/claim-product?catId=4044';
+  const content = loadContent({ initialUrl: targetUrl, departmentData: true, ...options });
+  content.api.setNow(100_000);
+  content.body.innerText = 'Reviewer gallery loading';
+  content.document.readyState = 'complete';
+  content.api.setCollector(() => []);
+  Object.assign(content.api.role, { active: true, tabId: 1, generation: 9,
+    auxiliary: { lane: 'departments', targetKey: 'Home', targetUrl } });
+  return content;
+}
+
+function recoveryFocus(content, response = null) {
+  const send = content.chrome.runtime.sendMessage;
+  content.chrome.runtime.sendMessage = async message => {
+    if (message.type === 'reviewer:focus') {
+      content.sentMessages.push(message);
+      return response || { ok: true, granted: true, enabled: true,
+        until: content.api.getNow() + 3_000, leaseId: `render-${content.api.getNow()}` };
+    }
+    return send(message);
+  };
+}
+
+const HIGH_TRAFFIC_TEXT = "Hold tight for a moment\nHigh traffic is slowing things down a bit. We'll load this page when it's ready.";
+
+test('high traffic holds the assigned page without intake, navigation, verification or failure', async () => {
+  const content = recoveryBlankDepartment({ performance: {
+    getEntriesByType(kind) { return kind === 'navigation' ? [{ responseStatus: 429 }] : []; }
+  } });
+  content.body.innerText = HIGH_TRAFFIC_TEXT;
+  content.api.setCollector(() => [{ item_id: 'old-card-behind-overlay' }]);
+  await content.local.set({ 'sweep:1': { generation: 9, mode: 'none', visited: [1], total: 10 } });
+  const checkpoint = JSON.stringify(content.local.data['sweep:1']);
+  let loads = 0;
+  content.location.assign = content.location.reload = () => { loads++; };
+  for (const at of [100_000, 131_000, 281_000, 1_000_000]) {
+    content.api.setNow(at);
+    await content.api.relay();
+    const probe = await contentMessage(content, { type: 'reviewer:probe' });
+    assert.equal(probe.highTraffic, true);
+    assert.equal(probe.reviewerReady, false);
+    assert.equal(probe.botCheck, false);
+    assert.equal(probe.phase, 'waiting-traffic');
+  }
+  assert.equal(loads, 0);
+  assert.equal(content.sentMessages.some(m => ['reviewer:page', 'reviewer:unusable',
+    'reviewer:verification', 'reviewer:focus'].includes(m.type)), false);
+  assert.equal(JSON.stringify(content.local.data['sweep:1']), checkpoint);
+  assert.equal(content.sentMessages.filter(m => m.event === 'traffic-wait').length, 1);
+});
+
+test('ordinary loading, product prose and hidden traffic text do not get traffic-wait authority', async () => {
+  for (const text of ['Loading', 'High traffic', 'Hold tight for a moment',
+    `Recognized Reviewer\nProduct description: ${HIGH_TRAFFIC_TEXT}`]) {
+    const content = recoveryBlankDepartment();
+    content.body.innerText = text;
+    const probe = await contentMessage(content, { type: 'reviewer:probe' });
+    assert.equal(probe.highTraffic, false);
+  }
+});
+
+test('traffic clearance resumes the original native freshness check instead of the old cards', async () => {
+  const content = loadContent();
+  content.api.setNow(100_000);
+  content.api.setCollector(() => [{ item_id: 'previous' }]);
+  let clicks = 0, loads = 0;
+  addNativePageControl(content, () => {
+    clicks++;
+    content.location.href = 'https://www.walmart.com/reviews/claim-product?q=&page=2';
+    content.location.search = '?q=&page=2';
+    content.body.innerText = HIGH_TRAFFIC_TEXT;
+  });
+  content.location.assign = content.location.reload = () => { loads++; };
+  await content.api.navigatePage(2, 9);
+  await runNavigation(content);
+  assert.equal(content.api.getPhase(), 'waiting-traffic');
+  content.api.setNow(700_000);
+  content.body.innerText = 'Free (Valued at $25)';
+  await contentMessage(content, { type: 'reviewer:probe' });
+  await runNavigation(content);
+  assert.equal(content.sentMessages.some(m => m.event === 'navigation-ready'), false);
+  assert.equal(content.sentMessages.some(m => m.type === 'reviewer:page'), false);
+  assert.equal(content.sentMessages.some(m => m.type === 'reviewer:unusable'), false);
+  content.api.setCollector(() => [{ item_id: 'fresh' }]);
+  await runNavigation(content);
+  assert.equal(content.sentMessages.filter(m => m.event === 'navigation-ready').length, 1);
+  assert.equal(content.sentMessages.filter(m => m.event === 'traffic-resumed').length, 1);
+  assert.equal(clicks, 1);
+  assert.equal(loads, 0);
+});
+
+test('trusted input during traffic still interrupts the preserved navigation on resume', async () => {
+  const content = loadContent();
+  content.api.setNow(100_000);
+  content.api.setCollector(() => [{ item_id: 'previous' }]);
+  addNativePageControl(content, () => { content.body.innerText = HIGH_TRAFFIC_TEXT; });
+  await content.api.navigatePage(2, 9);
+  await runNavigation(content);
+  content.api.setNow(150_000);
+  content.api.setLastInteraction(149_000);
+  content.body.innerText = 'Free (Valued at $25)';
+  await contentMessage(content, { type: 'reviewer:probe' });
+  await runNavigation(content);
+  assert.equal(content.api.getPhase(), 'waiting-user');
+  assert.equal(content.sentMessages.some(m => m.event === 'navigation-ready'), false);
+  assert.equal(content.sentMessages.filter(m => m.event === 'navigation-interrupted').length, 1);
+});
+
+test('traffic DOM clearance wakes scanning automatically and records only numeric evidence', async () => {
+  const content = recoveryBlankDepartment();
+  content.body.innerText = HIGH_TRAFFIC_TEXT;
+  await content.api.relay();
+  content.api.setNow(160_000);
+  content.body.innerText = 'Reviewer gallery loading';
+  const watcher = content.mutationObservers.find(o => o.options?.characterData);
+  watcher.callback([]);
+  const entry = [...content.timerCallbacks.entries()].find(([, value]) => value.ms === 100);
+  assert.ok(entry);
+  content.timerCallbacks.delete(entry[0]);
+  await entry[1].callback();
+  const resumed = content.sentMessages.find(m => m.event === 'traffic-resumed');
+  assert.equal(resumed.details.durationMs, 60_000);
+  assert.equal(content.api.getPhase(), 'starting');
+  assert.equal(JSON.stringify(resumed).includes('High traffic'), false);
+  assert.equal([...content.timerCallbacks.values()].some(t => t.ms === 0), true);
+});
+
+test('role revocation and verification discard the traffic continuation', async () => {
+  for (const reason of ['role', 'verification']) {
+    const content = recoveryBlankDepartment();
+    content.body.innerText = HIGH_TRAFFIC_TEXT;
+    await content.api.relay();
+    if (reason === 'role') content.api.applyRole({ active: false, tabId: 1, generation: 10 });
+    else await contentMessage(content, { type: 'reviewer:pause' });
+    content.body.innerText = 'Reviewer gallery loading';
+    content.api.setNow(200_000);
+    await content.api.relay();
+    assert.equal(content.sentMessages.some(m => m.event === 'traffic-resumed'), false);
+    assert.equal(content.sentMessages.some(m => m.type === 'reviewer:page'), false);
+    assert.equal(content.api.getActionTimer(), null);
+  }
+});
+
+test('traffic during an outstanding facet selection resumes its original binding watchdog', async () => {
+  const content = pendingDepartmentSelectionFixture();
+  const selecting = content.api.selectAuxiliaryTarget(90);
+  await content.selectionEntered;
+  content.body.innerText = HIGH_TRAFFIC_TEXT;
+  const probe = await contentMessage(content, { type: 'reviewer:probe' });
+  assert.equal(probe.phase, 'waiting-traffic');
+  content.api.setNow(800_000);
+  content.body.innerText = 'Recognized Reviewer';
+  await contentMessage(content, { type: 'reviewer:probe' });
+  assert.equal(content.sentMessages.some(m => m.type === 'reviewer:aux-selected'), false);
+  content.finishSelection();
+  await selecting;
+  assert.equal(content.sentMessages.filter(m => m.type === 'reviewer:aux-selected').length, 1);
+  assert.equal(content.sentMessages.some(m => m.type === 'reviewer:unusable'), false);
+  assert.equal(content.api.role.auxiliary.selection, null);
+});
+
+test('an old asynchronous native retry cannot revive after a traffic pause', async () => {
+  for (const storageFailure of [false, true]) {
+    const content = loadContent();
+    content.api.setNow(100_000);
+    content.api.setCollector(() => [{ item_id: 'previous' }]);
+    addNativePageControl(content, () => {});
+    await content.api.navigatePage(2, 9);
+    const get = content.local.get.bind(content.local);
+    let release, entered;
+    const waiting = new Promise(resolve => { entered = resolve; });
+    const blocked = new Promise(resolve => { release = resolve; });
+    content.local.get = async keys => {
+      if (keys.includes('pageDelaySeconds')) {
+        entered();
+        await blocked;
+        if (storageFailure) throw new Error('Delayed old failure');
+      }
+      return get(keys);
+    };
+    content.api.setNow(106_000);
+    await runNavigation(content);
+    await waiting;
+    content.body.innerText = HIGH_TRAFFIC_TEXT;
+    await contentMessage(content, { type: 'reviewer:probe' });
+    content.api.setNow(206_000);
+    content.body.innerText = 'Free (Valued at $25)';
+    await contentMessage(content, { type: 'reviewer:probe' });
+    const resumedTimer = content.api.getActionTimer();
+    release();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(content.api.getActionTimer(), resumedTimer);
+    assert.equal(content.sentMessages.some(m => m.event === 'navigation-retry'), false);
+    assert.equal(content.sentMessages.some(m => m.type === 'reviewer:unusable'), false);
+  }
+});
+
+test('scheduled home refresh preserves a live high-traffic waiting page and status', async () => {
+  const tab = { ...REVIEW_TAB };
+  const bg = loadBackground({ tabs: [tab], probes: new Map([[11, {
+    ready: true, active: true, generation: 8, highTraffic: true,
+    phase: 'waiting-traffic', sweeping: false, lastActivityAt: 1, nextActionAt: 0
+  }]]) });
+  await bg.api.initialization;
+  bg.session.data.reviewerCoordinator = { tabId: 11, generation: 8, selectedAt: 1 };
+  bg.local.data.refreshMinutes = 5;
+  await bg.api.refreshTick();
+  assert.equal(bg.restartMessages.length, 0);
+  assert.equal(bg.tabActions.length, 0);
+  assert.equal((await bg.api.scannerStatusSnapshot()).primary.phase, 'waiting-traffic');
+});
+
+test('recovery_20261030: a hidden blank department gets a bounded rendering turn before its budget expires', async () => {
+  const content = recoveryBlankDepartment();
+  recoveryFocus(content);
+  await content.api.ensureAuxiliaryTarget(9);
+  assert.ok(content.sentMessages.some(m => m.type === 'reviewer:focus'));
+  content.api.setNow(131_000);
+  await content.api.ensureAuxiliaryTarget(9);
+  assert.equal(content.sentMessages.some(m => m.type === 'reviewer:unusable'), false,
+    'Thirty seconds of scheduler sleep cannot consume a three-second selected turn as render work');
+});
+
+test('recovery_20261030: trusted input suspends blank readiness accounting', async () => {
+  const content = recoveryBlankDepartment();
+  recoveryFocus(content);
+  await content.api.ensureAuxiliaryTarget(9);
+  content.api.setNow(130_999);
+  content.listeners.get('keydown')({ isTrusted: true, target: content.body });
+  content.api.setNow(131_000);
+  await content.api.ensureAuxiliaryTarget(9);
+  assert.equal(content.api.getPhase(), 'waiting-user');
+  assert.equal(content.sentMessages.some(m => m.type === 'reviewer:unusable'), false);
+});
+
+test('recovery_20261030: bounded denied readiness becomes an opportunity failure without completing a target', async () => {
+  const content = recoveryBlankDepartment();
+  recoveryFocus(content, { granted: false, enabled: true, reason: 'waiting-turn', retryAfterMs: 5000 });
+  await content.api.ensureAuxiliaryTarget(9);
+  content.api.setNow(131_000);
+  await content.api.ensureAuxiliaryTarget(9);
+  assert.equal(content.sentMessages.some(m => m.type === 'reviewer:unusable'), false);
+  content.api.setNow(401_000);
+  await content.api.ensureAuxiliaryTarget(9);
+  assert.equal(content.sentMessages.find(m => m.type === 'reviewer:unusable')?.failureCode, 'render-opportunity-timeout');
+  assert.equal(content.sentMessages.some(m => m.type === 'reviewer:sweep-complete'), false);
+});
+
+test('recovery_20261030: actual granted render work still expires finitely', async () => {
+  const content = recoveryBlankDepartment();
+  recoveryFocus(content);
+  for (let ms = 0; ms <= 34_000; ms += 1_000) {
+    content.api.setNow(100_000 + ms);
+    await content.api.ensureAuxiliaryTarget(9);
+    if (content.sentMessages.some(m => m.type === 'reviewer:unusable')) break;
+  }
+  assert.equal(content.sentMessages.find(m => m.type === 'reviewer:unusable')?.failureCode, 'render-timeout');
+});
+
+test('recovery_20261030: a failed document response is classified before empty or card completion', async () => {
+  const content = recoveryBlankDepartment({ performance: {
+    getEntriesByType(kind) { return kind === 'navigation' ? [{ responseStatus: 520 }] : []; }
+  } });
+  content.body.innerText = 'No search results';
+  content.local.data['sweep:1'] = { generation: 9, targetKey: 'Home', mode: 'none', visited: [1, 2] };
+  await content.api.relay();
+  const failure = content.sentMessages.find(m => m.type === 'reviewer:unusable');
+  assert.equal(failure?.failureCode, 'document-http-error');
+  assert.equal(failure?.responseStatus, 520);
+  assert.ok(Number.isFinite(failure?.documentId));
+  assert.equal(content.sentMessages.some(m => m.type === 'reviewer:sweep-complete'), false);
+  assert.deepEqual(content.local.data['sweep:1'].visited, [1, 2]);
+});
+
+test('recovery_20261030: fresh probes identify their document as well as their generation', async () => {
+  const content = recoveryBlankDepartment();
+  const probe = await contentMessage(content, { type: 'reviewer:probe' });
+  assert.equal(probe.generation, 9);
+  assert.ok(Number.isFinite(probe.documentId));
+});
+
+
+test('recovery_20261030: a native freshness extraction exception cannot strand the navigation poll', async () => {
+  const content = loadContent();
+  content.api.setNow(100_000);
+  let broken = false, loads = 0;
+  content.api.setCollector(() => {
+    if (broken) throw new Error('Transient detached card');
+    return [{ item_id: 'old-page' }];
+  });
+  addNativePageControl(content, () => {
+    content.location.href = 'https://www.walmart.com/reviews/claim-product?q=&page=2';
+    content.location.search = '?q=&page=2';
+  });
+  content.location.assign = () => { loads++; };
+  content.api.navigatePage(2, 9);
+  broken = true;
+  content.api.setNow(101_000);
+  await assert.doesNotReject(runNavigation(content));
+  assert.ok(content.timerCallbacks.get(content.api.getActionTimer()), 'The freshness poll remains scheduled');
+  broken = false;
+  content.api.setNow(131_000);
+  await runNavigation(content);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(loads, 1, 'The changed route receives one guarded fallback after its full render allowance');
+  assert.equal(content.sentMessages.some(m => m.type === 'reviewer:page'), false);
+  assert.ok(content.sentMessages.some(m => m.event === 'navigation-outcome' && m.details.outcome === 'timeout'));
+});
+
+test('recovery_20261030: native navigation emits a bound ready outcome only after fresh cards', async () => {
+  const content = loadContent();
+  content.api.setNow(100_000);
+  let cards = [{ item_id: 'previous' }];
+  content.api.setCollector(() => cards);
+  addNativePageControl(content, () => {
+    content.location.href = 'https://www.walmart.com/reviews/claim-product?q=&page=2';
+    content.location.search = '?q=&page=2';
+  });
+  content.api.navigatePage(2, 9);
+  await runNavigation(content);
+  assert.equal(content.sentMessages.some(m => m.event === 'navigation-outcome'), false);
+  cards = [{ item_id: 'fresh' }];
+  content.api.setNow(102_000);
+  await runNavigation(content);
+  const ready = content.sentMessages.find(m => m.event === 'navigation-outcome');
+  assert.equal(ready?.details.outcome, 'ready');
+  assert.equal(ready?.details.targetPage, 2);
+  assert.equal(ready?.details.generation, 9);
+  assert.ok(Number.isFinite(ready?.details.documentId));
+});
+
+
+test('recovery_20261030: revoked rendering turns cannot accumulate background time as active work', async () => {
+  const content = recoveryBlankDepartment();
+  recoveryFocus(content);
+  for (let cycle = 0; cycle < 12; cycle++) {
+    const at = 100_000 + cycle * 3_000;
+    content.api.setNow(at);
+    await content.api.ensureAuxiliaryTarget(9);
+    content.api.setNow(at + 500);
+    await contentMessage(content, { type: 'reviewer:selection-revoked', generation: 9, leaseId: `render-${at}` });
+  }
+  content.api.setNow(136_000);
+  await content.api.ensureAuxiliaryTarget(9);
+  assert.equal(content.sentMessages.some(m => m.type === 'reviewer:unusable'), false,
+    'Twelve half-second turns are six seconds of work, not thirty-six');
+});
+
+test('recovery_20261030: HTTP recovery yields to input and a changed role', async () => {
+  const content = recoveryBlankDepartment({ performance: {
+    getEntriesByType(kind) { return kind === 'navigation' ? [{ responseStatus: 520 }] : []; }
+  } });
+  content.api.setNow(130_999);
+  content.listeners.get('keydown')({ isTrusted: true, target: content.body });
+  content.api.setNow(131_000);
+  await content.api.relay();
+  assert.equal(content.api.getPhase(), 'waiting-user');
+  assert.equal(content.sentMessages.some(m => m.type === 'reviewer:unusable'), false);
+  content.api.applyRole({ active: false, tabId: 1, generation: 10 });
+  content.api.setNow(171_000);
+  await content.api.relay();
+  assert.equal(content.sentMessages.some(m => m.type === 'reviewer:unusable'), false);
+});
+
+
+test('recovery_20261030: blank keywords also receive a bounded rendering opportunity', async () => {
+  const content = recoveryBlankDepartment();
+  content.api.role.auxiliary.lane = 'keywords';
+  recoveryFocus(content, { enabled: true, granted: false, reason: 'waiting-turn' });
+  await content.api.relay();
+  assert.ok(content.sentMessages.some(m => m.type === 'reviewer:focus'));
+  content.api.setNow(131_000);
+  await content.api.relay();
+  assert.equal(content.sentMessages.some(m => m.type === 'reviewer:unusable'), false);
+});
+
+test('recovery_20261030: failed native recovery persistence reports a finite classified failure', async () => {
+  const content = loadContent();
+  content.api.setNow(100_000);
+  content.api.setCollector(() => [{ item_id: 'previous' }]);
+  addNativePageControl(content, () => {
+    content.location.href = 'https://www.walmart.com/reviews/claim-product?q=&page=2';
+    content.location.search = '?q=&page=2';
+  });
+  content.api.navigatePage(2, 9);
+  content.local.get = async () => { throw new Error('Temporary storage failure'); };
+  content.api.setNow(131_000);
+  await assert.doesNotReject(runNavigation(content));
+  await new Promise(resolve => setImmediate(resolve));
+  const failure = content.sentMessages.find(m => m.type === 'reviewer:unusable');
+  assert.equal(failure?.failureCode, 'navigation-timeout');
+  assert.ok(Number.isFinite(failure?.documentId));
+  assert.equal(content.sentMessages.some(m => m.type === 'reviewer:page'), false);
+});
+
+test('an OOS-only auxiliary document reaches intake and page reading instead of false render recovery', async () => {
+  const captured = JSON.parse(fs.readFileSync(
+    new URL('./fixtures/reviewer-sofa-card-20261028.json', import.meta.url), 'utf8'));
+  const raw = captured.cards.find(card => JSON.stringify(card).includes('19698913226'));
+  const makeNode = value => {
+    const node = { tagName: value.tag.toUpperCase(), innerText: value.text, textContent: value.text,
+      children: (value.children || []).map(makeNode),
+      getAttribute(name) { return value.attributes[name] ?? null; },
+      querySelectorAll(selector) {
+        const descendants = this.children.flatMap(child => [child, ...child.querySelectorAll('*')]);
+        if (selector === '*') return descendants;
+        if (selector === 'a[href*="/ip/"]') return descendants.filter(child =>
+          child.tagName === 'A' && child.getAttribute('href')?.includes('/ip/'));
+        if (selector === 'h3' || selector === 'img') return descendants.filter(child =>
+          child.tagName === selector.toUpperCase());
+        return [];
+      },
+      querySelector(selector) { return this.querySelectorAll(selector)[0] || null; } };
+    for (const child of node.children) child.parentElement = node;
+    return node;
+  };
+  const card = makeNode(raw);
+  const url = 'https://www.walmart.com/reviews/claim-product?q=Couch&queryNups=Couch';
+  const content = loadContent({ initialUrl: url, pageAck: { ok: true } });
+  content.api.setNow(1_000_000);
+  content.document.visibilityState = 'visible';
+  content.body.innerText = `Free items remaining 3 items\n${raw.text}`;
+  content.document.querySelectorAll = selector => card.querySelectorAll(selector);
+  Object.assign(content.api.role, { active: true, tabId: 1, primaryTabId: 1, generation: 7,
+    auxiliary: { lane: 'keywords', mode: 'none', targetKey: 'keyword:couch', targetUrl: url } });
+  await content.local.set({ rotateScannerTabs: false, sweepMode: 'none', pageDelaySeconds: 15 });
+  await content.api.relay();
+  const pages = content.sentMessages.filter(message => message.type === 'reviewer:page');
+  assert.equal(pages.length, 1, 'An observed unavailable card is not a blank document');
+  assert.equal(pages[0].items[0].item_id, 'ip-19698913226');
+  assert.equal(pages[0].items[0].available, false, 'Shared sender still filters unavailable offers');
+  assert.ok(content.local.data['sweep:1'].visited.includes(1));
+  assert.equal(content.sentMessages.some(message => message.type === 'reviewer:unusable'), false);
 });

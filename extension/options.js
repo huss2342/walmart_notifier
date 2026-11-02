@@ -2,9 +2,7 @@
 
 const DEFAULT_PATH_PATTERN = '^/reviews/claim-product';
 const DEFAULT_ENDPOINT = 'http://127.0.0.1:8787/ingest';
-const OPTIONS_SCANNER_KEYS = ['auxiliaryDepartments', 'auxiliaryKeywords', 'auxiliaryBrands',
-  'auxiliaryKeywordQueries', 'groupScannerTabs', 'rotateScannerTabs',
-  'verificationAssistEnabled', 'verificationNativeEnabled', 'pathPattern'];
+const OPTIONS_SCANNER_KEYS = ReviewerScannerSettings.keys;
 const $ = (id) => document.getElementById(id);
 
 const endpointEl = $('endpoint');
@@ -20,6 +18,10 @@ const auxiliaryKeywordsEl = $('auxiliaryKeywords');
 const auxiliaryBrandsEl = $('auxiliaryBrands');
 const auxiliaryQueriesEl = $('auxiliaryKeywordQueries');
 const auxiliaryKeywordErrorEl = $('auxiliaryKeywordError');
+const auxiliaryPriorityEl = $('auxiliaryPriority');
+const priorityQueriesEl = $('auxiliaryPriorityQueries');
+const priorityRefreshEl = $('auxiliaryPriorityRefreshMinutes');
+const priorityErrorEl = $('auxiliaryPriorityError');
 const groupScannerTabsEl = $('groupScannerTabs');
 const rotateScannerTabsEl = $('rotateScannerTabs');
 const savedEl = $('saved');
@@ -172,6 +174,9 @@ renderVerificationControls();
 
 let lastHealth = null;
 let lastHealthError = '';
+let loadedScannerForm = null;
+let loadedRelayForm = null;
+let loadedConnection = null;
 
 $('exportDiagnostics').addEventListener('click', async () => {
   const resultEl = $('diagnosticsResult');
@@ -192,78 +197,70 @@ $('exportDiagnostics').addEventListener('click', async () => {
 });
 
 /** Resolve a server route while refusing to send the optional token off-device. */
-function localUrl(path) {
-  const base = new URL(endpointEl.value.trim() || DEFAULT_ENDPOINT);
-  if (base.protocol !== 'http:' || !['127.0.0.1', 'localhost'].includes(base.hostname)) {
-    throw new Error('Use an http://127.0.0.1 or http://localhost endpoint.');
-  }
-  if (base.username || base.password || base.pathname.replace(/\/+$/, '') !== '/ingest' ||
-      base.search || base.hash) {
-    throw new Error('The endpoint must end exactly in /ingest, with no credentials or query.');
-  }
-  return new URL(path, base.origin).toString();
+function localUrl(path, connection = null) {
+  return ReviewerLocalClient.route(connection?.endpoint || endpointEl.value.trim() || DEFAULT_ENDPOINT, path);
 }
 
-function authHeaders() {
-  const token = tokenEl.value.trim();
+function authHeaders(connection = null) {
+  const token = connection ? connection.token : tokenEl.value.trim();
   return token ? { 'X-Ingest-Token': token } : {};
 }
 
 async function optionsScannerSettings(overrides = {}) {
   const value = await chrome.storage.local.get(OPTIONS_SCANNER_KEYS);
-  return validatedScannerSettings({ schemaVersion: 1,
-    auxiliaryDepartments: value.auxiliaryDepartments ?? true,
-    auxiliaryKeywords: value.auxiliaryKeywords ?? true,
-    auxiliaryBrands: value.auxiliaryBrands ?? false,
-    auxiliaryKeywordQueries: value.auxiliaryKeywordQueries ?? null,
-    groupScannerTabs: value.groupScannerTabs ?? true,
-    rotateScannerTabs: value.rotateScannerTabs ?? true,
-    verificationAssistEnabled: value.verificationAssistEnabled ?? false,
-    verificationNativeEnabled: value.verificationNativeEnabled ?? false,
-    pathPattern: value.pathPattern || DEFAULT_PATH_PATTERN,
-    ...overrides });
+  return ReviewerScannerSettings.project(value, overrides);
 }
 
-async function readBackendScannerSettings() {
-  const response = await localFetch(localUrl('/scanner-settings'), {
-    headers: authHeaders(), cache: 'no-store'
+async function readBackendScannerSettings(connection = null) {
+  const response = await localFetch(localUrl('/scanner-settings', connection), {
+    headers: authHeaders(connection), cache: 'no-store'
   }, 5_000);
   if (!response.ok) throw new Error('Scanner settings unavailable.');
   const body = await response.json();
   if (!body || !Object.hasOwn(body, 'settings')) throw new Error('Scanner settings unavailable.');
-  return body.settings === null ? null : validatedScannerSettings(body.settings);
+  return body.settings === null ? null : ReviewerScannerSettings.validate(body.settings);
 }
 
-async function putBackendScannerSettings(settings) {
-  const response = await localFetch(localUrl('/scanner-settings'), {
-    method: 'PUT', headers: { ...authHeaders(), 'Content-Type': 'application/json' },
-    body: JSON.stringify(validatedScannerSettings(settings))
+async function putBackendScannerSettings(settings, connection = null) {
+  const response = await localFetch(localUrl('/scanner-settings', connection), {
+    method: 'PUT', headers: { ...authHeaders(connection), 'Content-Type': 'application/json' },
+    body: JSON.stringify(ReviewerScannerSettings.validate(settings))
   });
   if (!response.ok) throw new Error('Scanner settings save failed.');
-  return validatedScannerSettings((await response.json()).settings);
+  return ReviewerScannerSettings.validate((await response.json()).settings);
 }
 
 async function persistScannerToggle(key, active) {
   // A separate verification button changes saved desired settings, without
   // accidentally applying unsaved scan controls from the form.
-  const current = await readBackendScannerSettings() || await optionsScannerSettings();
-  const { schemaVersion, ...saved } = await putBackendScannerSettings({ ...current, [key]: active });
-  await chrome.storage.local.set(saved);
+  const edits = connectionEdits();
+  return ReviewerLocalClient.settingsTransaction(async () => {
+    const connection = await connectionForEdits(edits);
+    const current = await readBackendScannerSettings(connection) || await optionsScannerSettings();
+    const { schemaVersion, ...saved } = ReviewerScannerSettings.project(
+      await putBackendScannerSettings({ ...current, [key]: active }, connection));
+    await chrome.storage.local.set(saved);
+  });
+}
+
+function connectionEdits() {
+  return ReviewerScannerSettings.changes({ endpoint: endpointEl.value.trim() || DEFAULT_ENDPOINT,
+    token: tokenEl.value.trim() }, loadedConnection);
+}
+
+async function connectionForEdits(edits) {
+  const cached = await chrome.storage.local.get(['endpoint', 'token']);
+  return { endpoint: cached.endpoint || DEFAULT_ENDPOINT, token: cached.token || '', ...edits };
 }
 
 /**
  * Fetch from a visible extension page. This is an explicit connection check
  * and a place for affected Chrome builds or policies to show an LNA prompt.
  */
-function localFetch(url, init = {}, timeoutMs = 15_000) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  return fetch(url, {
-    ...init,
-    // localUrl() guarantees a literal loopback destination, so Chrome can
-    // classify it correctly across both PNA-era and current LNA builds.
-    signal: controller.signal
-  }).finally(() => clearTimeout(timeout));
+async function localFetch(url, init = {}, timeoutMs = 15_000) {
+  const response = await ReviewerLocalClient.json(url, init, { timeoutMs });
+  // Preserve the small Response-shaped interface used by the Options actions.
+  return { ok: response.ok, status: response.status, async json() { return response.body; } };
 }
 
 function connectionError(err, url = DEFAULT_ENDPOINT) {
@@ -286,16 +283,19 @@ function connectionError(err, url = DEFAULT_ENDPOINT) {
 
 // --- connection settings ----------------------------------------------------
 
-chrome.storage.local
+const formInitialization = chrome.storage.local
   .get(['endpoint', 'token', 'refreshMinutes', 'pageDelaySeconds', 'pathPattern', 'sweepMode',
     'auxiliaryDepartments', 'auxiliaryKeywords', 'auxiliaryBrands', 'auxiliaryKeywordQueries',
+    'auxiliaryPriority', 'auxiliaryPriorityQueries', 'auxiliaryPriorityRefreshMinutes',
     'groupScannerTabs', 'rotateScannerTabs'])
   .then(async ({ endpoint = DEFAULT_ENDPOINT, token = '', refreshMinutes = 30,
            pageDelaySeconds = 15, pathPattern = DEFAULT_PATH_PATTERN, sweepMode = false,
            auxiliaryDepartments = true, auxiliaryKeywords = true, auxiliaryBrands = false,
-           auxiliaryKeywordQueries, groupScannerTabs = true, rotateScannerTabs = true }) => {
+           auxiliaryKeywordQueries, auxiliaryPriority = false, auxiliaryPriorityQueries,
+           auxiliaryPriorityRefreshMinutes = 1, groupScannerTabs = true, rotateScannerTabs = true }) => {
     endpointEl.value = endpoint;
     tokenEl.value = token;
+    loadedConnection = { endpoint, token };
     refreshEl.value = refreshMinutes;
     pageDelayEl.value = pageDelaySeconds;
     sweepModeEl.value = normalizeSweepMode(sweepMode);
@@ -303,6 +303,7 @@ chrome.storage.local
     auxiliaryDepartmentsEl.checked = auxiliaryDepartments === true;
     auxiliaryKeywordsEl.checked = auxiliaryKeywords === true;
     auxiliaryBrandsEl.checked = auxiliaryBrands === true;
+    renderPrioritySettings({ auxiliaryPriority, auxiliaryPriorityQueries, auxiliaryPriorityRefreshMinutes });
     groupScannerTabsEl.checked = groupScannerTabs !== false;
     rotateScannerTabsEl.checked = rotateScannerTabs !== false;
     updateAuxiliaryControls();
@@ -315,45 +316,52 @@ chrome.storage.local
       auxiliaryKeywordErrorEl.textContent = `Saved keywords need attention: ${err.message}`;
       auxiliaryQueriesEl.ariaInvalid = 'true';
     }
-    try {
-      const response = await localFetch(localUrl('/relay-settings'), {
-        headers: authHeaders(), cache: 'no-store'
-      }, 5_000);
-      if (!response.ok) throw new Error('Scan settings unavailable.');
-      const body = await response.json();
-      if (body.settings != null) {
-        const { schemaVersion, ...scan } = validatedRelaySettings(body.settings);
-        refreshEl.value = scan.refreshMinutes;
-        pageDelayEl.value = scan.pageDelaySeconds;
-        sweepModeEl.value = scan.sweepMode;
-        await chrome.storage.local.set(scan);
+    await ReviewerLocalClient.settingsTransaction(async () => {
+      try {
+        const response = await localFetch(localUrl('/relay-settings'), {
+          headers: authHeaders(), cache: 'no-store'
+        }, 5_000);
+        if (!response.ok) throw new Error('Scan settings unavailable.');
+        const body = await response.json();
+        if (body.settings != null) {
+          const { schemaVersion, ...scan } = ReviewerScannerSettings.relay.validate(body.settings);
+          refreshEl.value = scan.refreshMinutes;
+          pageDelayEl.value = scan.pageDelaySeconds;
+          sweepModeEl.value = scan.sweepMode;
+          await chrome.storage.local.set(scan);
+        }
+      } catch {
+        savedEl.textContent = 'Could not read relay-settings.json; showing the last saved scan settings.';
       }
-    } catch {
-      savedEl.textContent = 'Could not read relay-settings.json; showing the last saved scan settings.';
-    }
-    try {
-      const scanner = await readBackendScannerSettings();
-      if (scanner) {
-        const { schemaVersion, ...cached } = scanner;
-        await chrome.storage.local.set(cached);
-        pathEl.value = scanner.pathPattern;
-        auxiliaryDepartmentsEl.checked = scanner.auxiliaryDepartments;
-        auxiliaryKeywordsEl.checked = scanner.auxiliaryKeywords;
-        auxiliaryBrandsEl.checked = scanner.auxiliaryBrands;
-        groupScannerTabsEl.checked = scanner.groupScannerTabs;
-        rotateScannerTabsEl.checked = scanner.rotateScannerTabs;
-        auxiliaryQueriesEl.value = auxiliaryQueries(scanner.auxiliaryKeywordQueries ?? undefined).join('\n');
-        updateAuxiliaryControls();
-        await renderVerificationControls();
+      try {
+        const scanner = await readBackendScannerSettings();
+        if (scanner) {
+          const { schemaVersion, ...cached } = ReviewerScannerSettings.project(scanner);
+          await chrome.storage.local.set(cached);
+          pathEl.value = scanner.pathPattern;
+          auxiliaryDepartmentsEl.checked = scanner.auxiliaryDepartments;
+          auxiliaryKeywordsEl.checked = scanner.auxiliaryKeywords;
+          auxiliaryBrandsEl.checked = scanner.auxiliaryBrands;
+          renderPrioritySettings(scanner);
+          groupScannerTabsEl.checked = scanner.groupScannerTabs;
+          rotateScannerTabsEl.checked = scanner.rotateScannerTabs;
+          auxiliaryQueriesEl.value = auxiliaryQueries(scanner.auxiliaryKeywordQueries ?? undefined).join('\n');
+          updateAuxiliaryControls();
+          await renderVerificationControls();
+        }
+      } catch {
+        savedEl.textContent += (savedEl.textContent ? ' ' : '') +
+          'Could not read scanner-settings.json; showing the last saved scanner settings.';
       }
-    } catch {
-      savedEl.textContent += (savedEl.textContent ? ' ' : '') +
-        'Could not read scanner-settings.json; showing the last saved scanner settings.';
-    }
+    }).catch(error => { savedEl.textContent = error.message; });
+    try { loadedScannerForm = scannerFormValues(); }
+    catch { loadedScannerForm = null; } // Keep damaged stored keywords editable.
+    loadedRelayForm = relayFormValues();
     renderStatus();
   });
 
 $('save').addEventListener('click', async () => {
+  await formInitialization;
   try {
     localUrl('/ingest');
   } catch (err) {
@@ -390,46 +398,126 @@ $('save').addEventListener('click', async () => {
   auxiliaryKeywordErrorEl.textContent = '';
   auxiliaryQueriesEl.ariaInvalid = 'false';
 
-  const scan = validatedRelaySettings({
+  try { priorityFormValues(); }
+  catch (error) {
+    priorityErrorEl.textContent = error.message;
+    priorityQueriesEl.ariaInvalid = 'true';
+    return;
+  }
+  priorityErrorEl.textContent = '';
+  priorityQueriesEl.ariaInvalid = 'false';
+
+  const scan = relayFormValues();
+  const form = scannerFormValues(queries);
+  const scannerChanges = ReviewerScannerSettings.changes(form, loadedScannerForm);
+  const relayChanges = ReviewerScannerSettings.changes(scan, loadedRelayForm);
+  const edits = connectionEdits();
+  let connection;
+  let scanner;
+  let savedScan;
+  try {
+    await ReviewerLocalClient.settingsTransaction(async () => {
+      connection = await connectionForEdits(edits);
+      const latest = await readBackendScannerSettings(connection) || await optionsScannerSettings(scannerChanges);
+      scanner = await putBackendScannerSettings({ ...latest, ...scannerChanges }, connection);
+      const currentResponse = await localFetch(localUrl('/relay-settings', connection), {
+        headers: authHeaders(connection), cache: 'no-store'
+      }, 5_000);
+      if (!currentResponse.ok) throw new Error('Scan settings unavailable.');
+      const current = (await currentResponse.json()).settings;
+      const latestScan = current == null ? loadedRelayForm : ReviewerScannerSettings.relay.validate(current);
+      const response = await localFetch(localUrl('/relay-settings', connection), {
+        method: 'PUT', headers: { ...authHeaders(connection), 'Content-Type': 'application/json' },
+        body: JSON.stringify(ReviewerScannerSettings.relay.validate({ ...latestScan, ...relayChanges }))
+      });
+      if (!response.ok) throw new Error('Scan settings save failed.');
+      savedScan = ReviewerScannerSettings.relay.validate((await response.json()).settings);
+      const { schemaVersion, ...cachedScan } = savedScan;
+      const { schemaVersion: scannerVersion, ...cachedScanner } = ReviewerScannerSettings.project(scanner);
+      await chrome.storage.local.set({ ...connection, ...cachedScan, ...cachedScanner });
+    });
+  } catch (error) {
+    savedEl.textContent = 'Not saved: could not confirm both scanner-settings.json and relay-settings.json. ' +
+      'Some backend values may have changed; reload before retrying. ' +
+      (error.message.includes('coordination') ? error.message : '');
+    return;
+  }
+  renderSavedSettings(scanner, savedScan);
+  endpointEl.value = connection.endpoint;
+  tokenEl.value = connection.token;
+  loadedConnection = connection;
+  loadedScannerForm = scannerFormValues();
+  loadedRelayForm = relayFormValues();
+  flash(savedEl, 'Saved');
+  renderStatus();
+});
+
+function relayFormValues() {
+  return ReviewerScannerSettings.relay.validate({
     schemaVersion: 1,
     sweepMode: normalizeSweepMode(sweepModeEl.value),
     pageDelaySeconds: Math.min(60, Math.max(5, parseInt(pageDelayEl.value, 10) || 15)),
     refreshMinutes: Math.min(120, Math.max(0, parseInt(refreshEl.value, 10) || 0))
   });
-  let scanner;
-  try {
-    scanner = await putBackendScannerSettings(await optionsScannerSettings({
+}
+
+function scannerFormValues(queries = auxiliaryQueries(auxiliaryQueriesEl.value)) {
+  return {
+      ...priorityFormValues(),
       auxiliaryDepartments: auxiliaryDepartmentsEl.checked,
       auxiliaryKeywords: auxiliaryKeywordsEl.checked,
       auxiliaryBrands: auxiliaryDepartmentsEl.checked && auxiliaryBrandsEl.checked,
       auxiliaryKeywordQueries: queries,
       groupScannerTabs: groupScannerTabsEl.checked,
       rotateScannerTabs: rotateScannerTabsEl.checked,
-      pathPattern: pattern
-    }));
-    const response = await localFetch(localUrl('/relay-settings'), {
-      method: 'PUT', headers: { ...authHeaders(), 'Content-Type': 'application/json' },
-      body: JSON.stringify(scan)
-    });
-    if (!response.ok) throw new Error('Scan settings save failed.');
-    validatedRelaySettings((await response.json()).settings);
-  } catch {
-    savedEl.textContent = 'Not saved: could not confirm both scanner-settings.json and relay-settings.json. ' +
-      'Some backend values may have changed; reload before retrying.';
-    return;
+      pathPattern: pathEl.value.trim() || DEFAULT_PATH_PATTERN
+  };
+}
+
+function priorityFormValues() {
+  const queries = priorityQueries(priorityQueriesEl.value);
+  if (auxiliaryPriorityEl.checked && !queries.length) {
+    throw new Error('Add at least one priority item name to enable the fourth tab.');
   }
-  const { schemaVersion, ...cachedScan } = scan;
-  const { schemaVersion: scannerVersion, ...cachedScanner } = scanner;
-  await chrome.storage.local.set({
-    endpoint: endpointEl.value.trim() || DEFAULT_ENDPOINT,
-    token: tokenEl.value.trim(),
-    ...cachedScan,
-    ...cachedScanner
-  });
-  auxiliaryQueriesEl.value = queries.join('\n');
-  flash(savedEl, 'Saved');
-  renderStatus();
-});
+  const interval = Number(priorityRefreshEl.value);
+  if (!Number.isInteger(interval) || interval < 1 || interval > 120) {
+    throw new Error('Use a priority break from 1 to 120 whole minutes.');
+  }
+  return { auxiliaryPriority: auxiliaryPriorityEl.checked, auxiliaryPriorityQueries: queries,
+    auxiliaryPriorityRefreshMinutes: interval };
+}
+
+function renderPrioritySettings(scanner) {
+  auxiliaryPriorityEl.checked = scanner.auxiliaryPriority === true;
+  priorityRefreshEl.value = scanner.auxiliaryPriorityRefreshMinutes ?? 1;
+  try {
+    priorityQueriesEl.value = priorityQueries(scanner.auxiliaryPriorityQueries).join('\n');
+    priorityErrorEl.textContent = '';
+    priorityQueriesEl.ariaInvalid = 'false';
+  }
+  catch (error) {
+    const value = scanner.auxiliaryPriorityQueries;
+    priorityQueriesEl.value = Array.isArray(value) ? value.filter(query => typeof query === 'string').join('\n')
+      : typeof value === 'string' ? value : '';
+    priorityErrorEl.textContent = `Saved priority searches need attention: ${error.message}`;
+    priorityQueriesEl.ariaInvalid = 'true';
+  }
+}
+
+function renderSavedSettings(scanner, scan) {
+  pathEl.value = scanner.pathPattern;
+  auxiliaryDepartmentsEl.checked = scanner.auxiliaryDepartments;
+  auxiliaryKeywordsEl.checked = scanner.auxiliaryKeywords;
+  auxiliaryBrandsEl.checked = scanner.auxiliaryBrands;
+  renderPrioritySettings(scanner);
+  groupScannerTabsEl.checked = scanner.groupScannerTabs;
+  rotateScannerTabsEl.checked = scanner.rotateScannerTabs;
+  auxiliaryQueriesEl.value = auxiliaryQueries(scanner.auxiliaryKeywordQueries ?? undefined).join('\n');
+  refreshEl.value = scan.refreshMinutes;
+  pageDelayEl.value = scan.pageDelaySeconds;
+  sweepModeEl.value = scan.sweepMode;
+  updateAuxiliaryControls();
+}
 
 function updateAuxiliaryControls() {
   auxiliaryBrandsEl.disabled = !auxiliaryDepartmentsEl.checked;
@@ -442,6 +530,12 @@ auxiliaryQueriesEl.addEventListener('input', () => {
   auxiliaryKeywordErrorEl.textContent = '';
   auxiliaryQueriesEl.ariaInvalid = 'false';
 });
+for (const control of [auxiliaryPriorityEl, priorityQueriesEl, priorityRefreshEl]) {
+  control.addEventListener('input', () => {
+    priorityErrorEl.textContent = '';
+    priorityQueriesEl.ariaInvalid = 'false';
+  });
+}
 
 $('restartAuxiliary').addEventListener('click', async () => {
   const button = $('restartAuxiliary');
@@ -561,7 +655,7 @@ async function renderAuxiliaryStatus() {
     if (!result?.ok || !Array.isArray(result.lanes)) throw new Error('Status unavailable.');
     const frag = document.createDocumentFragment();
     let rendered = 0;
-    const names = { departments: 'Department scan', keywords: 'Keyword scan' };
+    const names = { departments: 'Department scan', keywords: 'Keyword scan', priority: 'Priority scan' };
     const labels = {
       disabled: 'Disabled', idle: 'Waiting to start', ready: 'Waiting to start', starting: 'Starting',
       scanning: 'Scanning', running: 'Scanning', discovering: 'Discovering filters',
@@ -573,17 +667,29 @@ async function renderAuxiliaryStatus() {
     for (const lane of result.lanes) {
       if (!lane || !Object.hasOwn(names, lane.lane)) continue;
       const state = typeof lane.status === 'string' ? lane.status : 'idle';
-      const description = Object.hasOwn(labels, state) ? labels[state] : state.slice(0, 80);
+      const measuredCoverage = ['completedTargets', 'attemptedTargets', 'unresolvedTargets']
+        .every(key => Number.isSafeInteger(lane[key]) && lane[key] >= 0 && lane[key] <= 1e15);
+      const description = !measuredCoverage && ['complete', 'completed'].includes(state)
+        ? 'Round ended; completion unverified'
+        : Object.hasOwn(labels, state) ? labels[state] : state.slice(0, 80);
       const label = typeof lane.targetLabel === 'string' ? lane.targetLabel.slice(0, 200) : '';
       let detail = `${description}.`;
       if (label) detail += ` Current target: ${label}.`;
-      detail += ` ${safeCount(lane.completedTargets)} of ${safeCount(lane.totalTargets)} targets complete; ` +
-        `${safeCount(lane.pages)} pages read; ${safeCount(lane.failures)} failures.`;
+      detail += measuredCoverage
+        ? ` ${lane.completedTargets} of ${safeCount(lane.totalTargets)} targets verified complete; ` +
+          `${lane.attemptedTargets} attempted; ${lane.unresolvedTargets} unresolved; `
+        : ` ${safeCount(lane.completedTargets)} of ${safeCount(lane.totalTargets)} targets advanced; ` +
+          'completion unverified; ';
+      if (measuredCoverage && Number.isSafeInteger(lane.emptyTargets) &&
+          lane.emptyTargets >= 0 && lane.emptyTargets <= lane.completedTargets) {
+        detail += `${lane.emptyTargets} verified empty; `;
+      }
+      detail += `${safeCount(lane.pages)} pages read; ${safeCount(lane.failures)} failures.`;
       if (safeCount(lane.truncatedTargets)) {
         detail += ` ${safeCount(lane.truncatedTargets)} targets reached the coverage limit.`;
       }
       if (safeCount(lane.coverageLimitedTargets)) {
-        detail += ` ${safeCount(lane.coverageLimitedTargets)} targets reached the page limit without further filters.`;
+        detail += ` ${safeCount(lane.coverageLimitedTargets)} targets have no confirmed final page; coverage remains unresolved.`;
       }
       if (typeof lane.lastError === 'string' && lane.lastError) {
         detail += ` Last problem: ${lane.lastError.slice(0, 240)}`;

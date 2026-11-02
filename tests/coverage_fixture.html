@@ -1,0 +1,73 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Scanner coverage regression</title>
+<style>body {font:16px system-ui;max-width:980px;margin:28px auto;line-height:1.5}#result{font-weight:700}#cards{border:1px solid #bbb;padding:16px}nav{padding:16px}img{max-width:24px}</style>
+<h1>Scanner coverage regression · 2.26.5</h1>
+<p>Local replay of captured public cards and pagination controls. No Walmart requests or live scanner settings.</p>
+<p id="result" role="status">Running…</p><ul id="checks"></ul>
+<div id="cards"></div>
+<nav aria-label="pagination"><a aria-current="page">35</a><button aria-label="Next Page" disabled>Next</button></nav>
+<script src="/fixture-stubs.js"></script>
+<script src="/sweep-modes.js"></script><script src="/runtime-policy.js"></script>
+<script src="/verification-observation.js"></script><script src="/page-controls.js"></script>
+<script src="/document-session.js"></script><script src="/live-observer.js"></script><script src="/content.js"></script>
+<script>
+(async () => {
+  const result = document.querySelector('#result');
+  let passed = 0;
+  const check = (condition, description) => {
+    if (!condition) throw Error(description);
+    const line = document.createElement('li'); line.textContent = 'PASS — ' + description;
+    document.querySelector('#checks').appendChild(line);
+    passed++;
+  };
+  const make = value => {
+    const node = document.createElement(value.tag);
+    for (const [key, val] of Object.entries(value.attributes)) node.setAttribute(key, val);
+    if (value.children.length) for (const child of value.children) node.appendChild(make(child));
+    else node.textContent = value.text;
+    return node;
+  };
+  try {
+    const fixture = await (await fetch('/sofa-card.json')).json();
+    for (const card of fixture.cards) document.querySelector('#cards').appendChild(make(card));
+    const items = collect();
+    const selected = items.find(item => item.item_id === 'ip-20761609702');
+    check(selected?.value_usd === 35.99 && selected.available, 'Selected Sofa card retained: Free, $35.99, available');
+    const variants = ['20786920734','20844210988','20827667279','19385610574','19341061402'];
+    check(!items.some(item => variants.includes(item.item_id.replace('ip-', ''))), 'All five image-labelled variants excluded');
+    check(!items.some(item => item.item_id === 'ip-19698913226' && item.available), 'Out-of-stock captured product never becomes eligible');
+    check(paginationNextState(35) === 'disabled', 'Visible disabled Next with matching current page supplies terminal evidence');
+    check(paginationNextState(34) === 'unknown', 'Stale current-page marker cannot certify completion');
+    const receipts = Array.from({length:100},(_,i)=>i+1);
+    check(nextUnvisited({visited:receipts,total:125,nextPageAvailable:true}) === 101, 'Normal pagination continues beyond 100 pages');
+    check(nextUnvisited({visited:[1,2,3,4,5],total:5,nextPageAvailable:true}) === 6, 'Moving numeric pager window continues to page 6');
+    check(!hasTerminalCoverage({visited:receipts,total:100}), 'Unproven numeric endpoint cannot claim complete coverage');
+    check(hasTerminalCoverage({visited:[1,2,3],terminalPage:3,terminalReason:'disabled-next'}), 'Complete acknowledged range plus terminal proof succeeds');
+    check(!hasTerminalCoverage({visited:[1,3],terminalPage:3,terminalReason:'disabled-next'}), 'Missing interior page prevents completion');
+    const pager = document.querySelector('nav');
+    pager.innerHTML = '<ul><li><a href="#" role="button" aria-label="Previous Page">Previous</a></li>' +
+      '<li><a href="#" role="button" data-automation-id="page-number" aria-label="Go to Page 1">1</a></li>' +
+      '<li><div>...</div></li><li><a href="#" role="button" aria-label="Go to Page 22">22</a></li>' +
+      '<li><a href="#" role="button" aria-label="Go to Page 23">23</a></li>' +
+      '<li><a href="#" role="button" aria-label="Go to Page 24">24</a></li><li><div>25</div></li></ul>';
+    check(renderedPaginationPage() === 25, 'Captured plain current-page div is recognized without aria-current');
+    check(paginationNextState(25) === 'omitted', 'Captured omitted-Next terminal supplies corroborated end evidence');
+    check(paginationNextState(85) === 'unknown', 'Requested page 85 cannot masquerade as rendered page 25');
+    check(!stableTerminalPager(25, 0), 'Terminal proof waits for a separate stable observation');
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    check(stableTerminalPager(25, 0), 'Stable terminal proof confirms without a network request');
+    const next = document.createElement('button'); next.setAttribute('aria-label', 'Next Page');
+    next.style.display = 'none'; pager.querySelector('ul').append(next);
+    check(paginationNextState(25) === 'unknown', 'A hidden Next does not supply omitted-Next completion');
+    next.style.display = 'block';
+    check(paginationNextState(25) === 'enabled', 'Newly hydrated Next invalidates the terminal evidence');
+    next.remove();
+    const later = document.createElement('a'); later.setAttribute('aria-label', 'Go to Page 35');
+    later.href = '#'; later.textContent = '35'; pager.querySelector('ul').append(later);
+    check(paginationNextState(25) === 'unknown', 'A visible higher page prevents premature completion');
+    result.textContent = `PASS: all ${passed} browser checks`;
+  } catch(error) { result.textContent = 'FAIL: ' + error.message; console.error(error); }
+  finally { stopObserver(); cancelPageWork(); clearInterval(rolePollTimer); }
+})();
+</script>

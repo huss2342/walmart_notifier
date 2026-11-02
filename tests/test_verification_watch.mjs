@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
 
-const source = ['page-controls.js', 'verification-watch.js'].map(name =>
+const source = ['verification-observation.js', 'page-controls.js', 'verification-watch.js'].map(name =>
   fs.readFileSync(new URL(`../extension/${name}`, import.meta.url), 'utf8')).join('\n');
 
 function watch(pathname = '/ip/example/123', text = 'Robot or human? Press & Hold', responses = []) {
@@ -93,6 +93,6 @@ test('manifest loads passive controls before scanner code and covers all Walmart
   const watcher = manifest.content_scripts.find(script => script.js.includes('verification-watch.js'));
   assert.ok(watcher.matches.includes('https://www.walmart.com/*'));
   assert.equal(watcher.run_at, 'document_start');
-  assert.deepEqual(watcher.js, ['page-controls.js', 'verification-watch.js']);
+  assert.deepEqual(watcher.js, ['verification-observation.js', 'page-controls.js', 'verification-watch.js']);
   assert.equal(manifest.content_scripts.filter(script => script.js.includes('page-controls.js')).length, 1);
 });

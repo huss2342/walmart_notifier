@@ -5,6 +5,7 @@ const ITEM_LINK = 'a[href*="/ip/"]';
 const DEFAULT_PATH_PATTERN = '^/reviews/claim-product';
 const VALUE_RE = /Valued\s*at\s*\$\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)/i;
 const VALUE_GLOBAL_RE = /Valued\s*at/gi;
+const FREE_OFFER_RE = /(?:^|[\r\n])\s*Free\s*(?:\(\s*)?Valued\s*at\b/i;
 const OUT_OF_STOCK_RE = /\bout of stock\b/i;
 const CLAIMS_RE = /Free items remaining\s*(\d+)\s*item/i;
 const BADGE_RE =
@@ -20,9 +21,13 @@ const NATIVE_START_TIMEOUT_MS = 5_000;
 const NATIVE_NAVIGATION_BACKOFF_MS = 60_000;
 const RESULTS_DOCUMENT_ID = Date.now();
 let lastReadyResultsPage = null;
+let terminalPagerObservation = null;
+let focusWait = null;
+let pendingFocusRetry = null;
 const EMPTY_POLL_MS = 2_000;
 const END_OF_RESULTS_RE = /no search results/i;
-const HARD_PAGE_CAP = 100;
+const UNPROVEN_PAGE_LIMIT = 100;
+const MAX_PAGE_NUMBER = 100_000;
 const EMPTY_END_CONFIRMATIONS = 3;
 const EMPTY_END_CONFIRM_MS = 2_000;
 const INGEST_RETRY_DELAYS_MS = [2_000, 5_000, 15_000, 30_000, 60_000];
@@ -93,13 +98,8 @@ for (const evt of ['pointerdown', 'click', 'keydown', 'wheel', 'touchstart', 'sc
   interactionListeners.push([evt, listener]);
 }
 
-const role = {
-  active: false,
-  tabId: null,
-  primaryTabId: null,
-  generation: 0,
-  auxiliary: null
-};
+const documentSession = ReviewerDocumentSession.create({ href: () => location.href });
+const role = documentSession.role;
 let phase = 'passive';
 let lastActivityAt = 0;
 let relayTimer = null;
@@ -111,6 +111,12 @@ let ingestRetryAttempt = 0;
 let roleRequestInFlight = false;
 let verificationObserved = false;
 let verificationReported = false;
+let trafficWaitStartedAt = null;
+let trafficWaitTimer = null;
+let trafficNavigation = null;
+let trafficDocumentRecovered = false;
+let navigationRecoveryRevision = 0;
+const TRAFFIC_POLL_MS = 10_000;
 let sharedVerificationPaused = false;
 let sharedVerificationRevision = 0;
 let nextActionAt = 0;
@@ -130,16 +136,21 @@ let pagerPauseResolve = null;
 let pagerFocusTimer = null;
 let pagerFocusEpoch = 0;
 const focusRequests = new Set();
-let resultsScrollController = null;
-let resultsScrollStarted = null;
-let resultsScrollCompleted = null;
-let resultsScrollProof = null;
-let resultsIntakeKey = null;
-let resultsScrollAttemptKey = null;
-let resultsScrollWorkMs = 0;
-let resultsScrollFailures = 0;
+let lastSelectionUntil = 0;
+let lastSelectionLeaseId = null;
+const revokedSelectionLeases = new Set();
 const onScrollVisibilityChange = () => {
-  if (document.visibilityState !== 'visible') cancelResultsScroll();
+  if (document.visibilityState === 'visible') return;
+  const controller = documentSession.reading.controller;
+  if (!controller) return;
+  // An occluded window can hide its selected tab. Check tab ownership instead
+  // of mistaking that for a user selecting a different tab.
+  documentSession.request(() => sendToWorker({ type: 'reviewer:selection-check',
+    generation: role.generation }), 3_000).then(reply => {
+    if (documentSession.reading.controller === controller && reply?.selected !== true) controller.abort();
+  }).catch(() => {
+    if (documentSession.reading.controller === controller) controller.abort();
+  });
 };
 document.addEventListener('visibilitychange', onScrollVisibilityChange, true);
 interactionListeners.push(['visibilitychange', onScrollVisibilityChange]);
@@ -156,10 +167,43 @@ const EMPTY_BOUNDARY_TTL_MS = 10 * 60_000;
 const endConfirmationsInDocument = new Map();
 const attemptedAuxiliarySelections = new Set();
 
+// The observer consumes a small explicit interface; it no longer reaches into
+// content-script globals or owns a second competing intake lock.
+const visibleObservation = ReviewerLiveObserver.create({ session: documentSession,
+  canObserve: canObserveVisible,
+  canRun: () => !checkVerification() && isCurrent() && keepMonitoringScope(),
+  ready: async generation => await isReviewerPage() && isCurrent(generation),
+  current: isCurrent, collect: excluded => collect(excluded, true),
+  send: message => sendDocumentMessage({ ...message, intakePhase: 'live' }), acknowledgeRole: applyAckRole,
+  diagnostic, page: currentPage, acquire: beginDocumentRelay, release: endDocumentRelay });
+const acknowledgedVisibleIds = documentSession.visible.acknowledgedIds;
+function rememberAcknowledged(items) { visibleObservation.remember(items); }
+function cancelVisibleObservation() { visibleObservation.cancel(); }
+function resetVisibleObservations() { visibleObservation.reset(); }
+function scheduleVisibleObservation(delayMs) { visibleObservation.schedule(delayMs); }
+function observeVisibleUpdate() { return visibleObservation.observe(); }
+function canObserveVisible() {
+  // An unbound facet still displays its parent's cards.
+  return !role.auxiliary?.selection &&
+    (phase === 'complete' || phase === 'waiting-navigation') && !navigationPending;
+}
+function beginDocumentRelay() {
+  if (relaying) return null;
+  const operation = documentSession.begin();
+  if (operation) relaying = true;
+  return operation;
+}
+function endDocumentRelay(operation) {
+  if (documentSession.finish(operation)) relaying = false;
+}
+function revokeDocumentWork() { documentSession.revoke(); relaying = false; }
+
 function stopInvalidatedContext() {
   if (contextInvalidated) return;
   contextInvalidated = true;
   role.active = false;
+  documentSession.dispose();
+  relaying = false;
   cancelPageWork();
   stopObserver();
   verificationObserver?.disconnect();
@@ -205,13 +249,110 @@ async function extensionCall(invoke) {
 }
 
 const sendToWorker = message => extensionCall(() => chrome.runtime.sendMessage(message));
+const sendDocumentMessage = message => documentSession.request(() => sendToWorker({ ...message,
+  documentId: RESULTS_DOCUMENT_ID }),
+  message.type === 'reviewer:page'
+    ? 30_000 + Math.max(1, Math.ceil((message.items?.length || 0) / 200)) * 15_000
+    : 15_000);
 const readLocal = async keys => await extensionCall(() => chrome.storage.local.get(keys)) || {};
 const writeLocal = values => extensionCall(() => chrome.storage.local.set(values));
 const removeLocal = keys => extensionCall(() => chrome.storage.local.remove(keys));
 
 function diagnostic(event, details = {}) {
   sendToWorker({ type: 'reviewer:diagnostic', event,
-    details: { ...details, page: currentPage(), generation: role.generation } }).catch(() => {});
+    details: { ...details, page: currentPage(), generation: role.generation, documentId: RESULTS_DOCUMENT_ID,
+      lane: role.auxiliary?.lane || 'home',
+      ...Object.fromEntries(['round', 'targetIndex', 'attempt'].filter(k => Number.isSafeInteger(role.auxiliary?.[k]))
+        .map(k => [k, role.auxiliary[k]])) } }).catch(() => {});
+}
+
+// Local diagnostic evidence only. Never export text, paths, resource addresses,
+// account details or request/response bodies, and never make a network request.
+let pageStateContext = '';
+let pageStateEmptyContext = null;
+let auxiliaryEmptyObservation = null;
+let auxiliaryReadinessWaitSince = 0;
+let auxiliaryReadinessWaitKey = '';
+let auxiliaryRenderWait = null;
+const pageStateHistory = new Map();
+const PAGE_STATE_STAGES = new Set(['empty-observed', 'empty-confirmation', 'fallback',
+  'unusable', 'zero-page-complete', 'recovered']);
+
+function pageStateEvidence(sweep = null) {
+  const count = (value, maximum = 10_000) => Math.min(maximum, Math.max(0,
+    Number.isFinite(value) ? Math.floor(value) : 0));
+  const visible = node => {
+    if (!node || node.hidden || node.getAttribute?.('aria-hidden') === 'true') return false;
+    const style = getComputedStyle(node);
+    return style.display !== 'none' && !['hidden', 'collapse'].includes(style.visibility) &&
+      (!node.getClientRects || node.getClientRects().length > 0);
+  };
+  const main = document.querySelector('main, [role="main"], #maincontent') || document.body;
+  const text = main?.innerText || '';
+  const all = selector => Array.from(document.querySelectorAll(selector)).slice(0, 10_000);
+  const mode = sweep ? sweepRecordMode(sweep) : currentSweepMode;
+  const queries = sweepQueries(mode);
+  const query = String(sweep?.query || new URL(location.href).searchParams.get('queryNups') ||
+    new URL(location.href).searchParams.get('q') || '').toLocaleLowerCase('en-US');
+  const navigation = typeof performance !== 'undefined' && performance?.getEntriesByType
+    ? performance.getEntriesByType('navigation')[0] : null;
+  const resources = typeof performance !== 'undefined' && performance?.getEntriesByType
+    ? performance.getEntriesByType('resource').slice(-1000) : [];
+  const responseStatus = Number(navigation?.responseStatus);
+  return {
+    readyState: ['loading', 'interactive', 'complete'].includes(document.readyState) ? document.readyState : 'unknown',
+    visibility: ['visible', 'hidden', 'prerender'].includes(document.visibilityState) ? document.visibilityState : 'unknown',
+    route: onReviewerRoute() ? 'reviewer' : /\/(?:login|signin|auth)(?:\/|$)/i.test(location.pathname) ? 'auth' : 'other',
+    reviewerShell: all('h1').some(node => visible(node) && /^recognized reviewer$/i.test(node.textContent?.trim() || '')),
+    resultsLabel: visible(document.querySelector('#claim-product-result-label')),
+    noResults: END_OF_RESULTS_RE.test(text),
+    loading: all('[aria-busy="true"], [role="progressbar"], [data-testid="loading"], [data-testid="spinner"]').some(visible),
+    error: /something went wrong|trouble loading|temporarily unavailable|service unavailable|technical difficulties/i.test(text),
+    signIn: all('input[type="password"]').some(visible),
+    productLinks: count(all(ITEM_LINK).length),
+    offerLines: count((text.match(VALUE_GLOBAL_RE) || []).length),
+    pagerPresent: Boolean(pageControlRoot()),
+    renderedPage: count(renderedPaginationPage() || 0, MAX_PAGE_NUMBER),
+    navigationType: ['navigate', 'reload', 'back_forward'].includes(navigation?.type) ? navigation.type : 'unknown',
+    responseStatus: Number.isInteger(responseStatus) && responseStatus >= 100 && responseStatus <= 599 ? responseStatus : 0,
+    failedRequests: count(resources.filter(entry => {
+      if (!['fetch', 'xmlhttprequest'].includes(entry.initiatorType) || !(entry.responseStatus >= 400 && entry.responseStatus <= 599)) return false;
+      try { return new URL(entry.name, location.href).origin === location.origin; } catch { return false; }
+    }).length),
+    readingFailures: count(documentSession.reading.failures),
+    readingWorkMs: count(documentSession.reading.workMs, 1e15),
+    queryIndex: queries.findIndex(value => value.toLocaleLowerCase('en-US') === query) + 1,
+    queryCount: count(queries.length)
+  };
+}
+
+function recordPageState(stage, details = {}) {
+  try {
+    if (!isCurrent() || !PAGE_STATE_STAGES.has(stage)) return;
+    const context = `${role.generation}:${location.href}`;
+    if (context !== pageStateContext) {
+      pageStateContext = context;
+      pageStateHistory.clear();
+    }
+    if (stage === 'empty-observed' || stage === 'empty-confirmation') pageStateEmptyContext = context;
+    const now = Date.now();
+    const previous = pageStateHistory.get(stage);
+    // At most one event per stage per ten seconds, including changing spinners.
+    if (previous && now >= previous.at && now - previous.at < 10_000) return;
+    const state = pageStateEvidence(details.sweep);
+    const attempt = Number.isSafeInteger(details.attempt) && details.attempt >= 0 ? details.attempt : 0;
+    const signature = JSON.stringify({ state, attempt });
+    if (previous?.signature === signature && now >= previous.at && now - previous.at < 60_000) return;
+    pageStateHistory.set(stage, { at: now, signature });
+    if (stage === 'recovered') pageStateEmptyContext = null;
+    const sweep = details.sweep;
+    diagnostic('page-state', { stage, state, lane: role.auxiliary?.lane || 'home',
+      documentId: RESULTS_DOCUMENT_ID, attempt,
+      elapsedMs: emptySince ? Math.max(0, now - emptySince) : 0,
+      items: Number.isSafeInteger(details.items) && details.items >= 0 ? details.items : 0,
+      pages: (Number(sweep?.completedPages) || 0) + new Set(sweep?.visited || []).size,
+      mode: sweep ? sweepRecordMode(sweep) : currentSweepMode });
+  } catch { /* Diagnostic failure must never change intake, navigation or recovery. */ }
 }
 
 // A challenge applies to the shared session, including passive tabs. Cached
@@ -224,6 +365,7 @@ function checkVerification() {
     verificationReported = false;
     return false;
   }
+  revokeDocumentWork();
   confirmedEmptyBoundary = null;
   cancelPageWork();
   stopObserver();
@@ -237,15 +379,80 @@ function checkVerification() {
   return true;
 }
 
+function highTrafficPresent() {
+  if (!onReviewerRoute() || !document.body) return false;
+  const text = (document.body.innerText || '').replace(/\s+/g, ' ').trim();
+  if (!/high traffic is slowing things down a bit\b/i.test(text) ||
+      !/we['’]ll load this page when it['’]s ready\b/i.test(text)) return false;
+  const heading = [...document.querySelectorAll('h1, h2, [role="heading"]')].some(node => {
+    if (!/^hold tight for a moment$/i.test((node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim())) return false;
+    const style = getComputedStyle(node);
+    return !node.hidden && style.display !== 'none' && !['hidden', 'collapse'].includes(style.visibility) &&
+      (!node.getClientRects || node.getClientRects().length > 0);
+  });
+  return heading || /^hold tight for a moment\b/i.test(text);
+}
+
+// This is a server-requested wait, separate from verification and ordinary
+// missing results. Check only the DOM; the fallback timer makes no requests.
+function waitForTraffic() {
+  if (!extensionAvailable()) return true;
+  if (!role.active || sharedVerificationPaused || verificationObserved) return false;
+  if (highTrafficPresent()) {
+    if (trafficWaitStartedAt === null) {
+      const pending = navigationPending && trafficNavigation?.generation === role.generation
+        ? { continuation: trafficNavigation, target: navigationTarget } : null;
+      revokeDocumentWork();
+      cancelPageWork();
+      stopObserver();
+      if (pending) {
+        trafficNavigation = pending.continuation;
+        navigationPending = true;
+        navigationTarget = pending.target;
+      }
+      trafficWaitStartedAt = Date.now();
+      diagnostic('traffic-wait', { documentId: RESULTS_DOCUMENT_ID });
+    }
+    phase = 'waiting-traffic';
+    lastActivityAt = Date.now();
+    nextActionAt = Date.now() + TRAFFIC_POLL_MS;
+    if (!trafficWaitTimer) trafficWaitTimer = setTimeout(() => {
+      trafficWaitTimer = null;
+      if (!checkVerification()) waitForTraffic();
+    }, TRAFFIC_POLL_MS);
+    return true;
+  }
+  if (trafficWaitStartedAt === null) return false;
+  const durationMs = Math.max(0, Date.now() - trafficWaitStartedAt);
+  clearTimeout(trafficWaitTimer);
+  trafficWaitTimer = null;
+  trafficWaitStartedAt = null;
+  trafficDocumentRecovered = true;
+  emptySince = 0;
+  lastActivityAt = Date.now();
+  nextActionAt = 0;
+  diagnostic('traffic-resumed', { documentId: RESULTS_DOCUMENT_ID, durationMs });
+  if (navigationPending && trafficNavigation?.generation === role.generation) {
+    trafficNavigation.resume(durationMs);
+  } else {
+    phase = 'starting';
+    startObserver();
+    scheduleRelay(0, true);
+  }
+  return true;
+}
+
 function isCurrent(generation = role.generation) {
   return extensionAvailable() && role.active && !sharedVerificationPaused &&
-    !verificationObserved && role.generation === generation;
+    !verificationObserved && trafficWaitStartedAt === null && !highTrafficPresent() &&
+    role.generation === generation;
 }
 
 function setSharedVerificationPause(paused) {
   sharedVerificationRevision += 1;
   sharedVerificationPaused = paused;
   if (!paused) return;
+  revokeDocumentWork();
   cancelPageWork();
   stopObserver();
   phase = 'waiting-verification';
@@ -278,20 +485,60 @@ function sweepingNow() {
 }
 
 function onReviewerMessage(msg, _sender, sendResponse) {
+  if (msg?.type === 'reviewer:selection-revoked') {
+    if (isCurrent(msg.generation) && typeof msg.leaseId === 'string') {
+      revokedSelectionLeases.add(msg.leaseId);
+      // Requests expire within seconds; retain far more identities than can
+      // be issued during that window, without growing for a long-lived page.
+      if (revokedSelectionLeases.size > 128) revokedSelectionLeases.delete(revokedSelectionLeases.values().next().value);
+    }
+    const matchesLease = typeof msg.leaseId === 'string' ? msg.leaseId === lastSelectionLeaseId
+      : !Number.isFinite(msg.leaseUntil) || msg.leaseUntil >= lastSelectionUntil;
+    if (isCurrent(msg.generation) && matchesLease) {
+      if (auxiliaryRenderWait?.grant?.granted) {
+        auxiliaryRenderWait.grant.until = Math.min(auxiliaryRenderWait.grant.until, Date.now());
+      }
+      cancelResultsScroll();
+      cancelFocusPreparation();
+      cancelPageControlScroll();
+    }
+    sendResponse({ ok: true });
+    return undefined;
+  }
   if (!extensionAvailable()) return undefined;
   if (msg?.type === 'reviewer:pause') {
     setSharedVerificationPause(true);
     sendResponse({ ok: true });
     return undefined;
   }
+  if (msg?.type === 'reviewer:focus-available') {
+    if (msg.generation === role.generation && isCurrent() && !checkVerification() && keepMonitoringScope()) {
+      const retry = pendingFocusRetry;
+      if (retry && documentSession.current(retry.token) && ['waiting-focus', 'waiting-user'].includes(phase)) {
+        clearTimeout(actionTimer);
+        actionTimer = setTimeout(retry.attempt, 0);
+        nextActionAt = Date.now();
+      } else if (!actionTimer && phase === 'waiting-focus') {
+        // Reading and initial rendering retry through relay(), not a queued
+        // page action. Both paths must request fresh authority after this hint.
+        scheduleRelay(0, true);
+      }
+    }
+    sendResponse({ ok: true });
+    return undefined;
+  }
   if (msg?.type === 'reviewer:probe') {
     const botCheck = checkVerification();
+    if (!botCheck) waitForTraffic();
+    const highTraffic = highTrafficPresent();
     sendResponse({
       ready: true,
       botCheck,
-      reviewerReady: !botCheck && (collect().length > 0 || atEndOfResults()),
+      highTraffic,
+      reviewerReady: !botCheck && !highTraffic && (collect().length > 0 || atEndOfResults()),
       active: role.active,
       generation: role.generation,
+      documentId: RESULTS_DOCUMENT_ID,
       phase,
       busy: Date.now() - lastInteraction < INTERACTION_GRACE_MS,
       visibility: document.visibilityState,
@@ -416,8 +663,8 @@ function cardFor(anchor) {
       const id = idFromHref(link.getAttribute('href') || '');
       if (!id) continue;
       ids.add(id);
-      const label = (link.getAttribute('aria-label') || '').trim();
-      links.push({ id, label });
+      const label = (link.getAttribute('aria-label') || link.querySelector('img')?.getAttribute('alt') || '').trim();
+      links.push({ id, label, anchor: link });
       const primary = label.match(/^view item for\s+(\S.*)$/i);
       if (primary) {
         primaryIds.add(id);
@@ -425,9 +672,26 @@ function cardFor(anchor) {
       }
     }
     // One price alone may belong to a sibling whose neighbor has no value.
-    // Accept variants only through Walmart's observed explicit relationship,
-    // never because another product happens to lack a primary action.
+    // Keep the primary card's evidence only when every other ID is an explicit
+    // variant of that primary. Variant links are never independent candidates.
     if (ids.size > 1) {
+      if (!primaryIds.size && node.getAttribute?.('role') === 'group') {
+        // Out-of-stock cards can omit View item. Only that unmarked group
+        // needs this fallback; ordinary marked cards do no extra DOM work.
+        // A swatch heading cannot establish a selected primary.
+        const headingIds = new Set();
+        const headingTitles = new Set();
+        for (const { id, label, anchor: link } of links) {
+          if (/^.+,\s*variant on\s+\S/i.test(label)) continue;
+          const headings = [...(link.querySelectorAll?.('h3') || [])];
+          const title = headings.length === 1 ? normalized(headings[0].innerText || headings[0].textContent || '') : '';
+          if (title) { headingIds.add(id); headingTitles.add(title); }
+        }
+        if (headingIds.size === 1 && headingIds.has(ownId) && headingTitles.size === 1) {
+          primaryIds.add(ownId);
+          primaryTitles.add([...headingTitles][0]);
+        }
+      }
       if (primaryIds.size !== 1 || !primaryIds.has(ownId) || primaryTitles.size !== 1) return null;
       const [primaryTitle] = primaryTitles;
       for (const { id, label } of links) {
@@ -447,7 +711,7 @@ function cardFor(anchor) {
 function cleanTitle(raw) {
   let title = (raw || '').replace(/\s+/g, ' ').trim();
   title = title.replace(BADGE_RE, '').trim();
-  title = title.replace(/^view item\b/i, '').trim();
+  title = title.replace(/^view item(?:\s+for)?\b/i, '').trim();
   title = title.replace(TRAILING_PRICE_RE, '').trim();
   return title.slice(0, 250);
 }
@@ -518,35 +782,84 @@ function claimsRemaining() {
   return match ? parseInt(match[1], 10) : null;
 }
 
-function collect(excludedIds = null) {
+const CARD_EVIDENCE_SAMPLE_LIMIT = 12;
+let lastCardExtractionSignature = '';
+
+function recordCardExtraction(decisions, items) {
+  const observations = [...decisions.values()];
+  const priority = sample => sample.decision === 'accepted' && sample.valueCents === null ? 0
+    : sample.outOfStock === true ? 1 : sample.decision === 'variant' ? 2
+      : sample.decision === 'card-unavailable' ? 3 : sample.decision !== 'accepted' ? 4 : 5;
+  const lane = ['departments', 'keywords', 'brands', 'priority'].includes(role.auxiliary?.lane)
+    ? role.auxiliary.lane : 'home';
+  const acceptedCount = observations.filter(sample => sample.decision === 'accepted').length;
+  const details = { documentId: RESULTS_DOCUMENT_ID, lane, items,
+    acceptedCount, rejectedCount: observations.length - acceptedCount,
+    variantCount: observations.filter(sample => sample.decision === 'variant').length,
+    outOfStockCount: observations.filter(sample => sample.outOfStock === true).length,
+    missingValueCount: observations.filter(sample => sample.cardFound && sample.valueCents === null).length,
+    samples: observations.sort((left, right) => priority(left) - priority(right))
+      .slice(0, CARD_EVIDENCE_SAMPLE_LIMIT) };
+  const signature = JSON.stringify({ ...details, page: currentPage(), generation: role.generation });
+  if (signature === lastCardExtractionSignature) return;
+  lastCardExtractionSignature = signature;
+  // Only actual extraction paths opt in. Probe/readiness collections stay
+  // silent, and diagnostics never contain titles, URLs, queries or account data.
+  diagnostic('card-extraction', details);
+}
+
+function collect(excludedIds = null, withEvidence = false) {
   let claims;
-  const query = new URLSearchParams(location.search).get('q') || '';
+  const params = new URLSearchParams(location.search);
+  const query = params.get('queryNups') || params.get('q') || '';
   const byId = new Map();
+  const decisions = withEvidence ? new Map() : null;
+  const observe = (id, decision, card = null, free = null, outOfStock = null, value = null) => {
+    if (!decisions || !/^\d{6,20}$/.test(id)) return;
+    const cents = value === null ? null : Math.round(value * 100);
+    decisions.set(id, { itemId: `ip-${id}`, decision, cardFound: Boolean(card), free, outOfStock,
+      valueCents: Number.isSafeInteger(cents) && cents >= 0 && cents <= 1e15 ? cents : null });
+  };
 
   for (const anchor of document.querySelectorAll(ITEM_LINK)) {
     const id = idFromHref(anchor.getAttribute('href') || '');
     if (!id || byId.has(id) || excludedIds?.has(`ip-${id}`)) continue;
+    if (/^.+,\s*variant on\s+\S/i.test(anchor.getAttribute('aria-label') || anchor.querySelector('img')?.getAttribute('alt') || '')) {
+      observe(id, 'variant');
+      continue;
+    }
 
     const card = cardFor(anchor);
+    // A link without its own unambiguous card carries no offer or stock
+    // evidence. In particular, rejected variant links must not default to an
+    // available product just because their sibling's card was found earlier.
+    if (!card) { observe(id, 'card-unavailable'); continue; }
+    const free = FREE_OFFER_RE.test(card.text);
+    const outOfStock = OUT_OF_STOCK_RE.test(card.text);
+    const value = card.text.match(VALUE_RE);
+    const valueUsd = value ? parseFloat(value[1].replace(/,/g, '')) : null;
+    // Read the visible offer line, not a Free shipping label or hidden text.
+    if (!free) { observe(id, 'not-free', card, free, outOfStock, valueUsd); continue; }
     const title = titleFor(anchor, card);
-    if (!title) continue;
+    if (!title) { observe(id, 'missing-title', card, free, outOfStock, valueUsd); continue; }
 
     if (claims === undefined) claims = claimsRemaining();
-    const value = card ? card.text.match(VALUE_RE) : null;
+    observe(id, outOfStock ? 'out-of-stock' : 'accepted', card, free, outOfStock, valueUsd);
     byId.set(id, {
       item_id: `ip-${id}`,
       title,
-      value_usd: value ? parseFloat(value[1].replace(/,/g, '')) : null,
+      value_usd: valueUsd,
       url: new URL(anchor.getAttribute('href'), location.origin).toString().split('?')[0],
       category: categoryFor(anchor, card),
       badge: badgeFor(anchor.innerText),
       image_url: imageFor(anchor, card),
-      available: !(card && OUT_OF_STOCK_RE.test(card.text)),
+      available: !outOfStock,
       source: 'extension',
       claims_remaining: claims,
       query
     });
   }
+  if (decisions) recordCardExtraction(decisions, byId.size);
   return [...byId.values()];
 }
 
@@ -567,7 +880,7 @@ function pageUrl(page) {
 function searchUrl(query) {
   const url = new URL(pageUrl(1));
   url.searchParams.set('q', query);
-  url.searchParams.set('queryNups', '');
+  url.searchParams.set('queryNups', query);
   return url.toString();
 }
 
@@ -588,10 +901,10 @@ function totalPages() {
     const named = aria.match(/^(?:go to\s+)?page\s+(\d+)$/i);
     const text = (node.innerText || node.textContent || '').trim();
     return named ? [Number(named[1])] : /^\d+$/.test(text) ? [Number(text)] : [];
-  }).filter(number => number > 0 && number <= HARD_PAGE_CAP);
+  }).filter(number => Number.isSafeInteger(number) && number > 0 && number <= MAX_PAGE_NUMBER);
   const numbers = (controlNumbers.length ? controlNumbers : (list.innerText.match(/\d+/g) || []))
     .map(Number)
-    .filter((number) => number > 0 && number <= HARD_PAGE_CAP);
+    .filter((number) => Number.isSafeInteger(number) && number > 0 && number <= MAX_PAGE_NUMBER);
   return numbers.length ? Math.max(...numbers) : auxiliarySinglePageHint();
 }
 
@@ -605,7 +918,7 @@ function auxiliarySinglePageHint() {
     const variables = data?.initialSearchQueryVariables;
     const result = data?.initialData?.searchResult;
     const url = new URL(location.href);
-    const query = url.searchParams.get('q') || url.searchParams.get('queryNups') || '';
+    const query = url.searchParams.get('queryNups') || url.searchParams.get('q') || '';
     const category = value => !value || value === '0' ? '' : String(value);
     if (!variables || String(variables.query || '') !== query ||
         category(variables.catId) !== category(url.searchParams.get('catId')) ||
@@ -669,6 +982,7 @@ function deferFacetControls(delayMs = 5_000) {
 
 async function prepareFacetControls(generation) {
   const href = location.href;
+  const epoch = pagerFocusEpoch;
   if (!auxiliaryCanAct(generation)) {
     lastFacetFocusReason = Date.now() - lastInteraction < INTERACTION_GRACE_MS ? 'user-active' : 'not-authorized';
     if (isCurrent(generation) && !verificationObserved) deferFacetControls();
@@ -680,17 +994,17 @@ async function prepareFacetControls(generation) {
     if (isCurrent(generation) && !verificationObserved) deferFacetControls();
     return null;
   }
-  // Hidden documents can suspend the frames needed to mount their popovers.
-  // Wait for a reading turn instead of exhausting otherwise valid targets.
-  if ((grant?.enabled && !grant.granted) || document.visibilityState !== 'visible' ||
+  // Worker grants confirm selected-tab ownership independently of OS focus.
+  if (!grant || (grant.enabled !== false && !grant.granted) ||
+      (grant.enabled === false && grant.reason !== 'disabled') ||
       (Number.isFinite(grant?.until) && grant.until - Date.now() < 8_000)) {
-    lastFacetFocusReason = grant?.enabled && !grant.granted ? grant.reason || 'unknown'
-      : document.visibilityState !== 'visible' ? 'hidden' : 'short-lease';
+    lastFacetFocusReason = !grant ? 'unavailable' : !grant.granted && grant.reason !== 'disabled'
+      ? grant.reason || 'unknown' : 'short-lease';
     deferFacetControls();
     return null;
   }
   lastFacetFocusReason = 'none';
-  return () => auxiliaryCanAct(generation) && document.visibilityState === 'visible' &&
+  return () => auxiliaryCanAct(generation) && epoch === pagerFocusEpoch &&
     location.href === href &&
     (!Number.isFinite(grant?.until) || Date.now() < grant.until - 100);
 }
@@ -744,7 +1058,7 @@ async function discoverAuxiliaryTargets(generation) {
     return await writeSweep({ ...sweep, discoveryDone: true, discoveredDepartments }, generation);
   } catch (error) {
     if (isCurrent(generation) && !checkVerification()) {
-      if (error?.code === 'cancelled' || document.visibilityState !== 'visible' ||
+      if (error?.code === 'cancelled' || !canAct() ||
           Date.now() - lastInteraction < INTERACTION_GRACE_MS) {
         deferFacetControls();
       } else {
@@ -778,6 +1092,61 @@ async function selectAuxiliaryTarget(generation) {
   navigationPending = true;
   phase = 'waiting-target-change';
   lastNavigationAt = startedAt;
+  let trafficPausedMs = 0;
+  let selectionInFlight = true;
+  let selectionIssued = false;
+  const poll = async () => {
+    if (checkVerification() || waitForTraffic() || !isCurrent(generation)) return;
+    if (lastInteraction > startedAt) {
+      navigationPending = false;
+      phase = 'waiting-user';
+      scheduleRelay(INTERACTION_GRACE_MS, true);
+      return;
+    }
+    const changedUrl = auxiliaryScopeUrl(location.href) !== auxiliaryScopeUrl(selection.parentUrl);
+    const items = collect();
+    if (changedUrl && ((items.length && itemSignature() !== previous) ||
+        (!items.length && atEndOfResults()))) {
+      const token = documentSession.capture();
+      try {
+        const reply = await sendToWorker({ type: 'reviewer:aux-selected', generation, url: location.href });
+        if (!documentSession.current(token) || !isCurrent(generation)) return;
+        applyAckRole(reply);
+        if (!reply?.ok) throw new Error(reply?.error || 'Could not authorize selected filter');
+        navigationPending = false;
+        if (isCurrent(generation)) scheduleRelay(0, true);
+      } catch (error) {
+        if (!documentSession.current(token) || !isCurrent(generation)) return;
+        navigationPending = false;
+        if (isCurrent(generation)) await reportUnusable(error?.message || String(error), generation);
+      }
+      return;
+    }
+    if (Date.now() - startedAt - trafficPausedMs >= EMPTY_PAGE_TIMEOUT_MS) {
+      navigationPending = false;
+      await reportUnusable('Selected filter did not produce a fresh results page within 30 seconds', generation);
+      return;
+    }
+    actionTimer = setTimeout(() => { actionTimer = null; poll().catch(() => scheduleRelay(5_000, true)); }, 500);
+    nextActionAt = Date.now() + 500;
+    lastActivityAt = Date.now();
+  };
+  const continuation = trafficNavigation = { generation, resume(durationMs) {
+    trafficPausedMs += durationMs;
+    phase = 'waiting-target-change';
+    if (selectionInFlight) return;
+    if (!selectionIssued) {
+      attemptedAuxiliarySelections.delete(`${generation}:${role.auxiliary.targetKey}`);
+      navigationPending = false;
+      trafficNavigation = null;
+      phase = 'starting';
+      startObserver();
+      scheduleRelay(0, true);
+      return;
+    }
+    actionTimer = setTimeout(() => { actionTimer = null; poll().catch(() => scheduleRelay(5_000, true)); }, 0);
+    nextActionAt = Date.now();
+  } };
   try {
     const result = await ReviewerFacetControls.select({ document, selection,
       canAct,
@@ -793,6 +1162,7 @@ async function selectAuxiliaryTarget(generation) {
         expectedFacetInput = expected;
         let reply;
         try {
+          selectionIssued = true;
           reply = await sendToWorker({ type: 'reviewer:facet-input', generation,
             selection: { kind: selection.kind, label: selection.label, parentUrl: selection.parentUrl } });
           return reply;
@@ -807,51 +1177,99 @@ async function selectAuxiliaryTarget(generation) {
         }
       },
       pause: ms => new Promise(resolve => setTimeout(resolve, ms)) });
-    if (!isCurrent(generation)) return;
+    selectionInFlight = false;
+    if (result?.ok) selectionIssued = true;
+    if (waitForTraffic() || !isCurrent(generation)) return;
     if (!result?.ok) throw new Error(result?.reason || 'Filter is no longer available');
   } catch (error) {
+    selectionInFlight = false;
+    if (waitForTraffic()) return;
     navigationPending = false;
+    if (trafficNavigation === continuation) trafficNavigation = null;
     if (isCurrent(generation) && !checkVerification()) {
-      if (error?.message === 'cancelled' || document.visibilityState !== 'visible' ||
+      if (error?.message === 'cancelled' || !canAct() ||
           Date.now() - lastInteraction < INTERACTION_GRACE_MS) deferFacetControls();
       else await reportUnusable(`Filter selection failed: ${error?.message || String(error)}`, generation);
     }
     return;
   }
-  const poll = async () => {
-    if (!isCurrent(generation) || checkVerification()) return;
-    if (lastInteraction > startedAt) {
-      navigationPending = false;
-      phase = 'waiting-user';
-      scheduleRelay(INTERACTION_GRACE_MS, true);
-      return;
-    }
-    const changedUrl = auxiliaryScopeUrl(location.href) !== auxiliaryScopeUrl(selection.parentUrl);
-    const items = collect();
-    if (changedUrl && ((items.length && itemSignature() !== previous) ||
-        (!items.length && atEndOfResults()))) {
-      try {
-        const reply = await sendToWorker({ type: 'reviewer:aux-selected', generation, url: location.href });
-        applyAckRole(reply);
-        if (!reply?.ok) throw new Error(reply?.error || 'Could not authorize selected filter');
-        navigationPending = false;
-        if (isCurrent(generation)) scheduleRelay(0, true);
-      } catch (error) {
-        navigationPending = false;
-        if (isCurrent(generation)) await reportUnusable(error?.message || String(error), generation);
-      }
-      return;
-    }
-    if (Date.now() - startedAt >= EMPTY_PAGE_TIMEOUT_MS) {
-      navigationPending = false;
-      await reportUnusable('Selected filter did not produce a fresh results page within 30 seconds', generation);
-      return;
-    }
-    actionTimer = setTimeout(() => { actionTimer = null; poll().catch(() => scheduleRelay(5_000, true)); }, 500);
-    nextActionAt = Date.now() + 500;
-    lastActivityAt = Date.now();
-  };
+
   await poll();
+}
+
+function resetAuxiliaryRenderWait() {
+  const previous = auxiliaryRenderWait;
+  auxiliaryRenderWait = null;
+  if (previous?.grant?.granted) {
+    releasePreparationFocus(previous.grant, previous.generation, previous.at, 'page-navigation').catch(() => {});
+  }
+}
+
+// Count actual selected-tab rendering opportunity, rather than time spent
+// queued behind other scanners or yielding to input. A separate opportunity
+// deadline still bounds a document that never obtains a usable turn.
+async function waitForAuxiliaryRender(generation, reason) {
+  if (!isCurrent(generation) || checkVerification()) return false;
+  const now = Date.now();
+  const key = `${generation}:${location.href}`;
+  if (auxiliaryRenderWait?.key !== key) {
+    resetAuxiliaryRenderWait();
+    auxiliaryRenderWait = { key, generation, startedAt: now, at: now, workMs: 0, grant: null, visible: false };
+  }
+  const wait = auxiliaryRenderWait;
+  const inputAt = lastInteraction > wait.at ? lastInteraction : now;
+  const until = wait.grant?.granted ? wait.grant.until
+    : wait.visible && document.visibilityState === 'visible' ? now : wait.at;
+  wait.workMs += Math.max(0, Math.min(now, inputAt, until) - wait.at);
+  wait.at = now;
+  const idleIn = INTERACTION_GRACE_MS - (now - lastInteraction);
+  if (idleIn > 0) {
+    wait.startedAt = now + Math.max(0, idleIn);
+    if (wait.grant?.granted) await releasePreparationFocus(wait.grant, generation, now, 'page-navigation');
+    if (!isCurrent(generation) || auxiliaryRenderWait !== wait || checkVerification()) return false;
+    wait.grant = null;
+    wait.visible = false;
+    phase = 'waiting-user';
+    lastActivityAt = now;
+    if (!verificationObserved) scheduleRelay(Math.max(1_000, idleIn), true);
+    return false;
+  }
+  if (wait.workMs >= EMPTY_PAGE_TIMEOUT_MS || now - wait.startedAt >= 300_000) {
+    const failureCode = wait.workMs >= EMPTY_PAGE_TIMEOUT_MS ? 'render-timeout' : 'render-opportunity-timeout';
+    resetAuxiliaryRenderWait();
+    await reportUnusable(reason, generation, false, { failureCode });
+    return false;
+  }
+  if (!wait.grant?.granted || wait.grant.until <= now) {
+    if (wait.grant?.granted) await releasePreparationFocus(wait.grant, generation, now, 'page-navigation');
+    if (!isCurrent(generation) || auxiliaryRenderWait !== wait || checkVerification()) return false;
+    wait.grant = null;
+    phase = 'waiting-focus';
+    const grant = await requestPreparationFocus(generation, now + 3_000, 'page-navigation');
+    if (!isCurrent(generation) || auxiliaryRenderWait !== wait || checkVerification()) {
+      await releasePreparationFocus(grant, generation, Date.now(), 'page-navigation');
+      return false;
+    }
+    wait.at = Date.now();
+    wait.grant = grant;
+    wait.visible = grant?.enabled === false && grant.reason === 'disabled' && document.visibilityState === 'visible';
+    if (Date.now() - lastInteraction < INTERACTION_GRACE_MS) return waitForAuxiliaryRender(generation, reason);
+    lastFacetFocusReason = grant?.granted ? 'none' : grant?.reason || 'unavailable';
+  }
+  phase = wait.grant?.granted || wait.visible ? 'waiting-content' : 'waiting-focus';
+  lastActivityAt = Date.now();
+  scheduleRelay(wait.grant?.granted ? Math.max(100, Math.min(EMPTY_POLL_MS, wait.grant.until - Date.now()))
+    : Math.max(1_000, Math.min(5_000, wait.grant?.retryAfterMs || EMPTY_POLL_MS)), true);
+  return false;
+}
+
+function documentHttpFailure() {
+  // Navigation timing describes the full document, not later SPA responses.
+  if (location.href !== initialDocumentHref) return 0;
+  try {
+    const status = performance?.getEntriesByType?.('navigation')[0]?.responseStatus;
+    return Number.isInteger(status) && status >= 400 && status <= 599 ? status : 0;
+  } catch { return 0; }
 }
 
 async function ensureAuxiliaryTarget(generation) {
@@ -872,11 +1290,12 @@ async function ensureAuxiliaryTarget(generation) {
       if (!reply?.ok && isCurrent(generation)) await reportUnusable('The selected filter could not be authorized', generation);
       if (reply?.ok && role.active) scheduleRelay(0, true);
     } else {
+      recordPageState('empty-observed');
+      if (filterMatches) return waitForAuxiliaryRender(generation,
+        'The selected filter document did not render within its active rendering budget');
       if (!emptySince) emptySince = Date.now();
       if (Date.now() - emptySince >= EMPTY_PAGE_TIMEOUT_MS) {
-        await reportUnusable(!filterMatches
-          ? 'The selected filter could not be authorized'
-          : 'The selected filter document did not render within 30 seconds', generation);
+        await reportUnusable('The selected filter could not be authorized', generation);
       } else {
         phase = 'waiting-content';
         scheduleRelay(EMPTY_POLL_MS, true);
@@ -889,16 +1308,12 @@ async function ensureAuxiliaryTarget(generation) {
     (assignment.discoveryOnly || assignment.selection?.url);
   if (!dataNavigation && (assignment.selection || assignment.discoveryOnly || assignment.lane === 'departments')) {
     if (!collect().length && !atEndOfResults()) {
-      if (!emptySince) emptySince = Date.now();
-      if (Date.now() - emptySince >= EMPTY_PAGE_TIMEOUT_MS) {
-        await reportUnusable('Auxiliary target did not render within 30 seconds', generation);
-      } else {
-        phase = 'waiting-content';
-        scheduleRelay(EMPTY_POLL_MS, true);
-      }
-      return false;
+      recordPageState('empty-observed');
+      return waitForAuxiliaryRender(generation,
+        'Auxiliary target did not render within its active rendering budget');
     }
   }
+  if (collect().length || atEndOfResults()) resetAuxiliaryRenderWait();
   if (assignment.selection) {
     const wait = await pageDelayMs();
     if (isCurrent(generation)) queueWhenIdle(() => {
@@ -920,7 +1335,7 @@ async function ensureSweepSearch(generation) {
   if (!isCurrent(generation)) return false;
   if (!sweepQueries(sweepRecordMode(sweep)).length) return keepMonitoringScope();
   const params = new URLSearchParams(location.search);
-  if (params.get('q') === sweep.query && !params.get('queryNups') &&
+  if ((params.get('queryNups') || params.get('q')) === sweep.query &&
       (sweep.visited.length || currentPage() === 1)) return true;
   if (!(await writeSweep(sweep, generation))) return false;
   const wait = await pageDelayMs();
@@ -932,45 +1347,59 @@ async function ensureSweepSearch(generation) {
 
 async function writeSweep(sweep, generation = role.generation) {
   if (!isCurrent(generation)) return false;
+  const token = documentSession.capture();
   const key = sweepStorageKey();
   if (!key) return false;
   await writeLocal({ [key]: { ...sweep, generation } });
-  if (!isCurrent(generation)) return false;
+  if (!isCurrent(generation) || !documentSession.current(token)) return false;
   // Persist the URL and acknowledged progress before a new document/tab can
   // replace this one. The worker validates the current primary lease.
-  const checkpoint = await sendToWorker({ type: 'reviewer:checkpoint', generation });
+  const checkpoint = await sendDocumentMessage({ type: 'reviewer:checkpoint', generation }).catch(() => null);
   if (!checkpoint?.ok) {
-    if (isCurrent(generation)) {
+    if (isCurrent(generation) && documentSession.current(token)) {
       phase = 'relay-retry';
       lastActivityAt = Date.now();
       scheduleRelay(5_000, true);
     }
     return false;
   }
-  return isCurrent(generation);
+  return isCurrent(generation) && documentSession.current(token);
 }
 
 async function removeCurrentSweep(generation, pages) {
   if (!isCurrent(generation)) return;
   const key = sweepStorageKey();
   if (!key) return;
-  const stored = await readLocal([key]);
+  const timingKeys = ['lastSweepDone', 'lastSweepStartedAt', 'lastSweepPages'];
+  const stored = await readLocal([key, ...timingKeys]);
+  if (!completionStillCurrent(stored[key])) return false;
   const auxiliary = role.auxiliary;
+  const restore = async () => {
+    await writeLocal({ [key]: stored[key], ...Object.fromEntries(timingKeys
+      .filter(name => Object.hasOwn(stored, name)).map(name => [name, stored[name]])) });
+    const absent = timingKeys.filter(name => !Object.hasOwn(stored, name));
+    if (absent.length) await removeLocal(absent);
+    if (isCurrent(generation)) scheduleRelay(0, true);
+    return false;
+  };
   // The auxiliary coordinator removes its checkpoint only after accepting
   // completion. A suspended worker must not erase acknowledged page coverage.
   if (!auxiliary && stored[key]?.generation === generation) await removeLocal(key);
   if (!isCurrent(generation)) return;
+  if (!completionStillCurrent(stored[key], false)) return restore();
   if (!role.auxiliary) {
     await writeLocal({
       lastSweepDone: Date.now(),
       lastSweepStartedAt: stored[key]?.startedAt || Date.now(),
       lastSweepPages: pages
     });
+    if (!isCurrent(generation)) return false;
+    if (!completionStillCurrent(stored[key], false)) return restore();
   }
-  const capped = Math.max(totalPages() || 0, stored[key]?.total || 0) >= 25;
-  const coverageLimited = Boolean(auxiliary && !auxiliary.discoveryOnly && capped);
-  const reply = await sendToWorker({ type: 'reviewer:sweep-complete', generation, pages,
-    ...(auxiliary ? { coverageLimited } : {}) }).catch(() => null);
+  const coverageLimited = Boolean(auxiliary && !auxiliary.discoveryOnly &&
+    !hasTerminalCoverage(stored[key]));
+  const reply = await sendDocumentMessage({ type: 'reviewer:sweep-complete', generation, pages,
+    ...(auxiliary ? { coverageLimited, ...(stored[key]?.emptyResult === true ? { emptyResult: true } : {}) } : {}) }).catch(() => null);
   if (auxiliary) {
     applyAckRole(reply);
     if (!reply?.ok && isCurrent(generation)) {
@@ -984,20 +1413,71 @@ async function removeCurrentSweep(generation, pages) {
 
 function nextUnvisited(sweep) {
   const seen = new Set((sweep.visited || []).filter((page) => Number.isInteger(page) && page > 0));
-  if (sweep.total === null || sweep.total === undefined) {
-    const highest = seen.size ? Math.max(...seen) : 0;
-    for (let page = 1; page <= Math.min(highest, HARD_PAGE_CAP); page += 1) {
-      if (!seen.has(page)) return page;
-    }
-    return highest >= HARD_PAGE_CAP ? null : highest + 1;
-  }
-  for (let page = 1; page <= sweep.total; page += 1) {
+  const highest = seen.size ? Math.max(...seen) : 0;
+  const terminal = terminalPage(sweep);
+  const boundary = terminal ?? Math.max(highest, sweep.total || 0);
+  for (let page = 1; page <= Math.min(boundary, MAX_PAGE_NUMBER); page += 1) {
     if (!seen.has(page)) return page;
   }
-  return null;
+  if (terminal !== null) {
+    // Gap recovery can outlive the original tail observation. Revisit that
+    // frontier after filling the gaps so a growing catalogue is checked again.
+    const proofPage = terminal + (sweep.terminalReason === 'confirmed-empty' ? 1 : 0);
+    return sweep.lastObservedPage === proofPage ? null : proofPage;
+  }
+  if (boundary >= MAX_PAGE_NUMBER) return null;
+  // Keep the old safety budget for blind URL probing. Recognized later pages
+  // or a native Next let a real department continue beyond 100. Exhausting
+  // this budget is unresolved coverage, never a successful completion.
+  if (highest >= UNPROVEN_PAGE_LIMIT && !sweep.nextPageAvailable &&
+      !(sweep.total > highest)) return null;
+  return highest + 1;
+}
+
+function terminalPage(sweep) {
+  return Number.isSafeInteger(sweep?.terminalPage) && sweep.terminalPage >= 0 &&
+    sweep.terminalPage <= MAX_PAGE_NUMBER &&
+    ['disabled-next', 'omitted-next', 'single-page', 'confirmed-empty'].includes(sweep.terminalReason)
+    ? sweep.terminalPage : null;
+}
+
+function hasTerminalCoverage(sweep) {
+  const last = terminalPage(sweep);
+  if (last === null) return false;
+  const seen = new Set(sweep.visited || []);
+  for (let page = 1; page <= last; page += 1) if (!seen.has(page)) return false;
+  return true;
+}
+
+function completionStillCurrent(sweep, retry = true) {
+  if (!hasTerminalCoverage(sweep)) return true; // Unresolved/discovery reports have no success proof.
+  const page = currentPage();
+  const next = paginationNextState(page);
+  const last = terminalPage(sweep);
+  const current = sweep.emptyResult === true ? auxiliaryEmptyState(sweep, role.generation) !== null
+    : sweep.terminalReason === 'confirmed-empty'
+    ? page === last + 1 && next !== 'enabled' && atEndOfResults() && !collect().length
+    : page === last && (totalPages() || 0) <= page &&
+      (sweep.terminalReason === 'disabled-next' ? next === 'disabled'
+        : sweep.terminalReason === 'omitted-next' ? next === 'omitted' && stableTerminalPager(last, role.generation)
+        : next !== 'enabled' && auxiliarySinglePageHint() === 1);
+  if (current) return true;
+  // Controls/cards can hydrate while the durable checkpoint awaits its ACK.
+  // Re-read this page rather than completing from a pre-ACK observation.
+  phase = 'waiting-content';
+  lastActivityAt = Date.now();
+  if (retry) scheduleRelay(0, true);
+  return false;
 }
 
 function cancelPageWork() {
+  navigationRecoveryRevision += 1;
+  clearTimeout(trafficWaitTimer);
+  trafficWaitTimer = null;
+  trafficWaitStartedAt = null;
+  trafficNavigation = null;
+  pendingFocusRetry = null;
+  resetAuxiliaryRenderWait();
   cancelFocusPreparation();
   cancelPageControlScroll();
   cancelResultsScroll();
@@ -1017,10 +1497,12 @@ function scheduleRelay(delayMs = 0, replace = false) {
   // duplicate sweep after progress has been cleared.
   if (!isCurrent() || actionTimer || phase === 'complete') return;
   if (relayTimer && !replace) return;
+  const token = documentSession.capture();
   clearTimeout(relayTimer);
   relayTimer = setTimeout(() => {
     relayTimer = null;
     relay().catch((err) => {
+      if (!documentSession.current(token) || !isCurrent()) return;
       console.warn('Reviewer Item Relay: relay failed', err);
       phase = 'relay-retry';
       lastActivityAt = Date.now();
@@ -1029,9 +1511,10 @@ function scheduleRelay(delayMs = 0, replace = false) {
   }, Math.max(0, delayMs));
 }
 
-function queueWhenIdle(action, delayMs, waitingPhase = 'waiting-navigation') {
+function queueWhenIdle(action, delayMs, waitingPhase = 'waiting-navigation', focusRetry = false) {
   if (!extensionAvailable()) return;
   clearTimeout(actionTimer);
+  pendingFocusRetry = null;
   const generation = role.generation;
   phase = waitingPhase;
   lastActivityAt = Date.now();
@@ -1043,7 +1526,7 @@ function queueWhenIdle(action, delayMs, waitingPhase = 'waiting-navigation') {
       return;
     }
     if (!keepMonitoringScope()) return;
-    if (relaying || visibleUpdateRetries > 0) {
+    if (relaying || documentSession.visible.retries > 0) {
       // Do not leave late-rendered cards behind while their local delivery is
       // still in flight or awaiting a retry. This adds no Walmart requests.
       actionTimer = setTimeout(attempt, 1_000);
@@ -1061,6 +1544,7 @@ function queueWhenIdle(action, delayMs, waitingPhase = 'waiting-navigation') {
       return;
     }
     actionTimer = null;
+    pendingFocusRetry = null;
     nextActionAt = 0;
     cancelPageControlScroll();
     phase = 'navigating';
@@ -1069,6 +1553,7 @@ function queueWhenIdle(action, delayMs, waitingPhase = 'waiting-navigation') {
   };
   actionTimer = setTimeout(attempt, Math.max(0, delayMs));
   nextActionAt = Date.now() + Math.max(0, delayMs);
+  if (focusRetry) pendingFocusRetry = { token: documentSession.capture(), attempt };
 }
 
 async function pageDelayDetails() {
@@ -1107,8 +1592,13 @@ function cancelFocusPreparation() {
 async function requestPreparationFocus(generation, expiresAt, purpose) {
   let timer;
   let cancel;
+  const startedAt = Date.now();
+  const operation = purpose || 'pager';
+  const waitKey = `${generation}:${location.href}:${operation}`;
+  if (focusWait?.key !== waitKey) focusWait = { key: waitKey, at: startedAt };
+  const waitingSince = focusWait.at;
   try {
-    return await Promise.race([
+    const reply = await Promise.race([
       sendToWorker({ type: 'reviewer:focus', generation, expiresAt, ...(purpose ? { purpose } : {}) }),
       new Promise(resolve => {
         cancel = () => { clearTimeout(timer); resolve(null); };
@@ -1117,15 +1607,47 @@ async function requestPreparationFocus(generation, expiresAt, purpose) {
         timer = setTimeout(cancel, Math.max(0, Math.min(limit, expiresAt - Date.now())));
       })
     ]);
+    if (reply?.granted && revokedSelectionLeases.has(reply.leaseId)) {
+      return { ok: true, enabled: true, granted: false, reason: 'revoked', retryAfterMs: 1_000 };
+    }
+    if (reply?.granted) {
+      if (Number.isFinite(reply.until)) lastSelectionUntil = reply.until;
+      lastSelectionLeaseId = typeof reply.leaseId === 'string' ? reply.leaseId : null;
+    }
+    diagnostic(reply?.granted ? 'focus-granted' : 'focus-denied', {
+      operation, reason: reply?.granted ? undefined : reply?.reason || 'unavailable',
+      durationMs: Date.now() - startedAt,
+      elapsedMs: Math.max(0, Date.now() - waitingSince),
+      delayMs: Math.max(0, (reply?.until || Date.now()) - Date.now()) });
+    if (reply?.granted && focusWait?.key === waitKey) focusWait = null;
+    return reply;
   } catch { return null; } // The caller keeps the current page until focus is available.
   finally { clearTimeout(timer); focusRequests.delete(cancel); }
 }
 
-// Renew selection at the actual navigation boundary. The earlier pager/reading
-// slot may have expired while another scanner was using its turn.
-function visibleScannerFocus(requireWindow = true) {
-  return document.visibilityState === 'visible' && (!requireWindow ||
-    typeof document.hasFocus !== 'function' || document.hasFocus());
+async function releasePreparationFocus(grant, generation, startedAt, operation) {
+  if (!grant?.granted || typeof grant.leaseId !== 'string') return;
+  if (lastSelectionLeaseId === grant.leaseId) {
+    lastSelectionLeaseId = null;
+    lastSelectionUntil = 0;
+  }
+  let timer;
+  try {
+    const reply = await Promise.race([
+      sendToWorker({ type: 'reviewer:focus-release', generation, leaseId: grant.leaseId }),
+      new Promise(resolve => { timer = setTimeout(() => resolve(null), 1_000); })
+    ]);
+    diagnostic('focus-released', { operation, count: reply?.released ? 1 : 0,
+      durationMs: Math.max(0, Date.now() - startedAt),
+      delayMs: Math.max(0, (grant.until || Date.now()) - Date.now()) });
+  } catch { /* The finite lease still expires if a replaced worker cannot reply. */ }
+  finally { clearTimeout(timer); }
+}
+
+// Selected-tab grants remain valid when Chrome is behind another application.
+// The worker revokes them on tab changes; OS focus and visibility are separate.
+function scannerSelectionCurrent(grant) {
+  return !Number.isFinite(grant?.until) || grant.until > Date.now();
 }
 
 async function navigateWithFocus(action, generation, sourceHref = location.href, onSourceChange = null) {
@@ -1137,7 +1659,7 @@ async function navigateWithFocus(action, generation, sourceHref = location.href,
   };
   if (!current()) return reconcile();
   const needsReading = () => {
-    if (!onSourceChange && resultsScrollCompleted === `${generation}:${location.href}` &&
+    if (!onSourceChange && documentSession.reading.completed === `${generation}:${location.href}` &&
         !resultsReadingConfirmed(generation)) {
       navigationPending = false;
       phase = 'waiting-content';
@@ -1171,12 +1693,11 @@ async function navigateWithFocus(action, generation, sourceHref = location.href,
   const staleGrant = reply?.granted && Number.isFinite(reply.until) && reply.until <= Date.now();
   if ((!reply || (reply.enabled !== false && !reply.granted) ||
         (reply.enabled === false && reply.reason !== 'disabled')) ||
-      staleGrant || (reply?.granted && !visibleScannerFocus())) {
-    lastFacetFocusReason = staleGrant ? 'expired' : reply?.reason ||
-      (reply?.granted ? document.visibilityState !== 'visible' ? 'hidden' : 'window-unfocused' : 'unavailable');
+      staleGrant) {
+    lastFacetFocusReason = staleGrant ? 'expired' : reply?.reason || 'unavailable';
     navigationPending = false;
     const delayMs = reply?.granted ? 100 : Math.max(1_000, Math.min(5_000, reply?.retryAfterMs || 5_000));
-    queueWhenIdle(() => navigateWithFocus(action, generation, sourceHref, onSourceChange), delayMs, 'waiting-user');
+    queueWhenIdle(() => navigateWithFocus(action, generation, sourceHref, onSourceChange), delayMs, 'waiting-user', true);
     return;
   }
   lastFacetFocusReason = 'none';
@@ -1186,8 +1707,8 @@ async function navigateWithFocus(action, generation, sourceHref = location.href,
 }
 
 function cancelResultsScroll() {
-  resultsScrollController?.abort();
-  resultsScrollController = null;
+  documentSession.reading.controller?.abort();
+  documentSession.reading.controller = null;
 }
 
 function resultsReadingStamp() {
@@ -1200,21 +1721,21 @@ function resultsReadingStamp() {
 }
 
 function resultsReadingConfirmed(generation) {
-  return resultsScrollCompleted === `${generation}:${location.href}` &&
-    resultsScrollProof === resultsReadingStamp();
+  return documentSession.reading.completed === `${generation}:${location.href}` &&
+    documentSession.reading.proof === resultsReadingStamp();
 }
 
 // Read each delivered results page before advancing, including the last page
-// of a search. Automatic rotation must actually obtain a visible reading turn;
+// of a search. Automatic rotation must actually obtain a selected-tab turn;
 // a denied turn or an unfinished animation never acknowledges page coverage.
 async function scrollResultsPage(generation) {
   const href = location.href;
   const key = `${generation}:${href}`;
   if (resultsReadingConfirmed(generation)) return true;
-  if (resultsScrollCompleted === key) resultsScrollCompleted = null;
-  if (resultsScrollAttemptKey !== key) {
-    resultsScrollAttemptKey = key;
-    resultsScrollWorkMs = resultsScrollFailures = 0;
+  if (documentSession.reading.completed === key) documentSession.reading.completed = null;
+  if (documentSession.reading.attemptKey !== key) {
+    documentSession.reading.attemptKey = key;
+    documentSession.reading.workMs = documentSession.reading.failures = 0;
   }
   const defer = (reason, delayMs = 1_000, waitingPhase = 'waiting-focus') => {
     lastFacetFocusReason = reason;
@@ -1224,7 +1745,7 @@ async function scrollResultsPage(generation) {
     return false;
   };
   const unavailable = async () => {
-    if (++resultsScrollFailures >= 3) {
+    if (++documentSession.reading.failures >= 3) {
       await reportUnusable('Results reading could not complete after three attempts', generation);
       return false;
     }
@@ -1241,80 +1762,90 @@ async function scrollResultsPage(generation) {
     return false;
   }
   const grant = await requestPreparationFocus(generation, Date.now() + 3_000, 'page-scroll');
-  if (!valid() || checkVerification()) {
-    if (isCurrent(generation) && !verificationObserved && location.href === href) {
-      phase = 'waiting-user';
-      scheduleRelay(Math.max(1_000, INTERACTION_GRACE_MS - (Date.now() - lastInteraction)), true);
-    }
-    return false;
-  }
-  const disabled = grant?.enabled === false && grant.reason === 'disabled';
-  // Explicitly disabling rotation retains its documented background mode.
-  if (disabled && document.visibilityState !== 'visible') {
-    resultsScrollCompleted = key;
-    resultsScrollProof = resultsReadingStamp();
-    return true;
-  }
-  if (!grant || grant.reason === 'activation-unavailable') return unavailable();
-  if ((!disabled && !grant?.granted) || !visibleScannerFocus(!disabled) ||
-      (grant?.until && grant.until <= Date.now())) {
-    return defer(grant?.until && grant.until <= Date.now() ? 'expired' : grant?.reason ||
-      (grant?.granted ? document.visibilityState !== 'visible' ? 'hidden' : 'window-unfocused' : 'unavailable'),
-      grant?.retryAfterMs || 1_000);
-  }
-  lastFacetFocusReason = 'none';
-  cancelResultsScroll();
-  const controller = new AbortController();
-  resultsScrollController = controller;
-  const startAtTop = resultsScrollStarted !== key;
-  programmaticScroll = true;
-  phase = 'reading-page';
+  const grantedAt = Date.now();
   try {
-    const budgetMs = grant?.until ? Math.min(8_000, grant.until - Date.now() - 200) : 8_000;
-    if (budgetMs < 100) {
-      lastFacetFocusReason = 'short-lease';
-      phase = 'waiting-user';
-      scheduleRelay(1_000, true);
-      return false;
-    }
-    resultsScrollStarted = key;
-    const result = await ReviewerPageScroll.run({ window, document, signal: controller.signal,
-      startAtTop, budgetMs, settleKey: itemSignature,
-      canContinue: () => valid() && visibleScannerFocus(!disabled),
-      onState() { lastActivityAt = Date.now(); } });
-    if (!valid() || controller.signal.aborted || result.outcome === 'cancelled') {
+    if (!valid() || checkVerification()) {
       if (isCurrent(generation) && !verificationObserved && location.href === href) {
         phase = 'waiting-user';
         scheduleRelay(Math.max(1_000, INTERACTION_GRACE_MS - (Date.now() - lastInteraction)), true);
       }
       return false;
     }
-    resultsScrollWorkMs += Math.max(0, Math.min(8_000, Number(result.durationMs) || 0));
-    if (result.outcome !== 'complete') {
-      if (resultsScrollWorkMs >= 120_000) {
-        await reportUnusable('Results page did not settle within its bounded reading budget', generation);
+    const disabled = grant?.enabled === false && grant.reason === 'disabled';
+    // Explicitly disabling rotation retains its documented background mode.
+    if (disabled && document.visibilityState !== 'visible') {
+      documentSession.reading.completed = key;
+      documentSession.reading.proof = resultsReadingStamp();
+      return true;
+    }
+    if (!grant || grant.reason === 'activation-unavailable') return unavailable();
+    if ((!disabled && !grant?.granted) || !scannerSelectionCurrent(grant)) {
+      return defer(grant?.until && grant.until <= Date.now() ? 'expired' : grant?.reason ||
+        'unavailable',
+        grant?.retryAfterMs || 1_000);
+    }
+    lastFacetFocusReason = 'none';
+    cancelResultsScroll();
+    const controller = new AbortController();
+    documentSession.reading.controller = controller;
+    const startAtTop = documentSession.reading.started !== key;
+    programmaticScroll = true;
+    phase = 'reading-page';
+    try {
+      const budgetMs = grant?.until ? Math.min(8_000, grant.until - Date.now() - 200) : 8_000;
+      if (budgetMs < 100) {
+        lastFacetFocusReason = 'short-lease';
+        phase = 'waiting-user';
+        scheduleRelay(1_000, true);
         return false;
       }
-      if (result.outcome !== 'timeout' || !(result.distance > 0)) return unavailable();
-      resultsScrollFailures = 0;
-      return defer('none', 1_000, 'reading-page');
+      documentSession.reading.started = key;
+      const result = await ReviewerPageScroll.run({ window, document, signal: controller.signal,
+        startAtTop, budgetMs, settleKey: itemSignature,
+        canContinue: () => valid() && scannerSelectionCurrent(grant),
+        onState() { lastActivityAt = Date.now(); } });
+      if (!valid() || controller.signal.aborted || result.outcome === 'cancelled') {
+        if (isCurrent(generation) && !verificationObserved && location.href === href) {
+          phase = 'waiting-user';
+          scheduleRelay(Math.max(1_000, INTERACTION_GRACE_MS - (Date.now() - lastInteraction)), true);
+        }
+        return false;
+      }
+      // Chrome can suspend frames and heavily delay timers in a background
+      // document. Scheduler sleep is not evidence of an unusable results page.
+      const schedulerDelayed = result.outcome === 'timeout' && result.durationMs > budgetMs + 1_000;
+      if (schedulerDelayed) {
+        documentSession.reading.failures = 0;
+        return defer('none', 1_000, 'reading-page');
+      }
+      documentSession.reading.workMs += Math.max(0, Math.min(8_000, Number(result.durationMs) || 0));
+      if (result.outcome !== 'complete') {
+        if (documentSession.reading.workMs >= 120_000) {
+          await reportUnusable('Results page did not settle within its bounded reading budget', generation);
+          return false;
+        }
+        if (result.outcome !== 'timeout') return unavailable();
+        documentSession.reading.failures = 0;
+        return defer('none', 1_000, 'reading-page');
+      }
+      if (!scannerSelectionCurrent(grant)) {
+        return defer('expired');
+      }
+      documentSession.reading.completed = key;
+      documentSession.reading.proof = resultsReadingStamp();
+      documentSession.reading.failures = 0;
+      return true;
+    } catch {
+      // Already relayed items stay deduplicated; an animation error is not proof
+      // that the rest of the page loaded. Recovery is bounded to this target.
+      return valid() ? unavailable() : false;
+    } finally {
+      if (documentSession.reading.controller === controller) documentSession.reading.controller = null;
+      programmaticScrollUntil = Date.now() + 250;
+      programmaticScroll = false;
     }
-    if (!visibleScannerFocus(!disabled) || (grant?.until && grant.until <= Date.now())) {
-      return defer(grant?.until && grant.until <= Date.now() ? 'expired'
-        : document.visibilityState !== 'visible' ? 'hidden' : 'window-unfocused');
-    }
-    resultsScrollCompleted = key;
-    resultsScrollProof = resultsReadingStamp();
-    resultsScrollFailures = 0;
-    return true;
-  } catch {
-    // Already relayed items stay deduplicated; an animation error is not proof
-    // that the rest of the page loaded. Recovery is bounded to this target.
-    return valid() ? unavailable() : false;
   } finally {
-    if (resultsScrollController === controller) resultsScrollController = null;
-    programmaticScrollUntil = Date.now() + 250;
-    programmaticScroll = false;
+    await releasePreparationFocus(grant, generation, grantedAt, 'page-scroll');
   }
 }
 
@@ -1335,8 +1866,7 @@ async function preparePageNavigation(page, generation, waitMs) {
     if (epoch !== pagerFocusEpoch || !isCurrent(generation) || checkVerification() ||
         !keepMonitoringScope() || Date.now() > deadline - 1_000 ||
         Date.now() - lastInteraction < INTERACTION_GRACE_MS) return;
-    if ((reply?.enabled && !reply.granted) ||
-        (reply?.granted && document.visibilityState !== 'visible')) {
+    if ((reply?.enabled && !reply.granted) || !scannerSelectionCurrent(reply)) {
       const retry = reply?.granted ? 100 : Math.max(100, Number(reply?.retryAfterMs) || 1_000);
       if (Date.now() + retry <= deadline - 1_000) pagerFocusTimer = setTimeout(() => {
         pagerFocusTimer = null;
@@ -1387,7 +1917,16 @@ async function pageDelayMs() {
 }
 
 function itemSignature() {
-  return collect().map(item => item.item_id).sort().join('|');
+  const ids = new Set();
+  for (const anchor of document.querySelectorAll(ITEM_LINK)) {
+    const id = idFromHref(anchor.getAttribute('href') || '');
+    if (!id || ids.has(id)) continue;
+    // Normal cards expose their title on the link/image. Walk ancestors only
+    // for the rare title fallback; signatures need no prices, stock or images.
+    if (!titleFor(anchor, null) && !titleFor(anchor, cardFor(anchor))) continue;
+    ids.add(id);
+  }
+  return [...ids].map(id => `ip-${id}`).sort().join('|');
 }
 
 function navigatePage(page, generation, scanRestart = false, { retry = 0, bypassCooldown = false } = {}) {
@@ -1395,7 +1934,7 @@ function navigatePage(page, generation, scanRestart = false, { retry = 0, bypass
   cancelVisibleObservation();
   const target = pageUrl(page);
   navigationTarget = target;
-  const candidate = findPageControl(target, page);
+  const candidate = role.auxiliary?.urlPagination === true ? null : findPageControl(target, page);
   const nativeBackoff = candidate && nativeCoolingDown(target, candidate);
   if (nativeBackoff && !bypassCooldown) {
     // A cooldown is a wait before another bounded probe, not permission to
@@ -1415,7 +1954,7 @@ function navigatePage(page, generation, scanRestart = false, { retry = 0, bypass
     const inspection = inspectPageControls(target, page);
     if (inspection) diagnostic('pager-inspection', { targetPage: page, ...inspection });
     diagnostic('navigation-fallback', { targetPage: page,
-      reason: 'missing-control' });
+      reason: role.auxiliary?.urlPagination === true ? 'not-authorized' : 'missing-control' });
     if (scanRestart) diagnostic('scan-restart-load');
     if (!isCurrent(generation)) return;
     navigationPending = true;
@@ -1425,45 +1964,67 @@ function navigatePage(page, generation, scanRestart = false, { retry = 0, bypass
   }
   const previous = itemSignature();
   const startedAt = Date.now();
+  let trafficPausedMs = 0;
   const controlKey = nativeControlKey(target, control);
   lastNavigationAt = startedAt;
   const startedUrl = comparablePageUrl(location.href, location.href);
-  const fresh = () => comparablePageUrl(location.href, location.href) === comparablePageUrl(target, location.href) &&
-    ((collect().length && itemSignature() !== previous) || atEndOfResults());
+  const fresh = () => {
+    try {
+      return comparablePageUrl(location.href, location.href) === comparablePageUrl(target, location.href) &&
+        ((collect().length && itemSignature() !== previous) || atEndOfResults());
+    } catch { return false; } // A detached/hydrating card cannot terminate the freshness watchdog.
+  };
+  let outcomeRecorded = false;
+  const outcome = value => {
+    if (outcomeRecorded) return;
+    outcomeRecorded = true;
+    diagnostic('navigation-outcome', { outcome: value, targetPage: page,
+      documentId: RESULTS_DOCUMENT_ID, durationMs: Math.max(0, Date.now() - startedAt) });
+  };
   const resumePoll = () => {
     navigationPending = true;
     phase = 'waiting-page-change';
     return poll();
   };
   const responseArrived = () => fresh() ||
-    (comparablePageUrl(location.href, location.href) !== startedUrl && Date.now() - startedAt < EMPTY_PAGE_TIMEOUT_MS);
+    (comparablePageUrl(location.href, location.href) !== startedUrl && Date.now() - startedAt - trafficPausedMs < EMPTY_PAGE_TIMEOUT_MS);
   const stalled = async () => {
+    const revision = navigationRecoveryRevision;
     if (!isCurrent(generation) || checkVerification() || !keepMonitoringScope()) return;
     if (lastInteraction > startedAt) {
       navigationPending = false;
       navigationTarget = null;
       phase = 'waiting-user';
       diagnostic('navigation-interrupted', { targetPage: page });
+      outcome('interrupted');
       scheduleRelay(INTERACTION_GRACE_MS, true);
       return;
     }
+    outcome('timeout');
     // Retry only a no-op. A route that already changed keeps its full render
     // allowance and must never be clicked twice over the previous page's cards.
     if (retry < 1 && comparablePageUrl(location.href, location.href) === startedUrl) {
       const delayMs = await pageDelayMs();
+      if (revision !== navigationRecoveryRevision) return;
       if (!isCurrent(generation) || checkVerification() || !keepMonitoringScope()) return;
       diagnostic('navigation-retry', { targetPage: page, reason: 'native-stalled', delayMs,
         durationMs: Date.now() - startedAt });
       queueWhenIdle(() => {
+        if (revision !== navigationRecoveryRevision) return;
         // A late first response can arrive during the paced wait. Let its
         // original freshness poll resolve it instead of clicking a second time.
         if (comparablePageUrl(location.href, location.href) !== startedUrl) return poll();
-        return navigateWithFocus(() => navigatePage(page, generation, scanRestart,
-          { retry: 1, bypassCooldown: true }), generation, location.href, resumePoll);
+        return navigateWithFocus(() => {
+          if (revision === navigationRecoveryRevision) return navigatePage(page, generation, scanRestart,
+            { retry: 1, bypassCooldown: true });
+        }, generation, location.href, () => {
+          if (revision === navigationRecoveryRevision) return resumePoll();
+        });
       }, delayMs);
       return;
     }
     const stored = await readLocal(['nativeNavigationFailures']);
+    if (revision !== navigationRecoveryRevision) return;
     if (!isCurrent(generation) || checkVerification() || !keepMonitoringScope()) return;
     if (responseArrived()) return resumePoll();
     readNativePolicy({ nativeNavigationFailures: stored.nativeNavigationFailures });
@@ -1472,6 +2033,7 @@ function navigatePage(page, generation, scanRestart = false, { retry = 0, bypass
     const bounded = Object.entries(nativeNavigationFailures).sort((a, b) => b[1].until - a[1].until).slice(0, 20);
     nativeNavigationFailures = Object.fromEntries(bounded);
     await writeLocal({ nativeNavigationFailures, nativeNavigationPausedUntil: 0 }).catch(() => {});
+    if (revision !== navigationRecoveryRevision) return;
     if (!isCurrent(generation) || checkVerification() || !keepMonitoringScope()) return;
     if (responseArrived()) return resumePoll();
     if (lastInteraction > startedAt) {
@@ -1479,15 +2041,30 @@ function navigatePage(page, generation, scanRestart = false, { retry = 0, bypass
       navigationTarget = null;
       phase = 'waiting-user';
       diagnostic('navigation-interrupted', { targetPage: page });
+      outcome('interrupted');
       scheduleRelay(INTERACTION_GRACE_MS, true);
       return;
     }
     diagnostic('navigation-fallback', { targetPage: page, reason: 'native-stalled',
-      durationMs: Date.now() - startedAt, items: collect().length });
+      durationMs: Date.now() - startedAt });
     if (scanRestart) diagnostic('scan-restart-load');
     if (!isCurrent(generation)) return;
     phase = 'navigating';
-    await navigateWithFocus(() => location.assign(target), generation);
+    await navigateWithFocus(() => {
+      if (revision === navigationRecoveryRevision) location.assign(target);
+    }, generation);
+  };
+  const recoverStalled = () => {
+    const revision = navigationRecoveryRevision;
+    return stalled().catch(async () => {
+      if (revision !== navigationRecoveryRevision) return;
+      if (!isCurrent(generation) || checkVerification()) return;
+      navigationPending = false;
+      navigationTarget = null;
+      outcome('timeout');
+      await reportUnusable('Native navigation could not recover within its bounded attempt', generation,
+        false, { failureCode: 'navigation-timeout' });
+    });
   };
   navigationPending = true;
   phase = 'waiting-page-change';
@@ -1496,13 +2073,14 @@ function navigatePage(page, generation, scanRestart = false, { retry = 0, bypass
   // Hold the relay lock across client-side URL changes: the old page's cards
   // may remain visible after the URL already says "page 2".
   const poll = () => {
-    if (!isCurrent(generation) || checkVerification()) return;
+    if (checkVerification() || waitForTraffic() || !isCurrent(generation)) return;
     if (lastInteraction > startedAt) {
       actionTimer = null;
       navigationPending = false;
       navigationTarget = null;
       phase = 'waiting-user';
       diagnostic('navigation-interrupted', { targetPage: page });
+      outcome('interrupted');
       scheduleRelay(INTERACTION_GRACE_MS, true);
       return;
     }
@@ -1514,6 +2092,7 @@ function navigatePage(page, generation, scanRestart = false, { retry = 0, bypass
       phase = 'waiting-content';
       lastActivityAt = Date.now();
       diagnostic('navigation-ready', { targetPage: page, durationMs: Date.now() - startedAt });
+      outcome('ready');
       if (scanRestart) diagnostic('scan-restart-native');
       if (!isCurrent(generation)) return;
       if (nativeNavigationFailures[controlKey]) {
@@ -1523,7 +2102,7 @@ function navigatePage(page, generation, scanRestart = false, { retry = 0, bypass
       scheduleRelay(1_000, true);
       return;
     }
-    const elapsed = Date.now() - startedAt;
+    const elapsed = Date.now() - startedAt - trafficPausedMs;
     // Observed native pagination changes the URL before rendering new cards.
     // A no-op gets a short start window; a started navigation keeps the full
     // rendering allowance and can never acknowledge the previous page's cards.
@@ -1532,23 +2111,30 @@ function navigatePage(page, generation, scanRestart = false, { retry = 0, bypass
           comparablePageUrl(location.href, location.href) === startedUrl)) {
       actionTimer = null;
       nextActionAt = 0;
-      stalled();
+      recoverStalled();
       return;
     }
     actionTimer = setTimeout(poll, 500);
     nextActionAt = Date.now() + 500;
   };
+  trafficNavigation = { generation, resume(durationMs) {
+    trafficPausedMs += durationMs;
+    phase = 'waiting-page-change';
+    actionTimer = setTimeout(poll, 0);
+    nextActionAt = Date.now();
+  } };
   actionTimer = setTimeout(poll, 500);
   nextActionAt = Date.now() + 500;
   try { control.click(); } catch {
     clearTimeout(actionTimer);
     actionTimer = null;
     nextActionAt = 0;
-    stalled();
+    recoverStalled();
   }
 }
 
 async function finishSweep(sweep, generation) {
+  if (!completionStillCurrent(sweep)) return;
   const pages = (sweep.completedPages || 0) + new Set(sweep.visited || []).size;
   const mode = sweepRecordMode(sweep);
   const queries = sweepQueries(mode);
@@ -1559,6 +2145,9 @@ async function finishSweep(sweep, generation) {
   // first query and scanning the same category pass again.
   const nextIndex = currentIndex < 0 ? queries.length : currentIndex + 1;
   if (queries.length && nextIndex < queries.length) {
+    const restore = async () => {
+      if (await writeSweep(sweep, generation)) scheduleRelay(0, true);
+    };
     const updated = {
       ...sweep,
       mode,
@@ -1567,18 +2156,31 @@ async function finishSweep(sweep, generation) {
       completedLetters: mode === 'sweep' ? nextIndex : 0,
       completedPages: pages,
       total: null,
+      terminalPage: undefined,
+      terminalReason: undefined,
+      nextPageAvailable: false,
+      lastObservedPage: undefined,
       visited: [],
       endRetries: {},
       lastProgressAt: Date.now()
     };
     if (!(await writeSweep(updated, generation))) return;
+    if (!completionStillCurrent(sweep, false)) {
+      await restore();
+      return;
+    }
     const wait = await pageDelayMs();
     if (isCurrent(generation)) {
-      queueWhenIdle(() => navigateWithFocus(() => location.assign(searchUrl(updated.query)), generation), wait);
+      queueWhenIdle(() => navigateWithFocus(async () => {
+        if (!completionStillCurrent(sweep, false)) return restore();
+        location.assign(searchUrl(updated.query));
+      }, generation), wait);
     }
     return;
   }
   if (!(await writeSweep(sweep, generation))) return;
+  if (!completionStillCurrent(sweep)) return;
+  if (!pages && !role.auxiliary) recordPageState('zero-page-complete', { sweep });
   if (await removeCurrentSweep(generation, pages) === false) return;
   if (!isCurrent(generation)) return;
   if (!pages && !role.auxiliary) {
@@ -1600,8 +2202,65 @@ async function finishSweep(sweep, generation) {
   if (collect().length) scheduleVisibleObservation();
 }
 
+// Require stable, card-bound terminal evidence across separate reads. A changing
+// pager or late cards resets this confirmation without another network request.
+function stableTerminalPager(page, generation) {
+  if (omittedNextTerminalPage() !== page) {
+    terminalPagerObservation = null;
+    return false;
+  }
+  const key = `${generation}:${location.href}:${page}:${itemSignature()}`;
+  if (terminalPagerObservation?.key !== key || Date.now() < terminalPagerObservation.at) {
+    terminalPagerObservation = { key, at: Date.now() };
+    return false;
+  }
+  return Date.now() - terminalPagerObservation.at >= 1_000;
+}
+
+async function reconcileRenderedPagination(generation) {
+  const rendered = omittedNextTerminalPage();
+  const requested = currentPage();
+  if (rendered === null || rendered === requested) return true;
+  // A URL is not proof that Walmart served that page. Revisit the actual
+  // terminal URL and fill interior gaps before permitting completion.
+  if (!stableTerminalPager(rendered, generation)) {
+    phase = 'waiting-content';
+    scheduleRelay(1_000, true);
+    return false;
+  }
+  const sweep = await readSweep(generation);
+  if (!isCurrent(generation) || omittedNextTerminalPage() !== rendered) return false;
+  const corrected = { ...sweep, total: rendered,
+    visited: sweep.visited.filter(page => page <= rendered),
+    terminalPage: undefined, terminalReason: undefined, lastObservedPage: undefined,
+    lastPageFingerprint: undefined, nextPageAvailable: false };
+  if (!(await writeSweep(corrected, generation))) return false;
+  diagnostic('pager-clamped', { page: requested, targetPage: rendered });
+  const timing = await pageDelayDetails();
+  if (isCurrent(generation)) queueWhenIdle(() => navigateWithFocus(() => {
+    if (omittedNextTerminalPage() !== rendered) { scheduleRelay(0, true); return; }
+    return navigatePage(rendered, generation);
+  }, generation), timing.delayMs);
+  return false;
+}
+
+async function rejectRepeatedPage(generation, sweep = null) {
+  sweep ||= await readSweep(generation);
+  if (!isCurrent(generation)) return true;
+  const page = currentPage();
+  const fingerprint = itemSignature();
+  if (fingerprint && Number.isInteger(sweep.lastObservedPage) && sweep.lastObservedPage !== page &&
+      !sweep.visited.includes(page) && sweep.lastPageFingerprint === fingerprint) {
+    diagnostic('page-repeat', { page, targetPage: sweep.lastObservedPage });
+    await reportUnusable('Repeated results at a different page URL; coverage remains unresolved', generation);
+    return true;
+  }
+  return false;
+}
+
 async function advanceDeliveredPage(generation) {
   if (!isCurrent(generation)) return;
+  if (!(await reconcileRenderedPagination(generation))) return;
   const page = currentPage();
   let sweep = await readSweep(generation);
   if (!isCurrent(generation)) return;
@@ -1626,7 +2285,28 @@ async function advanceDeliveredPage(generation) {
   if (confirmedEmptyBoundary && page >= confirmedEmptyBoundary.emptyPage) {
     confirmedEmptyBoundary = null;
   }
-  const total = Math.max(detected ?? 0, sweep.total ?? 0) || null;
+  let total = Math.max(detected ?? 0, sweep.total ?? 0) || null;
+  const nextState = paginationNextState(page);
+  if (nextState === 'omitted' && !stableTerminalPager(page, generation)) {
+    phase = 'waiting-content';
+    scheduleRelay(1_000, true);
+    return;
+  }
+  const fingerprint = itemSignature();
+  if (await rejectRepeatedPage(generation, sweep)) return;
+  let end = terminalPage(sweep);
+  let terminalReason = sweep.terminalReason;
+  if (end !== null && (page >= end || (detected || 0) > end)) {
+    end = null;
+    terminalReason = undefined;
+  }
+  if ((['disabled', 'omitted'].includes(nextState) && (detected || 0) <= page) ||
+      (page === 1 && nextState !== 'enabled' && (detected || 0) <= 1 && auxiliarySinglePageHint() === 1)) {
+    end = page;
+    terminalReason = nextState === 'disabled' ? 'disabled-next' :
+      nextState === 'omitted' ? 'omitted-next' : 'single-page';
+    total = page;
+  }
   const visited = [...new Set([...(sweep.visited || []), page])];
   const endRetries = { ...(sweep.endRetries || {}) };
   delete endRetries[page];
@@ -1634,7 +2314,13 @@ async function advanceDeliveredPage(generation) {
   const updated = {
     ...sweep,
     generation,
+    emptyResult: false,
     total,
+    terminalPage: end ?? undefined,
+    terminalReason,
+    nextPageAvailable: nextState === 'enabled',
+    lastObservedPage: page,
+    lastPageFingerprint: fingerprint,
     visited,
     endRetries,
     lastProgressAt: Date.now()
@@ -1647,6 +2333,17 @@ async function continueSweep(sweep, generation) {
   const next = nextUnvisited(sweep);
 
   if (next === null) {
+    if (!hasTerminalCoverage(sweep) && !role.auxiliary?.discoveryOnly) {
+      // Preserve the checkpoint for the coordinator's durable retry ledger.
+      // Home must likewise remain incomplete instead of recording success.
+      diagnostic('coverage-unresolved', { page: currentPage(), pages: new Set(sweep.visited || []).size });
+      if (!role.auxiliary) {
+        if (await writeSweep(sweep, generation)) {
+          await reportUnusable('Pagination end could not be verified; acknowledged pages retained', generation);
+        }
+        return;
+      }
+    }
     await finishSweep(sweep, generation);
     return;
   }
@@ -1672,7 +2369,8 @@ async function startPaginationFallback(generation, details = {}) {
     scheduleRelay(0, true);
     return true;
   }
-  const reply = await sendToWorker({ type: 'reviewer:pagination-fallback', generation,
+  recordPageState('fallback', { sweep, attempt: details.attempt });
+  const reply = await sendDocumentMessage({ type: 'reviewer:pagination-fallback', generation,
     page: currentPage(), totalPages: Math.max(totalPages() ?? 0, sweep.total ?? 0),
     ...details });
   applyAckRole(reply);
@@ -1687,20 +2385,25 @@ async function startPaginationFallback(generation, details = {}) {
 
 async function handleEndPage(generation) {
   if (!isCurrent(generation) || checkVerification()) return;
+  const token = documentSession.capture();
   const page = currentPage();
   const sweep = await readSweep(generation);
-  if (!isCurrent(generation) || checkVerification()) return;
+  if (!isCurrent(generation) || !documentSession.current(token) || checkVerification()) return;
   if (collect().length || !atEndOfResults()) {
+    auxiliaryEmptyObservation = null;
     scheduleRelay(0, true);
     return;
   }
+
+  if (await verifyAuxiliaryEmpty(sweep, generation)) return;
+  if (!isCurrent(generation) || !documentSession.current(token) || checkVerification()) return;
 
   const detected = totalPages();
   const total = Math.max(detected ?? 0, sweep.total ?? 0) || null;
   const mode = sweepRecordMode(sweep);
   const smallerPager = detected !== null && detected < page;
-  const boundaryConfirmed = total === null || page > total ||
-    (page === total && page > 1) || smallerPager;
+  const boundaryConfirmed = paginationNextState(page) !== 'enabled' &&
+    (total === null || page > total || (page === total && page > 1) || smallerPager);
   const fallbackCandidate = mode === 'none' && (page === 1 || !boundaryConfirmed);
   if (fallbackCandidate) {
     // The portal briefly shows no-results during hydration, including after a
@@ -1728,6 +2431,14 @@ async function handleEndPage(generation) {
     endRetries: { ...(sweep.endRetries || {}), [page]: attempts }
   };
   if (!(await writeSweep(updated, generation)) || checkVerification()) return;
+  // Checkpoint persistence can yield while hydration finally renders cards.
+  // A confirmed empty tail must still be empty after that asynchronous boundary.
+  if (!isCurrent(generation) || !keepMonitoringScope()) return;
+  if (collect().length || !atEndOfResults()) {
+    emptySince = 0;
+    scheduleRelay(0, true);
+    return;
+  }
 
   const route = comparablePageUrl(pageUrl(1), location.href);
   if (confirmedEmptyBoundary && (confirmedEmptyBoundary.route !== route ||
@@ -1738,6 +2449,8 @@ async function handleEndPage(generation) {
     confirmedEmptyBoundary = null;
   }
   const reuseBoundary = attempts >= 2 && confirmedEmptyBoundary?.emptyPage === page;
+
+  recordPageState('empty-confirmation', { sweep: updated, attempt: attempts });
 
   // No-results briefly appears while cards load. Check the same document once
   // before spending a request, then reload once. These confirmations are short
@@ -1758,7 +2471,7 @@ async function handleEndPage(generation) {
   if (fallbackCandidate && await startPaginationFallback(generation, {
     reason: 'empty-results', attempt: attempts, elapsedMs: Date.now() - emptySince
   })) return;
-  if (!boundaryConfirmed) {
+  if (!boundaryConfirmed || paginationNextState(page) === 'enabled') {
     // An unread interior page is a failed scan, not evidence that later pages
     // vanished. Restart from page one rather than reloading this page forever.
     await reportUnusable(
@@ -1783,7 +2496,103 @@ async function handleEndPage(generation) {
   // boundary rather than the old maximum, and fill any earlier unread pages
   // before reporting a complete scan. Even a smaller pager can be a window of
   // page numbers, so the current empty page bounds the confirmed range.
-  await continueSweep({ ...updated, total: page - 1 }, generation);
+  await continueSweep({ ...updated, total: page - 1, terminalPage: page - 1,
+    terminalReason: 'confirmed-empty', nextPageAvailable: false, lastObservedPage: page }, generation);
+}
+
+// An explicit no-results panel is useful coverage, but a blank/error document
+// or a missing interior page is not. Prove an empty target locally across two
+// visible reads; no reload or additional request is needed for this case.
+function auxiliaryEmptyState(sweep, generation) {
+  const target = role.auxiliary;
+  if (!target || target.selection || target.discoveryOnly || !isCurrent(generation) ||
+      currentPage() !== 1 || sweep.targetKey !== target.targetKey ||
+      (sweep.visited || []).length || (sweep.total || 0) > 1 ||
+      auxiliaryScopeUrl(location.href) !== auxiliaryScopeUrl(target.targetUrl) ||
+      Date.now() - lastInteraction < INTERACTION_GRACE_MS || checkVerification()) return null;
+  const results = document.querySelector('main, [role="main"], #maincontent');
+  // Footer/help text and hidden panels cannot prove a result set is empty.
+  if (!results || results.hidden || results.getAttribute?.('aria-hidden') === 'true' ||
+      (results.getClientRects && !results.getClientRects().length) ||
+      getComputedStyle(results).display === 'none' ||
+      ['hidden', 'collapse'].includes(getComputedStyle(results).visibility) ||
+      !END_OF_RESULTS_RE.test(results.innerText || '')) return null;
+  const state = pageStateEvidence(sweep);
+  if (state.readyState !== 'complete' || state.visibility !== 'visible' ||
+      state.route !== 'reviewer' || !state.noResults || state.loading || state.error || state.signIn ||
+      state.productLinks || state.offerLines || collect().length ||
+      state.responseStatus >= 400 || state.failedRequests || paginationNextState(1) === 'enabled' ||
+      (totalPages() || 0) > 1) return null;
+  return `${generation}:${RESULTS_DOCUMENT_ID}:${target.targetKey}:${location.href}`;
+}
+
+async function verifyAuxiliaryEmpty(sweep, generation) {
+  const target = role.auxiliary;
+  const waitKey = `${generation}:${target?.targetKey || ''}:${location.href}`;
+  if (waitKey !== auxiliaryReadinessWaitKey) {
+    auxiliaryReadinessWaitKey = waitKey;
+    auxiliaryReadinessWaitSince = 0;
+  }
+  if (!target || target.selection || target.discoveryOnly || currentPage() !== 1 ||
+      (sweep.visited || []).length || (sweep.total || 0) > 1) {
+    auxiliaryEmptyObservation = null;
+    return false;
+  }
+  if (Date.now() - lastInteraction < INTERACTION_GRACE_MS) {
+    auxiliaryEmptyObservation = null;
+    auxiliaryReadinessWaitSince = 0;
+    emptySince = 0;
+    phase = 'waiting-user';
+    scheduleRelay(Math.max(1_000, INTERACTION_GRACE_MS - (Date.now() - lastInteraction)), true);
+    return true;
+  }
+  if (document.visibilityState !== 'visible') {
+    auxiliaryEmptyObservation = null;
+    auxiliaryReadinessWaitSince ||= Date.now();
+    // Scheduler waits are not render failures. Still bound a lost/stalled
+    // receiver rather than letting a wait label hide it indefinitely.
+    if (Date.now() - auxiliaryReadinessWaitSince >= 120_000) return false;
+    phase = 'waiting-focus';
+    const grant = await requestPreparationFocus(generation, Date.now() + 3_000, 'page-navigation');
+    if (!isCurrent(generation) || checkVerification()) return true;
+    if (Date.now() - lastInteraction < INTERACTION_GRACE_MS) {
+      auxiliaryReadinessWaitSince = 0;
+      emptySince = 0;
+      phase = 'waiting-user';
+      scheduleRelay(Math.max(1_000, INTERACTION_GRACE_MS - (Date.now() - lastInteraction)), true);
+      return true;
+    }
+    lastFacetFocusReason = grant?.granted ? 'none' : grant?.reason || 'unavailable';
+    emptySince = 0;
+    lastActivityAt = Date.now();
+    // Leave the two-second local confirmation inside this three-second turn.
+    // A denial retains the normal retry delay instead of polling rapidly.
+    scheduleRelay(grant?.granted ? 100 : 1_000, true);
+    return true;
+  }
+  auxiliaryReadinessWaitSince = 0;
+  const key = auxiliaryEmptyState(sweep, generation);
+  if (!key) { auxiliaryEmptyObservation = null; return false; }
+  if (auxiliaryEmptyObservation?.key !== key || Date.now() < auxiliaryEmptyObservation.at ||
+      Date.now() - auxiliaryEmptyObservation.at > 10_000) {
+    auxiliaryEmptyObservation = { key, at: Date.now() };
+  }
+  if (Date.now() - auxiliaryEmptyObservation.at < EMPTY_END_CONFIRM_MS) {
+    phase = 'waiting-content';
+    lastActivityAt = Date.now();
+    scheduleRelay(EMPTY_END_CONFIRM_MS, true);
+    return true;
+  }
+  const empty = { ...sweep, generation, emptyResult: true, total: 0,
+    terminalPage: 0, terminalReason: 'confirmed-empty', nextPageAvailable: false, lastObservedPage: 1 };
+  if (!(await writeSweep(empty, generation)) || auxiliaryEmptyState(empty, generation) !== key) {
+    auxiliaryEmptyObservation = null;
+    if (isCurrent(generation)) scheduleRelay(0, true);
+    return true;
+  }
+  recordPageState('empty-confirmation', { sweep: empty, attempt: 2 });
+  await continueSweep(empty, generation);
+  return true;
 }
 
 // --- role and relay lifecycle ------------------------------------------------
@@ -1825,8 +2634,9 @@ function applyRole(message) {
     phase = 'waiting-verification';
     return;
   }
-  if (!changed) return;
+  if (!changed) { waitForTraffic(); return; }
 
+  revokeDocumentWork();
   cancelPageWork();
   resetVisibleObservations();
   endConfirmationsInDocument.clear();
@@ -1841,6 +2651,7 @@ function applyRole(message) {
 
   phase = 'starting';
   lastActivityAt = Date.now();
+  if (waitForTraffic()) return;
   startObserver();
   scheduleRelay(0, true);
 }
@@ -1878,14 +2689,19 @@ function applyAckRole(ack) {
   }
 }
 
-async function reportUnusable(reason, generation, restartSweep = false) {
+async function reportUnusable(reason, generation, restartSweep = false, details = {}) {
   if (!isCurrent(generation)) return;
+  recordPageState('unusable');
   phase = 'empty-timeout';
   lastActivityAt = Date.now();
   let reply;
   try {
-    reply = await sendToWorker({
-      type: 'reviewer:unusable', generation, reason,
+    reply = await sendDocumentMessage({
+      type: 'reviewer:unusable', generation, reason, documentId: RESULTS_DOCUMENT_ID,
+      ...(['document-http-error', 'render-timeout', 'render-opportunity-timeout', 'navigation-timeout'].includes(details.failureCode)
+        ? { failureCode: details.failureCode } : {}),
+      ...(Number.isInteger(details.responseStatus) && details.responseStatus >= 400 && details.responseStatus <= 599
+        ? { responseStatus: details.responseStatus } : {}),
       ...(restartSweep ? { restartSweep: true } : {})
     });
   } catch {
@@ -1922,9 +2738,12 @@ function retryDelay(retryable) {
 
 async function relay() {
   if (checkVerification()) return;
+  if (waitForTraffic()) return;
   if (!isCurrent() || relaying || actionTimer || navigationPending) return;
+  const operation = beginDocumentRelay();
+  if (!operation) return;
   const generation = role.generation;
-  relaying = true;
+  const current = () => isCurrent(generation) && documentSession.current(operation);
   phase = 'collecting';
   lastActivityAt = Date.now();
   try {
@@ -1932,15 +2751,31 @@ async function relay() {
       await reportUnusable('The selected tab is no longer on the configured reviewer page', generation);
       return;
     }
-    if (!isCurrent(generation)) return;
+    if (!current()) return;
 
-    if (!(await ensureAuxiliaryTarget(generation))) return;
-    if (!(await ensureSweepSearch(generation))) return;
+    const responseStatus = documentHttpFailure();
+    if (responseStatus && !(trafficDocumentRecovered && (collect().length > 0 || atEndOfResults()))) {
+      if (Date.now() - lastInteraction < INTERACTION_GRACE_MS) {
+        phase = 'waiting-user';
+        lastActivityAt = Date.now();
+        scheduleRelay(Math.max(1_000, INTERACTION_GRACE_MS - (Date.now() - lastInteraction)), true);
+        return;
+      }
+      diagnostic('navigation-outcome', { outcome: 'http-error', responseStatus, documentId: RESULTS_DOCUMENT_ID });
+      await reportUnusable('Reviewer document returned an unsuccessful HTTP response', generation, false,
+        { failureCode: 'document-http-error', responseStatus });
+      return;
+    }
+    if (!(await ensureAuxiliaryTarget(generation)) || !current()) return;
+    if (!(await ensureSweepSearch(generation)) || !current()) return;
+    if (!(await reconcileRenderedPagination(generation)) || !current()) return;
 
-    const renderedItems = collect();
+    const renderedItems = collect(null, true);
     if (renderedItems.length) {
+      auxiliaryEmptyObservation = null;
+      if (pageStateEmptyContext === `${generation}:${location.href}`) recordPageState('recovered', { items: renderedItems.length });
       const intakeKey = `${generation}:${location.href}`;
-      const items = resultsIntakeKey === intakeKey
+      const items = documentSession.reading.intakeKey === intakeKey
         ? renderedItems.filter(item => !acknowledgedVisibleIds.has(item.item_id)) : renderedItems;
       emptySince = 0;
       phase = 'ingesting';
@@ -1948,41 +2783,42 @@ async function relay() {
       if (items.length) {
         let ack;
         try {
-          ack = await sendToWorker({ type: 'reviewer:page', generation, page: currentPage(), items });
+          ack = await sendDocumentMessage({ type: 'reviewer:page', generation, page: currentPage(), items });
         } catch (err) {
           ack = { ok: false, retryable: true, error: err?.message || String(err) };
         }
         applyAckRole(ack);
-        if (!isCurrent(generation)) return;
+        if (!current()) return;
         if (!ack?.ok) {
           ingestRetryAttempt += 1;
           phase = 'ingest-retry';
-          diagnostic('ingest-retry', { attempt: ingestRetryAttempt });
+          diagnostic('ingest-retry', { attempt: ingestRetryAttempt, requestId: ack?.requestId, intakePhase: 'initial' });
           lastActivityAt = Date.now();
           scheduleRelay(retryDelay(ack?.retryable), true);
           return;
         }
         ingestRetryAttempt = 0;
         rememberAcknowledged(items);
-        resultsIntakeKey = intakeKey;
+        documentSession.reading.intakeKey = intakeKey;
       }
       if (!(await scrollResultsPage(generation))) return;
-      if (!isCurrent(generation) || checkVerification() || !keepMonitoringScope()) return;
+      if (!current() || checkVerification() || !keepMonitoringScope()) return;
       // Scrolling may render more cards. Commit these before leaving even the
       // final page, and retain the existing ingest retry/deduplication contract.
-      const lateItems = collect(acknowledgedVisibleIds)
+      const lateItems = collect(acknowledgedVisibleIds, true)
         .filter(item => !acknowledgedVisibleIds.has(item.item_id));
       if (lateItems.length) {
         let lateAck;
         try {
-          lateAck = await sendToWorker({ type: 'reviewer:page', generation,
-            page: currentPage(), items: lateItems });
+          lateAck = await sendDocumentMessage({ type: 'reviewer:page', generation,
+            page: currentPage(), items: lateItems, intakePhase: 'late' });
         } catch { lateAck = { ok: false, retryable: true }; }
         applyAckRole(lateAck);
-        if (!isCurrent(generation)) return;
+        if (!current()) return;
         if (!lateAck?.ok) {
           ingestRetryAttempt += 1;
           phase = 'ingest-retry';
+          diagnostic('ingest-retry', { attempt: ingestRetryAttempt, requestId: lateAck?.requestId, intakePhase: 'late' });
           scheduleRelay(retryDelay(lateAck?.retryable), true);
           return;
         }
@@ -1993,6 +2829,7 @@ async function relay() {
         scheduleRelay(1_000, true);
         return;
       }
+      if (await rejectRepeatedPage(generation)) return;
       if (lastReadyResultsPage !== currentPage()) {
         lastReadyResultsPage = currentPage();
         diagnostic('results-page-ready', { documentId: RESULTS_DOCUMENT_ID });
@@ -2001,11 +2838,14 @@ async function relay() {
       return;
     }
 
+    recordPageState('empty-observed');
     if (atEndOfResults()) {
       await handleEndPage(generation);
       return;
     }
 
+    if (role.auxiliary) return waitForAuxiliaryRender(generation,
+      'Auxiliary reviewer page did not render within its active rendering budget');
     if (!emptySince) emptySince = Date.now();
     if (Date.now() - emptySince >= EMPTY_PAGE_TIMEOUT_MS) {
       const elapsedMs = Date.now() - emptySince;
@@ -2024,7 +2864,7 @@ async function relay() {
     lastActivityAt = Date.now();
     scheduleRelay(EMPTY_POLL_MS, true);
   } finally {
-    relaying = false;
+    endDocumentRelay(operation);
   }
 }
 
@@ -2041,7 +2881,7 @@ if (extensionAvailable()) {
     if (!extensionAvailable() || verificationTimer) return;
     verificationTimer = setTimeout(() => {
       verificationTimer = null;
-      if (!checkVerification() && phase === 'waiting-verification') requestRole();
+      if (!checkVerification() && !waitForTraffic() && phase === 'waiting-verification') requestRole();
     }, 100);
   });
   verificationObserver.observe(document.documentElement || document.body,

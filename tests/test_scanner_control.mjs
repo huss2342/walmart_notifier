@@ -2,8 +2,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
+import { reviewerLocks } from './fixtures/reviewer-locks.mjs';
 
-const source = fs.readFileSync(new URL('../extension/scanner-control.js', import.meta.url), 'utf8');
+const source = ['local-client.js', 'scanner-settings.js', 'scanner-control.js']
+  .map(name => fs.readFileSync(new URL(`../extension/${name}`, import.meta.url), 'utf8')).join('\n');
 const settings = () => ({ schemaVersion: 1, auxiliaryDepartments: true, auxiliaryKeywords: true,
   auxiliaryBrands: false, auxiliaryKeywordQueries: ['Chair', 'Pet'], groupScannerTabs: true,
   rotateScannerTabs: true, verificationAssistEnabled: true, verificationNativeEnabled: false,
@@ -24,6 +26,7 @@ function fixture() {
     auxiliaryDepartments: false, verificationAssistBudget: { attempts: [1, 2, 3] } };
   const paths = [];
   const actions = [];
+  const locks = reviewerLocks();
   let paused = false;
   let failReservation = false;
   let result = { ok: true };
@@ -33,6 +36,7 @@ function fixture() {
     async set(value) { if (failReservation && value.scannerCommandIds) throw new Error('disk unavailable');
       Object.assign(data, JSON.parse(JSON.stringify(value))); } };
   const context = vm.createContext({ URL, AbortController, setTimeout, clearTimeout, console,
+    navigator: { locks },
     fetch: async (url, init) => {
       const path = new URL(url).pathname;
       paths.push({ path, ...init });
@@ -49,12 +53,33 @@ function fixture() {
     snapshot: async () => ({ schemaVersion: 1, verification: { pausedUntil: 0 } }),
     onCommand: async name => { actions.push(name); if (result instanceof Error) throw result; return result; }
   });
-  return { data, paths, actions, bodies, make, bridge: make(), validate: context.validatedScannerSettings,
-    failureCode: context.scannerFailureCode,
+  return { data, paths, actions, bodies, locks, make, bridge: make(), validate: context.validatedScannerSettings,
+    failureCode: context.scannerFailureCode, laneCoverage: context.scannerLaneCoverage,
     pause(value) { paused = value; }, failReservation() { failReservation = true; },
     result(value) { result = value; }, command(id = 'request-1') { bodies.set('/scanner-commands', {
       commands: { schemaVersion: 1, restartHomeId: id, restartAdditionalId: null } }); } };
 }
+
+test('lane coverage export preserves supplied progress counters and round timestamps without inventing legacy evidence', () => {
+  const f = fixture();
+  const progress = { attemptedTargets: 7, unresolvedTargets: 2, emptyTargets: 3,
+    startedAt: 100_000, completedAt: 0 };
+  assert.deepEqual(JSON.parse(JSON.stringify(f.laneCoverage({ ...progress, targetLabel: 'private target',
+    checkpoint: { url: 'https://private.example/' } }))), progress);
+  assert.deepEqual(JSON.parse(JSON.stringify(f.laneCoverage({ completedTargets: 4 }))), {});
+  assert.deepEqual(JSON.parse(JSON.stringify(f.laneCoverage(null))), {});
+  assert.deepEqual(JSON.parse(JSON.stringify(f.laneCoverage({ attemptedTargets: 0, completedAt: 10 ** 15 }))),
+    { attemptedTargets: 0, completedAt: 10 ** 15 });
+});
+
+test('lane coverage export omits invalid optional numbers instead of presenting them as measured zeros', () => {
+  const f = fixture();
+  for (const key of ['attemptedTargets', 'unresolvedTargets', 'emptyTargets', 'startedAt', 'completedAt']) {
+    for (const value of [undefined, null, true, '1', -1, 1.5, NaN, Infinity, 10 ** 15 + 1]) {
+      assert.deepEqual(JSON.parse(JSON.stringify(f.laneCoverage({ [key]: value }))), {}, `${key}: ${value}`);
+    }
+  }
+});
 
 test('scanner failure export keeps only recognized codes and never raw errors', () => {
   const f = fixture();
@@ -89,6 +114,39 @@ test('backend settings override stale browser flags without changing credentials
   assert.equal(f.data.verificationAssistEnabled, true);
   assert.equal(f.data.token, 'never-export-this-token');
   assert.deepEqual(f.data.verificationAssistBudget.attempts, [1, 2, 3]);
+});
+
+test('legacy authoritative settings clear stale optional priority cache while absent backend preserves it', async () => {
+  for (const backend of [settings(), null]) {
+    const f = fixture();
+    Object.assign(f.data, { auxiliaryPriority: true, auxiliaryPriorityQueries: ['Desk'],
+      auxiliaryPriorityRefreshMinutes: 2 });
+    f.bodies.set('/scanner-settings', { settings: backend });
+    assert.equal(await f.bridge.syncSettings(), true);
+    assert.equal(f.data.auxiliaryPriority, backend === null);
+    assert.deepEqual(f.data.auxiliaryPriorityQueries, backend === null ? ['Desk'] : null);
+    assert.equal(f.data.auxiliaryPriorityRefreshMinutes, backend === null ? 2 : 1);
+    if (backend) assert.equal('auxiliaryPriority' in backend, false, 'Legacy wire shape stays unchanged');
+  }
+});
+
+test('worker cache synchronization waits for an Options transaction and reads its latest settings', async () => {
+  const f = fixture();
+  let release;
+  const editing = f.locks.request('reviewer-notifier-settings', { mode: 'exclusive' }, async () => {
+    await new Promise(resolve => { release = resolve; });
+    f.bodies.set('/scanner-settings', { settings: { ...settings(), auxiliaryDepartments: false,
+      rotateScannerTabs: false } });
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  const syncing = f.bridge.syncSettings();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.paths.length, 0, 'The worker must not fetch a stale document outside the settings lock');
+  release();
+  await editing;
+  assert.equal(await syncing, true);
+  assert.equal(f.data.auxiliaryDepartments, false);
+  assert.equal(f.data.rotateScannerTabs, false);
 });
 
 test('absent or invalid backend settings retain the complete working browser cache', async () => {

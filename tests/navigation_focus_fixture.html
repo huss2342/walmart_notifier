@@ -2,13 +2,14 @@
 <html lang="en"><meta charset="utf-8"><title>Focus before navigation test</title>
 <style>body {font: 18px system-ui; max-width: 850px; margin: 36px auto; padding: 20px; color: #163047; background: #eef4f8} #result {padding: 20px; background: white; border-radius: 12px} pre {white-space: pre-wrap; font-size: 14px}</style>
 <h1>Focus before navigation</h1>
-<p>Production page lifecycle, real DOM and scrolling; Chrome focus replies and window focus are simulated. No Walmart or notifier requests.</p>
+<p>Production page lifecycle, real DOM and scrolling; scanner-tab grants are simulated. Reading is verified with document focus false. No Walmart or notifier requests.</p>
 <p id="result" role="status">Running…</p><pre id="details"></pre>
 <div id="cards"><section><a href="/ip/10000001">First fixture item</a><p>Free (Valued at $25)</p></section></div>
 <ol><li data-automation-id="page-number"><a id="fixture-next" href="?page=2">2</a></li></ol>
 <script src="/fixture-stubs.js"></script>
 <script src="/sweep-modes.js"></script><script src="/runtime-policy.js"></script>
-<script src="/page-controls.js"></script><script src="/live-observer.js"></script>
+<script src="/verification-observation.js"></script><script src="/page-controls.js"></script>
+<script src="/document-session.js"></script><script src="/live-observer.js"></script>
 <script src="/page-scroll.js"></script>
 <script src="/content.js"></script>
 <script>
@@ -16,6 +17,12 @@
   const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
   const assert = (value, text) => { if (!value) throw new Error(text); };
   const events = [];
+  const observedWindowFocus = document.hasFocus();
+  const observedVisibility = document.visibilityState;
+  const suppressFrames = new URLSearchParams(location.search).get('frames') === 'off';
+  // Test flags must not look like an unknown catalogue filter to production
+  // scope checks. Keep the flag in this harness, then exercise the clean route.
+  if (suppressFrames) history.replaceState({}, '', location.pathname);
   let changes = 0;
   const activate = () => {
     cancelPageWork();
@@ -103,21 +110,31 @@
     events.push('denied focus holds current page');
     cancelPageWork();
     const originalFocus = Object.getOwnPropertyDescriptor(document, 'hasFocus');
-    Object.defineProperty(document, 'hasFocus', { configurable: true, value: () => true });
+    const originalRequestFrame = window.requestAnimationFrame;
+    const originalCancelFrame = window.cancelAnimationFrame;
+    Object.defineProperty(document, 'hasFocus', { configurable: true, value: () => false });
+    if (suppressFrames) {
+      window.requestAnimationFrame = () => 0;
+      window.cancelAnimationFrame = () => {};
+    }
     try {
       document.getElementById('cards').style.minHeight = '1800px';
-      document.querySelector('ol').style.marginBottom = '1000px';
+      document.querySelector('ol').style.marginBottom = `${window.innerHeight + 1000}px`;
       chrome.runtime.sendMessage = async message => message.type === 'reviewer:focus'
         ? { ok: true, enabled: true, granted: true, until: Date.now() + 10_000 } : { ok: true };
       assert(await scrollResultsPage(9) === true && resultsReadingConfirmed(9),
-        'Granted visible page did not finish its real downward reading pass');
+        'Granted unfocused page did not finish its real downward reading pass');
       assert(scrollY > 0, 'Reading did not move down the document');
       events.push('granted reading scrolls to a settled bottom');
       const bottomPosition = scrollY;
       await preparePageNavigation(2, 9, 9000);
       await wait(1000);
+      const readingState = { scrollY, bottomPosition,
+        confirmed: resultsReadingConfirmed(9), saved: documentSession.reading.proof,
+        current: resultsReadingStamp(), phase, lastFacetFocusReason,
+        pagerControl: Boolean(findPageControl(pageUrl(2), 2)) };
       assert(scrollY < bottomPosition && resultsReadingConfirmed(9),
-        'Preparing a pager above the true bottom invalidated completed reading');
+        `Preparing a pager above the true bottom invalidated completed reading: ${JSON.stringify(readingState)}`);
       let preparedNavigation = false;
       await navigateWithFocus(() => { preparedNavigation = true; }, 9);
       assert(preparedNavigation, 'Owned pager preparation blocked navigation');
@@ -130,15 +147,19 @@
     } finally {
       if (originalFocus) Object.defineProperty(document, 'hasFocus', originalFocus);
       else delete document.hasFocus;
+      window.requestAnimationFrame = originalRequestFrame;
+      window.cancelAnimationFrame = originalCancelFrame;
       cancelPageWork();
       document.getElementById('cards').style.minHeight = '';
       document.querySelector('ol').style.marginBottom = '';
       window.scrollTo({ top: 0, behavior: 'instant' });
     }
-    document.getElementById('result').textContent = 'PASS: denied focus holds the page; granted reading reaches a settled bottom; pager positioning preserves reading; late cards block navigation. Focus order, paced retry and stable jitter also pass.';
-    document.getElementById('details').textContent = JSON.stringify({ changes, events }, null, 2);
+    document.getElementById('result').textContent = 'PASS: background reading reaches a settled bottom with document focus false; pager positioning preserves reading; late cards block navigation. Tab selection order, denied turns, paced retry and stable jitter also pass.';
+    document.getElementById('details').textContent = JSON.stringify({ changes, observedWindowFocus, observedVisibility, suppressFrames, events }, null, 2);
   } catch (error) {
     document.getElementById('result').textContent = `FAIL: ${error.message}`;
+    document.getElementById('details').textContent = JSON.stringify({ changes, events,
+      observedWindowFocus, observedVisibility, suppressFrames, phase, role, lastFacetFocusReason }, null, 2);
   } finally {
     role.active = false;
     cancelPageWork(); stopObserver(); clearInterval(rolePollTimer);

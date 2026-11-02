@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "minimum_chrome_version": "120",
   "name": "Reviewer Item Relay",
-  "version": "2.24.1",
+  "version": "2.26.13",
   "description": "Relays items from your own signed-in reviewer page to the notifier running on this machine.",
   "permissions": [
     "storage",
@@ -24,7 +24,7 @@
   "content_scripts": [
     {
       "matches": ["https://www.walmart.com/*"],
-      "js": ["page-controls.js", "verification-watch.js"],
+      "js": ["verification-observation.js", "page-controls.js", "verification-watch.js"],
       "run_at": "document_start"
     },
     {
@@ -36,6 +36,7 @@
         "sweep-modes.js",
         "runtime-policy.js",
         "page-scroll.js",
+        "document-session.js",
         "live-observer.js",
         "facet-controls.js",
         "department-data.js",

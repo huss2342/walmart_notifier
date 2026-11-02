@@ -3,13 +3,15 @@
 const SCANNER_FAILURE_CODES = new Set(['missing-document', 'unsupported-kind', 'ambiguous-filter-section',
   'missing-filter-section', 'ambiguous-control', 'missing-control', 'missing-panel', 'ambiguous-expansion',
   'missing-expansion', 'expansion-stalled', 'expansion-overflow', 'option-overflow', 'missing-selection',
-  'ambiguous-selection', 'already-selected', 'cancelled', 'facet-error']);
+  'ambiguous-selection', 'already-selected', 'cancelled', 'facet-error',
+  'document-http-error', 'render-timeout', 'render-opportunity-timeout', 'navigation-timeout',
+  'navigation-scope-changed']);
 
 const SCANNER_RUNTIME_PHASES = new Set(['passive', 'starting', 'collecting', 'ingesting', 'ingest-retry',
   'relay-retry', 'complete', 'empty-timeout', 'extension-reloaded', 'manual-browsing', 'navigating',
   'recovering', 'transient-end-retry', 'waiting-content', 'waiting-navigation', 'waiting-selection',
   'waiting-page-change', 'waiting-target-change', 'waiting-user', 'waiting-verification',
-  'waiting-focus', 'reading-page']);
+  'waiting-focus', 'reading-page', 'waiting-traffic']);
 const SCANNER_FOCUS_REASONS = new Set(['none', 'busy', 'waiting-turn', 'manual-tab-active',
   'window-unfocused', 'user-active', 'not-authorized', 'expired', 'paused', 'disabled',
   'unavailable', 'short-lease', 'hidden', 'cancelled', 'revoked', 'selection-changed', 'not-scanner',
@@ -22,6 +24,15 @@ function scannerRuntimeProbe(probe) {
     visibility: ['visible', 'hidden'].includes(probe?.visibility) ? probe.visibility : 'unknown',
     focusReason: SCANNER_FOCUS_REASONS.has(probe?.focusReason) ? probe.focusReason : 'unknown',
     lastActivityAt: number(probe?.lastActivityAt), nextActionAt: number(probe?.nextActionAt) };
+}
+
+function scannerLaneCoverage(lane) {
+  // Older coordinator snapshots have cursor counts, not verified completions.
+  // Preserve absence rather than fabricating measured coverage or timestamps.
+  return Object.fromEntries(['attemptedTargets', 'unresolvedTargets', 'emptyTargets', 'startedAt', 'completedAt']
+    .filter(key => lane && Object.hasOwn(lane, key) && Number.isSafeInteger(lane[key]) &&
+      lane[key] >= 0 && lane[key] <= 1e15)
+    .map(key => [key, lane[key]]));
 }
 
 function scannerFailureCode(message) {
@@ -41,29 +52,7 @@ function scannerFailureCode(message) {
 }
 
 function validatedScannerSettings(value) {
-  const booleans = ['auxiliaryDepartments', 'auxiliaryKeywords', 'auxiliaryBrands',
-    'groupScannerTabs', 'rotateScannerTabs', 'verificationAssistEnabled', 'verificationNativeEnabled'];
-  const keys = ['schemaVersion', ...booleans, 'auxiliaryKeywordQueries', 'pathPattern'];
-  if (!value || typeof value !== 'object' || Array.isArray(value) || value.schemaVersion !== 1 ||
-      Object.keys(value).length !== keys.length || !keys.every(key => Object.hasOwn(value, key)) ||
-      booleans.some(key => typeof value[key] !== 'boolean') ||
-      typeof value.pathPattern !== 'string' || !value.pathPattern.trim() || value.pathPattern.length > 200 ||
-      /[\u0000-\u001f\u007f]/.test(value.pathPattern)) throw new Error('Invalid scanner settings.');
-  try { new RegExp(value.pathPattern, 'i'); } catch { throw new Error('Invalid scanner settings.'); }
-  let queries = value.auxiliaryKeywordQueries;
-  if (queries !== null) {
-    if (!Array.isArray(queries) || queries.length > 100 || queries.some(query =>
-      typeof query !== 'string' || !query.trim() || query.trim().length > 80 ||
-      /[\u0000-\u001f\u007f]/.test(query))) throw new Error('Invalid scanner settings.');
-    const seen = new Set();
-    queries = queries.map(query => query.trim()).filter(query => {
-      const key = query.toLocaleLowerCase('en-US');
-      if (seen.has(key)) return false;
-      seen.add(key); return true;
-    });
-  }
-  return { schemaVersion: 1, ...Object.fromEntries(booleans.map(key => [key, value[key]])),
-    auxiliaryKeywordQueries: queries, pathPattern: value.pathPattern };
+  return ReviewerScannerSettings.validate(value);
 }
 
 function validatedScannerCommands(value) {
@@ -89,35 +78,32 @@ var ReviewerScannerControl = (() => {
 
     async function request(path, method = 'GET', payload = undefined) {
       const { endpoint, token } = await config();
-      const url = new URL(path, checkedEndpoint(endpoint));
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 5_000);
-      try {
-        const headers = token ? { 'X-Ingest-Token': token } : {};
-        if (payload !== undefined) headers['Content-Type'] = 'application/json';
-        const response = await fetch(url.toString(), { method, headers, cache: 'no-store',
-          signal: controller.signal, ...(payload === undefined ? {} : { body: JSON.stringify(payload) }) });
-        if (!response.ok) throw new Error('Scanner backend unavailable.');
-        const text = await response.text();
-        if (text.length > 64 * 1024) throw new Error('Scanner response too large.');
-        return JSON.parse(text);
-      } finally { clearTimeout(timer); }
+      const url = ReviewerLocalClient.route(checkedEndpoint(endpoint), path);
+      const headers = token ? { 'X-Ingest-Token': token } : {};
+      if (payload !== undefined) headers['Content-Type'] = 'application/json';
+      const response = await ReviewerLocalClient.json(url, { method, headers, cache: 'no-store',
+        ...(payload === undefined ? {} : { body: JSON.stringify(payload) }) }, { timeoutMs: 5_000 });
+      if (!response.ok) throw new Error('Scanner backend unavailable.');
+      return response.body;
     }
 
     function syncSettings() {
       return serialize('settings', async () => {
         try {
-          const body = await request('/scanner-settings');
-          if (!body || !Object.hasOwn(body, 'settings')) throw new Error('Missing scanner settings.');
-          if (body.settings !== null) {
-            const { schemaVersion, ...settings } = validatedScannerSettings(body.settings);
-            const current = await config();
-            const changed = Object.fromEntries(Object.entries(settings).filter(([key, value]) =>
-              JSON.stringify(value) !== JSON.stringify(current[key])));
-            if (Object.keys(changed).length) await local.set(changed);
-          }
-          await local.set({ scannerSettingsSyncError: '', scannerSettingsSyncedAt: Date.now() });
-          return true;
+          return await ReviewerLocalClient.settingsTransaction(async () => {
+            const body = await request('/scanner-settings');
+            if (!body || !Object.hasOwn(body, 'settings')) throw new Error('Missing scanner settings.');
+            if (body.settings !== null) {
+              const { schemaVersion, ...settings } = ReviewerScannerSettings.project(
+                validatedScannerSettings(body.settings));
+              const current = await config();
+              const changed = Object.fromEntries(Object.entries(settings).filter(([key, value]) =>
+                JSON.stringify(value) !== JSON.stringify(current[key])));
+              if (Object.keys(changed).length) await local.set(changed);
+            }
+            await local.set({ scannerSettingsSyncError: '', scannerSettingsSyncedAt: Date.now() });
+            return true;
+          });
         } catch {
           await local.set({ scannerSettingsSyncError:
             'Could not load scanner-settings.json; keeping the last usable scanner settings.' }).catch(() => undefined);

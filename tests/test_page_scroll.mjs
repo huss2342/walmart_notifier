@@ -18,6 +18,7 @@ function fixture({ height = 4800, viewport = 600, reduced = false, loading = fal
   const listeners = new Map();
   const writes = [];
   const states = [];
+  const cancelled = [];
   const document = { readyState: loading ? 'loading' : 'complete',
     documentElement: { scrollHeight: height, clientHeight: viewport }, body: { scrollHeight: height } };
   const window = { scrollY: 0, scrollX: 17, innerHeight: viewport,
@@ -36,12 +37,17 @@ function fixture({ height = 4800, viewport = 600, reduced = false, loading = fal
     return id;
   };
   let randomIndex = 0;
+  const cancel = id => {
+    const task = tasks.get(id);
+    if (task) cancelled.push({ kind: task.kind, at: time });
+    tasks.delete(id);
+  };
   const options = { window, document, canContinue: () => true, budgetMs: 8000,
     now: () => time, random: () => [0.1, 0.85, 0.35, 0.65, 0.2][randomIndex++ % 5],
     requestFrame: callback => schedule(callback, freezeFrames ? Infinity : 16, 'frame'),
-    cancelFrame: id => tasks.delete(id),
+    cancelFrame: cancel,
     setTimer: (callback, delay) => schedule(callback, delay, 'timer'),
-    clearTimer: id => tasks.delete(id), onState: state => states.push({ ...state }) };
+    clearTimer: cancel, onState: state => states.push({ ...state }) };
   const flush = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
   async function advance(to) {
     await flush();
@@ -73,7 +79,7 @@ function fixture({ height = 4800, viewport = 600, reduced = false, loading = fal
     assert.ok(result, 'Scroll must settle.');
     return result;
   }
-  return { options, window, document, writes, states, tasks, listeners, advance, finish,
+  return { options, window, document, writes, states, cancelled, tasks, listeners, advance, finish,
     emit(name, event = { isTrusted: true }) { for (const listener of listeners.get(name) || []) listener(event); },
     grow(value) { document.documentElement.scrollHeight = document.body.scrollHeight = value; },
     activeListeners: () => [...listeners.values()].reduce((count, set) => count + set.size, 0) };
@@ -110,6 +116,59 @@ test('reduced motion uses immediate downward chunks without animation frames', a
   assert.equal(result.outcome, 'complete');
   assert.equal(page.window.scrollY, 4200);
   assert.equal(page.writes.length, result.steps);
+  clean(page);
+});
+
+test('timer fallback completes and genuinely settles a page when animation frames are suspended', async () => {
+  const page = fixture({ height: 2400, freezeFrames: true });
+  const result = await page.finish(helper.run(page.options));
+  assert.equal(result.outcome, 'complete');
+  assert.equal(page.window.scrollY, 1800);
+  assert.equal(result.distance, 1800);
+  assert.ok(page.writes.length > result.steps, 'Fallback retains intermediate smooth-scroll positions.');
+  const atBottom = page.writes.find(write => write.top === 1800).at;
+  assert.ok(result.durationMs - atBottom >= 1200, 'Fallback does not bypass stable-bottom proof.');
+  assert.ok(result.durationMs < 8000);
+  clean(page);
+});
+
+test('visible animation frames win their race and cancel the unused fallback timers', async () => {
+  const page = fixture({ height: 1200 });
+  const promise = helper.run(page.options);
+  await page.advance(48);
+  assert.deepEqual(page.writes.map(write => write.at), [16, 32, 48]);
+  assert.deepEqual(page.cancelled.filter(task => task.kind === 'timer').map(task => task.at), [16, 32, 48]);
+  assert.equal((await page.finish(promise)).outcome, 'complete');
+  clean(page);
+});
+
+test('timer fallback cancels suspended frames and abort clears both racers without later writes', async () => {
+  const page = fixture({ freezeFrames: true });
+  const controller = new AbortController();
+  const promise = helper.run({ ...page.options, signal: controller.signal });
+  await page.advance(100);
+  assert.ok(page.writes.length > 0, 'A suppressed animation frame cannot stall the pass.');
+  assert.ok(page.cancelled.some(task => task.kind === 'frame'));
+  const queuedCallbacks = [...page.tasks.values()].map(task => task.callback);
+  const writesBeforeAbort = page.writes.length;
+  controller.abort();
+  assert.equal((await page.finish(promise)).outcome, 'cancelled');
+  clean(page);
+  for (const callback of queuedCallbacks) callback();
+  await page.advance(500);
+  assert.equal(page.writes.length, writesBeforeAbort, 'Late cancelled callbacks cannot restart scrolling.');
+  clean(page);
+});
+
+test('role loss during a suppressed frame is rechecked before the fallback can write', async () => {
+  const page = fixture({ freezeFrames: true });
+  let current = true;
+  const promise = helper.run({ ...page.options, canContinue: () => current });
+  await page.advance(20);
+  current = false;
+  const result = await page.finish(promise);
+  assert.equal(result.outcome, 'cancelled');
+  assert.equal(page.writes.length, 0);
   clean(page);
 });
 

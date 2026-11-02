@@ -39,7 +39,11 @@ function fixture() {
   };
   const ctx = vm.createContext({ URL, console, setTimeout, clearTimeout,
     crypto: { randomUUID: () => '00000000-0000-4000-8000-000000000000' }, performance: { now: () => now },
-    VerificationChrome: { allowedUrl: raw => raw === 'https://www.walmart.com/blocked', readPage() {} } });
+    VerificationChrome: { allowedUrl: raw => raw === 'https://www.walmart.com/blocked' } });
+  for (const file of ['verification-observation.js', 'verification-protocol.js']) {
+    vm.runInContext(fs.readFileSync(new URL(`../extension/${file}`, import.meta.url), 'utf8'), ctx);
+  }
+  ctx.VerificationChrome.observePage = ctx.ReviewerVerificationObservation.observePage;
   vm.runInContext(fs.readFileSync(new URL('../extension/verification-native.js', import.meta.url), 'utf8'), ctx);
   return { api, calls, state, native: ctx.VerificationNative,
     open: () => ctx.VerificationNative.open(api, 11, async () => enabled, { connect: async () => channel }),
@@ -62,6 +66,29 @@ test('native adapter waits for idle before focus and uses its own input path', a
   assert.deepEqual(f.calls.filter(x => ['prepare', 'press', 'release'].includes(x)),
     ['prepare', 'press', 'release']);
   assert.equal(f.calls.at(-1), 'close');
+});
+
+test('native inspection passes a self-contained callback and explicit unchanged driver policy', async () => {
+  const f = fixture();
+  const d = await f.open();
+  f.api.scripting.executeScript = async options => {
+    assert.deepEqual(Array.from(options.args), ['driver']);
+    assert.equal(options.world, 'ISOLATED');
+    const page = vm.createContext({
+      location: { protocol: 'https:', hostname: 'www.walmart.com', port: '', pathname: '/blocked' },
+      document: { querySelectorAll: () => [], getElementById: () => null,
+        documentElement: { clientWidth: 800, clientHeight: 600 } },
+      performance: { timeOrigin: 123 }, innerWidth: 800, innerHeight: 600, devicePixelRatio: 1,
+    });
+    const result = vm.runInContext(`(${options.func.toString()})(...${JSON.stringify(options.args)})`, page);
+    return [{ frameId: 0, documentId: 'isolated-page', result }];
+  };
+  const observed = await d.page();
+  assert.equal(observed.eligible, true);
+  assert.equal(observed.challenge, true);
+  assert.equal(observed.target, null);
+  await d.detach();
+  assert.equal(f.calls.includes('press'), false);
 });
 
 test('busy user prevents native focus takeover and closes the helper', async () => {

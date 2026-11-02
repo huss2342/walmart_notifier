@@ -502,7 +502,7 @@ test('integrated options and manifest expose one relay control and include the s
   const html = fs.readFileSync(new URL('options.html', root), 'utf8');
   const background = fs.readFileSync(new URL('background.js', root), 'utf8');
   assert.equal(manifest.name, 'Reviewer Item Relay');
-  assert.equal(manifest.version, '2.24.1');
+  assert.equal(manifest.version, '2.26.13');
   assert.ok(manifest.permissions.includes('debugger'));
   for (const file of ['verification-engine.js', 'verification-driver.js', 'verification-automation.js']) {
     assert.ok(fs.existsSync(new URL(file, root)));

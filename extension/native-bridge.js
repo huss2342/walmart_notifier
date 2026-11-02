@@ -8,7 +8,7 @@
   worker.onMessage.addListener(message => {
     if (message?.type === 'start' && !host) {
       try {
-        host = chrome.runtime.connectNative('com.reviewer_item_relay.verification');
+        host = chrome.runtime.connectNative(VerificationNativeProtocol.hostName);
         host.onMessage.addListener(response => worker.postMessage({ response }));
         host.onDisconnect.addListener(() => { void chrome.runtime.lastError; worker.disconnect(); });
         worker.postMessage({ type: 'ready' });
