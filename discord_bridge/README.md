@@ -76,6 +76,13 @@ and saved requests. When neither entitlement remains, the service deletes saved
 requests and cancels unsent personal alerts. An uncertain API response does not
 prove a member lost access.
 
+Discord's **Integrations → Reviewer Alerts Bridge → /request** role allowlist
+must include both **Pro** and **Pro Trial**, with only **#item-requests** allowed.
+This command allowlist is separate from channel overwrites: matching channel
+permissions alone do not permit the command. Active trials use the same private
+request replies and DM matching alerts as Pro. Members must allow server DMs and
+run `/request test-dm` before receiving personal alerts.
+
 In the owner-only **#trial-management** channel:
 
 ```text

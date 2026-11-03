@@ -2,6 +2,25 @@
 
 Updated November 2, 2026 (America/Chicago).
 
+## Trial request permission parity (November 2; live and verified)
+
+Owner requested active trials have the same request permissions as Pro and
+confirmed private command replies plus DM-only matching alerts. Live investigation
+found all 22 Pro/trial channel overwrites already matched (including Send,
+View/Read and Use Application Commands in item-requests), but Discord's separate
+`/request` override allowed only Pro. Owner UI added **Pro Trial allow** to that
+single command. REST verification proves this is the only changed permission
+entry; other command metadata, everyone/channel denials, item-requests allow and
+all channel ACLs are unchanged. Full server audit is clean.
+
+**113 relevant tests passed**. Live read-only checks found 14 active trial-only
+members and verified one such member through the real request authorization and
+DM-sender membership eligibility paths. No member messages, role writes or
+synthetic requests were made. No source/runtime change or restart was needed.
+Private before/after command metadata and eligibility receipts are in
+`data/trial-request-parity-20261102/`. Keep Pro Trial in this allowlist whenever
+editing application permissions; channel auditing alone does not inspect it.
+
 ## Member trial information (November 2)
 
 Owner requested a member slash command in general before announcing trials.
