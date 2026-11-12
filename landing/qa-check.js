@@ -2,6 +2,8 @@
   title: document.title,
   viewport: innerWidth,
   overflow: document.documentElement.scrollWidth > innerWidth,
+  visibleWords: document.body.innerText.trim().split(/\s+/).length,
+  pageHeight: document.documentElement.scrollHeight,
   headings: [...document.querySelectorAll('h1,h2')].map(el => el.textContent),
   joins: [...document.querySelectorAll('[data-discord-join]')].map(el => ({
     text: el.textContent.trim(),
