@@ -16,15 +16,24 @@ function destination(search, now = '2026-11-13T00:00:00Z') {
   return link.href;
 }
 
-test('each ad routes to a different Discord invite', () => {
+test('both ad variants always use the permanent Discord invite', () => {
   const a = destination('?utm_source=reddit&utm_content=a');
   const b = destination('?utm_source=reddit&utm_content=b');
-  assert.notEqual(a, b);
+  assert.equal(a, 'https://discord.gg/VzwNcSgWBk');
+  assert.equal(b, 'https://discord.gg/VzwNcSgWBk');
   for (const value of [a, b]) {
     const url = new URL(value);
     assert.equal(url.origin, 'https://discord.gg');
     assert.match(url.pathname, /^\/[A-Za-z0-9-]+$/);
   }
+});
+
+test('every current Join button uses the permanent invite without a routing script', () => {
+  const html = readFileSync(new URL('../public/index.html', import.meta.url), 'utf8');
+  const links = [...html.matchAll(/<a\b[^>]*data-discord-join[^>]*href="([^"]+)"/g)];
+  assert.equal(links.length, 2);
+  for (const [, href] of links) assert.equal(href, 'https://discord.gg/VzwNcSgWBk');
+  assert.doesNotMatch(html, /<script\b/i);
 });
 
 test('organic visits and hostile or inherited-property parameters keep the default', () => {
