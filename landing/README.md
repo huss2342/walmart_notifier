@@ -9,8 +9,8 @@ Live website: https://reviewer-alerts.pages.dev/
 2. Keep one past high-value example, the actual bot avatar, two join buttons,
    and one collapsed trial/pricing section. Remove the walkthrough, feature
    list, duplicate pitch, and extra example cards.
-3. Run short speed-versus-trial headlines against the same image, audience,
-   landing page, and CTA. Attribute joins using separate Discord invites.
+3. Run short speed-versus-free-item headlines against the same image, audience,
+   landing page, and CTA. Use clean URLs and the permanent Discord invitation.
 4. Keep the approved $50 spending plan inside the owner's $60 ceiling, including
    previous spending. Verify all saved settings and the deployed website.
 
@@ -45,55 +45,74 @@ lowest-cost bidding. Do not change billing details or add an advertising pixel.
 
 Budget reference: [Reddit Budgets and Bidding](https://business.reddithelp.com/articles/Knowledge/How-much-do-Reddit-Ads-cost).
 
-## Headline test and attribution
+## Current headlines and permanent invitation
 
 | Variant | Headline | Characters | Discord invite |
 | --- | --- | --- | --- |
-| A | $100+ Walmart RR alerts in ~6 seconds | 37 | `5nUpFYyUj` |
-| B | Walmart RR alerts. Free Pro trial. | 34 | `CwFh53XD` |
+| A | $100+ Walmart RR alerts in ~6 seconds | 37 | `VzwNcSgWBk` |
+| B | Catch free $100+ Walmart RR items | 33 | `VzwNcSgWBk` |
 
-Both invite counters were zero when inspected, and both allow unlimited uses.
-A expires November 28; B expires November 19. Two unused invites created while
-preparing the test (`MMwDEJsVt` and `cpsEX3v3`) were removed; the existing
-permanent invitation was preserved.
+Both ad destinations are now exactly `https://reviewer-alerts.pages.dev/`.
+All Join buttons use `https://discord.gg/VzwNcSgWBk`. Discord's public invite
+endpoint verified the correct Reviewer Alerts server and `expires_at: null` on
+November 13. No new invitation was created for this revision.
 
-Both ad destinations use `utm_source=reddit`, `utm_medium=paid_social`,
-`utm_campaign=rr_headline_20261112`, and `utm_content=a` or `b`. Only the
-headline and attribution label differ. The same website and offer serve both.
-Primary image pixels were checked and match between the two existing creatives.
+The November 12 setup used campaign URL tags to select separate invitations
+and compare aggregate joins. A used an existing zero-use invitation
+`5nUpFYyUj`; B used the new invitation `CwFh53XD`. The owner requested clean
+URLs and a permanent Join link on November 13, so this routing was removed.
+Old tagged visits now keep the permanent invitation. The current page loads no
+JavaScript; a comment-only `campaign.js` remains for previously cached HTML.
 
-On November 19 at 23:00 UTC, campaign routing falls back to the existing
-permanent invite so later visits still work. Unknown parameters and visitors
-without JavaScript retain that permanent link.
+The original B headline, "Walmart RR alerts. Free Pro trial.", was replaced on
+November 13 at 8:51 AM CST. B's name is now `RR B | Free items | 2026-11-13`.
+The primary image and Learn More CTA are retained. The landing page now leads
+its supporting copy with "Free couches, appliances, and $100+ finds."
 
-Read invite-use totals in Discord **Server Settings → Invites** and divide each
-ad's spend by its invite-use increase. Counts are joins through those links,
-not paid subscriptions or guaranteed unique new users. Shared links and repeat
-joins can affect attribution. Delivery in one ad group may be uneven; this is a
-directional comparison, not a guaranteed randomized 50/50 experiment. With this
-small remaining budget, do not declare a conclusive winner from sparse results.
+Without separate invitations, Reddit can compare impressions, clicks, CTR, and
+CPC, but this website cannot attribute Discord joins to a particular headline.
+Delivery in one ad group may be uneven; this is a directional comparison, not a
+guaranteed randomized 50/50 experiment. Do not declare a winner from sparse data.
+
+## Performance snapshot before the November 13 edits
+
+Reddit Ads Manager, November 12–13 reporting range, read before changing B:
+
+| Original variant | Impressions | Clicks | Reported spend |
+| --- | ---: | ---: | ---: |
+| A: speed headline | 1 | 0 | $0.00 |
+| B: free Pro trial headline | 1 | 0 | $0.00 |
+
+Neither headline has evidence of better performance. Both were enabled and
+Active; reporting is delayed. The edited ads keep their ad IDs, so distinguish
+the pre-edit snapshot from future results using the 8:51 AM CST revision time.
 
 ## Verification and release
 
-- Visible copy reduced from 282 to 84 words (approximately 70%).
+- Visible copy reduced from 282 to 83 words (approximately 70%).
 - Checked 320, 375 with touch emulation, 768, 1024, and 1440 pixel widths.
 - No horizontal overflow; avatar and product image load; both join buttons work.
 - Keyboard access and console checked; no console errors.
-- Three route tests pass: distinct invites, hostile/unknown input, expiry fallback.
+- Four tests pass: both variants keep the permanent invite, current HTML uses
+  permanent links without a routing script, hostile/unknown input, future visits.
 - Fixed allowlisted URLs only; no arbitrary redirects, cookies, visitor storage,
   network beacons, third-party pixels, or new application dependencies.
 - Production returns 200 with CSP, referrer policy, and working self-hosted avatar.
-- Static release: https://ff22fa03.reviewer-alerts.pages.dev/ (source `73be61a`).
+- Current static release: https://2c2d89f3.reviewer-alerts.pages.dev/ (source `04d549f`).
+- November 13 production checks: old B tags at desktop width and old A tags at
+  375-pixel touch width both keep the permanent invitation; no overflow, loaded
+  avatar and product image, zero console errors or warnings, screenshot reviewed.
 - Reddit saved one replacement campaign, one ad group, two ads, and two posts.
 - Campaign `2633996234531549277` enabled; $10.98 Lifetime, Lowest cost,
   November 12 at 7 PM through November 14 at 6 PM CST verified in View Setup.
 - Ad group `2633996234524189314` enabled; campaign schedule inherited,
   United States, sole community RecognizedReviewer, automated targeting False,
   and Feed + Conversations verified from saved settings.
-- A: ad `2633996234526107767`, post `t3_1xutfnq`.
-- B: ad `2633996234526712340`, post `t3_1xutfnr`.
-- Both ads enabled with correct distinct destination URLs. Both Admin Approval
-  statuses Pending and delivery statuses Processing at final read-back.
+- A: ad `2633996234526107767`, current post `t3_1xv9vd3`.
+- B: ad `2633996234526712340`, current post `t3_1xv9vd1`.
+- Both edited ads enabled, with the clean destination URL verified in View Setup.
+  Both Admin Approval statuses Pending after the November 13 edits. The saved B
+  headline and unchanged CTA/image were also checked in the Assets view.
 - Original campaign `2624276685116702694` remains paused. Its old $60 budget and
   November 30 schedule were not changed because the attempted edit failed.
 
