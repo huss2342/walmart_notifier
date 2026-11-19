@@ -50,6 +50,9 @@ from notifiers import build_notifier  # noqa: E402
 from notifiers.discord import DiscordNotifier  # noqa: E402
 from notifiers.telegram import TelegramNotifier  # noqa: E402
 from operational_logging import OperationalLog, RequestLoggingMixin  # noqa: E402
+from page_snapshots import MAX_BODY_BYTES as MAX_PAGE_SNAPSHOT_BYTES  # noqa: E402
+from page_snapshots import PageSnapshotLog  # noqa: E402
+from page_snapshots import parse_batch as parse_page_snapshots  # noqa: E402
 from pipeline import process  # noqa: E402
 from relay_settings import RelaySettingsStore  # noqa: E402
 from relay_watchdog import RelayWatchdog  # noqa: E402
@@ -488,6 +491,8 @@ class Handler(RequestLoggingMixin, BaseHTTPRequestHandler):
     scanner_settings: ScannerSettingsStore
     scanner_commands: ScannerCommandsStore
     scanner_status: ScannerStatusStore
+    # Freshness study (extension 2.32.7): what every list read showed.
+    page_snapshots: PageSnapshotLog | None = None
     telegram_commands: TelegramCommandPoller | None = None
     intake_gate: IntakeGate = IntakeGate()  # serve() installs a fresh one
 
@@ -558,6 +563,25 @@ class Handler(RequestLoggingMixin, BaseHTTPRequestHandler):
             self._reply(500, {"error": "Could not save research result."})
             return
         self._reply(200, {"ok": True})
+
+    def _receive_page_snapshots(self) -> None:
+        """Validated per record (src/page_snapshots.py); a bad record never fails the batch."""
+        log_writer = self.page_snapshots
+        if log_writer is None:
+            self._reply(503, {"error": "Page snapshots unavailable."})
+            return
+        body = self._read_body(MAX_PAGE_SNAPSHOT_BYTES)
+        if body is None:
+            return
+        try:
+            records, rejected, dropped = parse_page_snapshots(body)
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            self._reply(400, {"error": "Invalid page snapshots."})
+            return
+        if not log_writer.record(records, rejected, dropped):
+            self._reply(500, {"error": "Could not save page snapshots."})
+            return
+        self._reply(200, {"ok": True, "accepted": len(records), "rejected": rejected})
 
     def _authorized(self) -> bool:
         if not self.token:
@@ -650,6 +674,8 @@ class Handler(RequestLoggingMixin, BaseHTTPRequestHandler):
                     if self.operations is not None else {"enabled": False},
                     "browser": diagnostics.health()
                     if callable(getattr(diagnostics, "health", None)) else {},
+                    "page_snapshots": self.page_snapshots.status()
+                    if self.page_snapshots is not None else {"enabled": False},
                 },
                 "discord": (
                     self.notifier.health() if isinstance(self.notifier, DiscordNotifier) else None
@@ -786,7 +812,8 @@ class Handler(RequestLoggingMixin, BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.split("?")[0].rstrip("/")
         if path not in ("/ingest", "/test-notification", "/bot-check", "/rescan", "/relay-status",
-                        "/browser-diagnostics", "/scanner-status", "/research-results"):
+                        "/browser-diagnostics", "/scanner-status", "/research-results",
+                        "/page-snapshots"):
             self._reply(404, "not found")
             return
         if not self._authorized():
@@ -804,6 +831,11 @@ class Handler(RequestLoggingMixin, BaseHTTPRequestHandler):
         if path == "/research-results":
             if self._require_json():
                 self._receive_research_result()
+            return
+
+        if path == "/page-snapshots":
+            if self._require_json():
+                self._receive_page_snapshots()
             return
 
         if path == "/relay-status":
@@ -1280,6 +1312,9 @@ def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
         Handler.store.path.parent if Handler.store.path else None, background=True
     )
     Handler.operations.emit('service_starting', component='backend')
+    Handler.page_snapshots = PageSnapshotLog(
+        Handler.store.path.parent if Handler.store.path else None
+    )
     Handler.token = token
     Handler.notifier = build_notifier()
     Handler.runtime_status = RuntimeStatus(Handler.store)
@@ -1384,6 +1419,7 @@ def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
         httpd.server_close()
         Handler.operations.emit('service_stopped', component='backend')
         Handler.operations.flush()
+        Handler.page_snapshots.flush()
 
 
 def main() -> None:

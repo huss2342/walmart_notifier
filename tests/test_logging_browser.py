@@ -408,6 +408,25 @@ def test_research_reads_are_logged_as_their_own_fast_read_lane():
     assert store.snapshot()["report"] == incoming
 
 
+def test_freshness_probe_reads_log_the_new80_lane_and_a_true_fresh_flag_only():
+    incoming = report((1, 2))
+    incoming["events"][0].update(
+        event="fast-read", lane="new80", outcome="items", page=1, items=40, fresh=True,
+        durationMs=900, responseStatus=200, totalPages=8,
+    )
+    incoming["events"][1].update(event="fast-read", lane="value80", outcome="items", page=3,
+                                 fresh=True)
+    store = BrowserDiagnosticsStore(":memory:")
+    store.record_report(incoming)
+    assert store.snapshot()["report"] == incoming
+    for bad in ({"event": "fast-read", "lane": "new80", "outcome": "items", "fresh": False},
+                {"event": "page-delivered", "lane": "home", "fresh": True}):
+        rejected = report((1,))
+        rejected["events"][0].update(bad)
+        with pytest.raises(ValueError, match="Invalid browser diagnostics report"):
+            BrowserDiagnosticsStore(":memory:").record_report(rejected)
+
+
 def restock_event(**changes):
     event = {"at": NOW, "event": "restock-watch", "itemId": "ip-20755219869", "stage": "returned",
              "stockState": "in-stock", "stockSource": "data", "signalV2": "in",

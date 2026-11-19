@@ -86,8 +86,13 @@ test('the $80+ list read must be exactly sort=price_high with min_price=79, as W
   assert.equal((await fastRead(list)).ok, true);
   html = listPage('');
   assert.equal((await fastRead(list)).ok, false, 'a page served without the filter proves nothing');
-  for (const url of [`${HOME}?sort=new&min_price=79`, `${HOME}?sort=price_high&min_price=50`,
-    `${HOME}?q=sofa&queryNups=sofa&sort=price_high&min_price=79`]) {
+  // Freshness probes (2.32.7) also read the same list newest first.
+  html = listPage('79', 'new');
+  assert.equal((await fastRead(`${HOME}?sort=new&min_price=79&page=2`)).ok, true);
+  assert.equal((await fastRead(list)).ok, false, 'a price_high read served newest first proves nothing');
+  for (const url of [`${HOME}?sort=price_high&min_price=50`, `${HOME}?sort=new&min_price=80`,
+    `${HOME}?min_price=79`, `${HOME}?q=sofa&queryNups=sofa&sort=price_high&min_price=79`,
+    `${HOME}?q=sofa&queryNups=sofa&sort=new&min_price=79`]) {
     assert.equal((await fastRead(url)).reason, 'scope', url);
   }
 });
@@ -115,6 +120,26 @@ test('fast read maps free catalogue products exactly like card items', async () 
   assert.deepEqual({ ...result.stock }, { in: 1, out: 1, other: 0 });
   assert.equal(result.bytes > 0, true);
   assert.equal(result.age, undefined);
+});
+
+test('a fast read lists every product on its page for the snapshot log, in page order', async () => {
+  const fastRead = reader(() => ok(page({ sort: 'price_high', items: [
+    { ...product(21155107170, { price: '1,149.99' }), category: { categoryPathId: '0:4044:103150' }, startDate: null },
+    product(1234567, { free: false }),
+    { ...product(7654321, { stock: 'OUT_OF_STOCK', price: '20.00' }), category: { categoryPathId: '0:1' },
+      releaseDate: '2026-11-18', availabilityTime: 'soon<script>' },
+    { ...product(7654322, { stock: 'PREORDER', price: '99.00' }),
+      category: { path: [{ url: '/cp/home/4044' }, { url: '/browse/home/furniture/4044_103150?povid=x' }] } }] })));
+  const result = await fastRead('https://www.walmart.com/reviews/claim-product?sort=price_high');
+  assert.equal(result.ok, true);
+  // [usItemId, position among products, free price in cents, stock, extra]: the
+  // category only for $80+ offers, date-like fields only with a plain value.
+  assert.deepEqual(result.snapshot, [
+    ['21155107170', 1, 114_999, 'i', { c: '0:4044:103150' }],
+    ['1234567', 2, null, 'i'],
+    ['7654321', 3, 2_000, 'o', { d: { releaseDate: '2026-11-18' } }],
+    ['7654322', 4, 9_900, 'x', { c: '4044_103150' }]]);
+  assert.equal(result.items.length, 3, 'the delivered items are unchanged');
 });
 
 test('a read reports its stock mix, every Walmart stock field and the CDN age', async () => {
@@ -252,6 +277,7 @@ function harness({ respond = () => ({ ok: true, status: 200, items: [] }), searc
   const logs = [];
   const asked = [];
   const delays = [];
+  const records = []; // The page snapshot log (2.32.7): every read and the freshness probes.
   const chrome = {
     storage: { local: { async get(key) { return { [key]: store[key] }; }, async set(values) { Object.assign(store, values); } } },
     alarms: { async get() { return null; }, async create() {} },
@@ -268,9 +294,10 @@ function harness({ respond = () => ({ ok: true, status: 200, items: [] }), searc
     paused, diagnostic: details => logs.push(details),
     queries: async () => searches, departments: async () => departments, onBlocked,
     ...(mustSend ? { mustSend } : {}), ...(hotSeeds ? { hotSeeds } : {}),
-    setTimer: (_fn, delay) => { delays.push(delay); return 1; }, clearTimer: () => {}, random: () => 0.5
+    setTimer: (_fn, delay) => { delays.push(delay); return 1; }, clearTimer: () => {}, random: () => 0.5,
+    snapshot: record => records.push(JSON.parse(JSON.stringify(record)))
   });
-  return { api, store, sent, logs, asked, delays, FastReads: context.FastReads,
+  return { api, store, sent, logs, asked, delays, records, FastReads: context.FastReads,
     advance(ms) { now += ms; },
     now() { return now; },
     async steps(count, ms = 2_500) {
@@ -1032,7 +1059,8 @@ test('search reads log a hash of the normalised query, the hot flag, the $80+ co
     send: () => ({ ok: true, summary: { new: 1 }, requestId: 'ab'.repeat(16) }),
     respond: url => describe(url).startsWith('search:')
       ? searchReply([offer(1_400_001, 150), offer(1_400_002, 20)]) : valueReply([120])(url) });
-  await h.steps(20);
+  // The $150 offer no list shows starts a freshness probe (2.32.7): a few extra reads first.
+  await h.steps(30);
   const byHash = hash => h.logs.filter(row => row.searchHash === hash);
   assert.equal(h.FastReads.searchHash('desk lamp'), fnv('desk lamp'));
   assert.equal(h.FastReads.searchHash('café crème'), fnv('café crème'), 'UTF-8 bytes, like Python');
@@ -1091,4 +1119,242 @@ test('at production scale with hot searches and the Nov 19 budget, member search
   assert.ok(newest.length >= 6 && newest.every(gap => gap >= 300_000 && gap <= 390_000), `newest: ${newest}`);
   const empty = members.filter((_, index) => index % 2).flatMap(query => gaps(after.h.asked, `search:${query}:1`));
   assert.ok(empty.length >= 20 && empty.every(gap => gap >= 1_800_000 && gap <= 35 * 60_000), `empty: ${empty}`);
+});
+
+// --- freshness probes (2.32.7) -------------------------------------------------
+// The min_price=79 list has 3 pages ($300-$210, $200-$130, $125-$79); a member
+// search "desk" shows NEW, a $150 offer no catalogue list shows yet.
+const NEW = 21_500_000_001;
+const shape = url => {
+  const parsed = new URL(url);
+  const page = Number(parsed.searchParams.get('page') || 1);
+  if (parsed.searchParams.get('catId')) return `department:${parsed.searchParams.get('catId')}:${page}`;
+  if (parsed.searchParams.get('q')) return `search:${parsed.searchParams.get('q')}:${page}`;
+  const min = parsed.searchParams.get('min_price') === '79';
+  const high = parsed.searchParams.get('sort') === 'price_high';
+  return `${high ? (min ? 'value80' : 'value') : (min ? 'new80' : 'newest')}:${page}`;
+};
+const LIST80 = { 1: [300, 290, 280, 270, 260, 250, 240, 230, 220, 210],
+  2: [200, 190, 180, 170, 160, 150, 145, 140, 135, 130], 3: [125, 120, 110, 100, 95, 90, 85, 80, 79.5, 79] };
+const IDLE80 = { 1: LIST80[1], 2: LIST80[2], 3: [79.99, 79.9, 79.8, 79.7, 79.6, 79.5, 79.4, 79.3, 79.2, 79.1] };
+
+function freshWorld({ appearAt = Infinity, appearPage = 2, price = 150, category = '0:4044:103150', available = true,
+  list80 = LIST80, newest = [], searchItems = null, blockOn = '', page3BrokenUntil = 0 } = {}) {
+  let now = () => 0;
+  const respond = url => {
+    const what = shape(url);
+    const page = Number(what.split(':').at(-1));
+    if (blockOn && what === blockOn) return { ok: false, blocked: true, status: 429 };
+    if (what === 'value80:3' && now() < page3BrokenUntil) return { ok: false, status: 500 };
+    if (what.startsWith('search:')) {
+      const items = searchItems || [offer(NEW, price, available)];
+      return { ...searchReply(items), snapshot: items.map((entry, index) => [entry.item_id.slice(3), index + 1,
+        Math.round(entry.value_usd * 100), entry.available ? 'i' : 'o', ...(category ? [{ c: category }] : [])]) };
+    }
+    if (what.startsWith('value80:')) {
+      const items = (list80[page] || []).map((value, index) => offer(5_100_000 + page * 100 + index, value));
+      if (now() >= appearAt && page === appearPage) items.splice(5, 0, offer(NEW, price));
+      return { ok: true, status: 200, totalPages: Object.keys(list80).length, products: items.length, items };
+    }
+    if (what.startsWith('value:')) return valueReply([210, 140, 85, 60, 45, 35])(url);
+    if (what.startsWith('newest:') || what.startsWith('new80:')) {
+      return { ok: true, status: 200, totalPages: 8, products: 2 + newest.length,
+        items: [...newest, offer(5_900_001, 99), offer(5_900_002, 15)] };
+    }
+    if (what.startsWith('department:')) {
+      return { ok: true, status: 200, totalPages: 25, products: 1, items: [offer(5_800_001, 30)] };
+    }
+    return { ok: true, status: 200, items: [] };
+  };
+  return { respond, bind(h) { now = () => h.now(); return h; } };
+}
+
+const DEPARTMENTS = [{ catId: '4044', index: 1 }, { catId: '4044_103150', index: 2 }, { catId: '1085666', index: 3 }];
+const freshHarness = (world, options = {}) => world.bind(harness({ respond: world.respond,
+  searches: { members: ['desk'] }, departments: DEPARTMENTS, ...options }));
+const freshAsks = h => h.asked.map((row, index) => ({ ...row, index, what: shape(row.url) }));
+const probeRecords = (h, event) => h.records.filter(row => row.kind === 'probe' && (!event || row.event === event));
+const usedReads = (count, now = 1_000_000) => ({ reviewerFreshnessProbes: { v: 1,
+  reads: Array.from({ length: count }, (_, index) => now - index * 600_000), starts: [], probed: [] } });
+
+test('a search-only $80+ item starts a probe: the predicted $80+ page, both new lists and its department, at once', async () => {
+  const h = freshHarness(freshWorld({ appearAt: 1_000_000 + 4 * 60_000 }));
+  await h.steps(40);
+  const [start] = probeRecords(h, 'start');
+  assert.ok(start, JSON.stringify(probeRecords(h)));
+  assert.equal(start.itemId, `ip-${NEW}`);
+  assert.equal(start.valueCents, 15_000);
+  assert.deepEqual([start.predictedPage, start.pages, start.plannedReads], [2, [2], 4]);
+  assert.equal(start.department, '4044_103150', 'the longest known department on the category path');
+  assert.equal(start.category, '0:4044:103150');
+  assert.deepEqual(start.trigger, { lane: 'requests', page: 1, searchHash: fnv('desk'), position: 1 });
+  const asks = freshAsks(h);
+  const search = asks.find(row => row.what === 'search:desk:1');
+  // Probe reads come straight after the search read, behind nothing but price_high page 1.
+  const after = asks.slice(search.index + 1).filter(row => row.what !== 'value:1').slice(0, 4).map(row => row.what);
+  assert.deepEqual(after, ['value80:2', 'newest:1', 'new80:1', 'department:4044_103150:1']);
+  const extra = h.records.filter(row => row.kind === 'read' && row.probe === start.probe);
+  assert.deepEqual(extra.map(row => row.lane), ['value80', 'newest', 'new80', 'departments']);
+  assert.ok(extra.every(row => row.outcome === 'items' && row.items.length > 0));
+  assert.deepEqual(extra.map(row => [row.sort ?? '', row.minPrice ?? 0, row.catId ?? '']),
+    [['price_high', 79, ''], ['new', 0, ''], ['new', 79, ''], ['', 0, '4044_103150']]);
+  // Measurement only: never ingested, logged as extra (fresh) reads.
+  assert.equal(h.sent.some(row => ['new80', 'departments'].includes(row.lane)), false);
+  assert.equal(h.logs.filter(row => row.fresh === true).length, 4);
+  assert.ok(h.logs.filter(row => row.fresh === true).every(row => !('searchHash' in row)));
+});
+
+test('a probe ends when the item shows on the $80+ list, with its lag; normal 40 s reads cover the re-checks', async () => {
+  const appearAt = 1_000_000 + 4 * 60_000;
+  const h = freshHarness(freshWorld({ appearAt }));
+  await h.steps(200); // 500 s
+  const [start] = probeRecords(h, 'start');
+  const [end] = probeRecords(h, 'end');
+  assert.ok(end, JSON.stringify(probeRecords(h)));
+  assert.equal(end.probe, start.probe);
+  assert.equal(end.outcome, 'appeared');
+  assert.equal(end.extraReads, 4, 'page 2 is read every 40 s anyway: no extra re-reads');
+  assert.deepEqual([end.first.value80.page, end.first.value80.position], [2, 6]);
+  assert.ok(end.first.value80.at >= appearAt && end.first.value80.at <= appearAt + 45_000, String(end.first.value80.at));
+  assert.equal(end.lagMs, end.first.value80.at - start.startedAt);
+  assert.ok(end.checks.some(check => check.shape === 'new80' && check.extra === true && check.found === false));
+  assert.ok(end.checks.filter(check => check.shape === 'value80' && !check.extra).length >= 3, 'normal reads count');
+  assert.equal(probeRecords(h, 'start').length, 1, 'one probe per item');
+  const state = await h.api.freshness();
+  assert.deepEqual([state.active.length, state.readsToday, state.startsThisHour], [0, 4, 1]);
+});
+
+test('an idle predicted page is re-read every 60 s until 20 minutes pass; then its cadence is back', async () => {
+  // Page 3 holds no $80+ offer (normally read every 3 min); an $80 offer belongs there.
+  const h = freshHarness(freshWorld({ price: 80, category: '', list80: IDLE80 }));
+  await h.steps(700); // ~29 min
+  const [start] = probeRecords(h, 'start');
+  assert.deepEqual([start.predictedPage, start.pages, start.plannedReads], [3, [2, 3], 4], 'near the edge: page 2 too');
+  const [end] = probeRecords(h, 'end');
+  assert.equal(end.outcome, 'timeout');
+  assert.ok(end.at - start.startedAt >= 20 * 60_000 && end.at - start.startedAt <= 20 * 60_000 + 5_000);
+  const reads = freshAsks(h).filter(row => row.what === 'value80:3').map(row => row.at);
+  const during = reads.filter(at => at > start.startedAt && at < end.at);
+  const duringGaps = during.slice(1).map((at, index) => at - during[index]);
+  assert.ok(duringGaps.length >= 15 && duringGaps.every(gap => gap <= 65_000), `re-checked every 60 s: ${duringGaps}`);
+  const extra = h.records.filter(row => row.kind === 'read' && row.probe === start.probe);
+  assert.equal(extra.length, end.extraReads);
+  assert.ok(end.extraReads >= 12 && end.extraReads <= 24, String(end.extraReads));
+  assert.ok(extra.filter(row => row.lane === 'value80' && row.page === 2).length <= 1, 'page 2 is read every 40 s anyway');
+  const afterEnd = reads.filter(at => at > end.at + 60_000);
+  assert.ok(afterEnd.length >= 1 && afterEnd.slice(1).every((at, index) => at - afterEnd[index] >= 170_000),
+    'back to its 3 min cadence');
+  assert.equal(h.store.reviewerFreshnessProbes.reads.length, end.extraReads, 'extra reads persisted');
+});
+
+test('no probe for items a list showed in the last 30 min, sold-out or under-$80 offers, or before the list is warm', async () => {
+  const h1 = freshHarness(freshWorld({ newest: [offer(NEW, 150)] }));
+  await h1.steps(120);
+  assert.ok(freshAsks(h1).some(row => row.what === 'search:desk:1'));
+  assert.equal(probeRecords(h1).length, 0, 'sort=new showed it');
+  for (const world of [freshWorld({ available: false }), freshWorld({ price: 79.99 })]) {
+    const h = freshHarness(world);
+    await h.steps(120);
+    assert.equal(probeRecords(h).length, 0);
+    assert.equal(freshAsks(h).some(row => row.what.startsWith('new80:')), false);
+  }
+  // Until every page of the $80+ list has been read since the worker started,
+  // the search alone proves nothing (page 3 fails for the first 5 minutes).
+  const ready = 1_000_000 + 5 * 60_000;
+  const cold = freshHarness(freshWorld({ page3BrokenUntil: ready, category: '' }));
+  await cold.steps(110); // 275 s
+  assert.ok(freshAsks(cold).filter(row => row.what === 'search:desk:1').length >= 1);
+  assert.equal(probeRecords(cold).length, 0);
+  await cold.steps(150);
+  const [start] = probeRecords(cold, 'start');
+  assert.ok(start && start.startedAt > ready, JSON.stringify(probeRecords(cold)));
+});
+
+test('caps: two probes at once, eight starts an hour, 100 extra reads a day, all persisted', async () => {
+  const many = [offer(NEW, 150), offer(NEW + 1, 160), offer(NEW + 2, 170)];
+  const h = freshHarness(freshWorld({ searchItems: many, category: '' }));
+  await h.steps(40);
+  assert.deepEqual(probeRecords(h, 'start').map(row => row.itemId), [`ip-${NEW}`, `ip-${NEW + 1}`]);
+  assert.deepEqual(probeRecords(h, 'skipped').map(row => [row.itemId, row.reason]), [[`ip-${NEW + 2}`, 'active']]);
+  const stored = JSON.parse(JSON.stringify(h.store.reviewerFreshnessProbes));
+  assert.equal(stored.v, 1);
+  assert.equal(stored.starts.length, 2);
+  assert.deepEqual(stored.probed.map(row => row[0]).sort(), many.map(row => row.item_id).sort());
+
+  const now = 1_000_000;
+  const hourly = freshHarness(freshWorld({ category: '' }), { store: { reviewerFreshnessProbes: { v: 1, reads: [],
+    starts: Array.from({ length: 8 }, (_, index) => now - index * 60_000), probed: [] } } });
+  await hourly.steps(40);
+  assert.deepEqual(probeRecords(hourly).map(row => [row.event, row.reason]), [['skipped', 'hourly']]);
+
+  const daily = freshHarness(freshWorld({ category: '' }), { store: usedReads(98) });
+  await daily.steps(40);
+  assert.deepEqual(probeRecords(daily).map(row => [row.event, row.reason]), [['skipped', 'daily']]);
+  assert.equal(freshAsks(daily).some(row => row.what.startsWith('new80:')), false);
+
+  // 96 used: the 4 planned reads fit, then the cap stops the re-checks of an idle page.
+  const late = freshHarness(freshWorld({ price: 80, category: '', list80: IDLE80 }), { store: usedReads(96) });
+  await late.steps(700);
+  const [end] = probeRecords(late, 'end');
+  assert.equal(end.extraReads, 4);
+  assert.ok(end.droppedReads >= 1, JSON.stringify(end));
+  assert.equal(late.store.reviewerFreshnessProbes.reads.length, 100);
+  assert.equal(late.records.filter(row => row.kind === 'read' && row.probe).length, 4);
+  // 22 hours on most of the budget is free again, but the same item is not probed twice in a day.
+  late.advance(22 * 60 * 60_000);
+  await late.steps(60);
+  assert.ok(freshAsks(late).some(row => row.at > 1_000_000 + 22 * 60 * 60_000 && row.what === 'search:desk:1'));
+  assert.equal(probeRecords(late, 'start').length, 1);
+  assert.equal(probeRecords(late, 'skipped').length, 0);
+});
+
+test('probe reads go through the limiter one at a time and price_high page 1 keeps its 10 s', async () => {
+  const h = freshHarness(freshWorld({ searchItems: [offer(NEW, 150), offer(NEW + 1, 290)] }));
+  await h.steps(4_000, 100); // 400 s in 100 ms ticks: only the limiter spaces the reads
+  assert.equal(probeRecords(h, 'start').length, 2);
+  const times = h.asked.map(row => row.at);
+  const spacing = times.slice(1).map((at, index) => at - times[index]);
+  assert.ok(spacing.every(gap => gap >= h.FastReads.MIN_SPACING_MS), `spacing: ${Math.min(...spacing)}`);
+  assert.ok(gaps(freshAsks(h), 'value:1').every(gap => gap <= 12_500), 'price_high page 1 is never delayed');
+  assert.ok(h.records.filter(row => row.kind === 'read' && row.probe).length >= 7);
+});
+
+test('never in the safe period after a bot-check sign; a block mid-probe ends it and stops its reads', async () => {
+  const start = 1_000_000;
+  const safe = freshHarness(freshWorld(), { store: { reviewerFastReads: { blocks: 0, until: 0,
+    slowUntil: start + 24 * 60 * 60_000 } } });
+  await safe.steps(200, 3_000);
+  assert.ok(freshAsks(safe).some(row => row.what === 'search:desk:1'), 'the member search still runs');
+  assert.equal(probeRecords(safe).length, 0);
+  assert.equal(safe.records.some(row => row.probe), false);
+
+  // Only probes read sort=new&min_price=79: the bot-check sign comes on a probe read.
+  const blocked = freshHarness(freshWorld({ blockOn: 'new80:1', category: '' }));
+  await blocked.steps(30);
+  const [end] = probeRecords(blocked, 'end');
+  assert.equal(end.outcome, 'blocked');
+  const sign = blocked.records.find(row => row.kind === 'read' && row.outcome === 'blocked');
+  assert.equal(sign.lane, 'new80');
+  blocked.advance(6 * 60_000); // past the 5 min back-off, inside the day of gentler reads
+  await blocked.steps(200, 3_000);
+  assert.ok(freshAsks(blocked).some(row => row.at > sign.at + 6 * 60_000 && row.what === 'search:desk:1'));
+  assert.equal(blocked.records.filter(row => row.kind === 'read' && row.probe && row.at > sign.at).length, 0);
+  assert.equal(probeRecords(blocked, 'start').length, 1);
+});
+
+test('every read goes to the snapshot log with its shape and products, searches only as a hash', async () => {
+  const h = freshHarness(freshWorld(), { searches: { members: ['Desk  Lamp'] } });
+  await h.steps(30);
+  const reads = h.records.filter(row => row.kind === 'read');
+  assert.equal(reads.length, h.asked.length, 'one record per read');
+  const v80 = reads.find(row => row.lane === 'value80' && row.page === 2);
+  assert.deepEqual([v80.source, v80.sort, v80.minPrice, v80.outcome, v80.totalPages], ['fast', 'price_high', 79, 'items', 3]);
+  assert.deepEqual(v80.items[0], ['5100200', 1, 20_000, 'i']);
+  const search = reads.find(row => row.lane === 'requests');
+  assert.equal(search.searchHash, fnv('desk lamp'));
+  assert.deepEqual(search.items[0], [String(NEW), 1, 15_000, 'i', { c: '0:4044:103150' }]);
+  const text = JSON.stringify(h.records);
+  for (const word of ['Desk', 'Lamp', 'lamp', 'desk']) assert.equal(text.includes(word), false, word);
+  assert.equal(h.FastReads.queryHash('  Desk   LAMP '), fnv('desk lamp'));
+  assert.equal(h.FastReads.queryHash(''), null);
 });

@@ -175,6 +175,7 @@ ROUTES = frozenset(
         "/scanner-commands",
         "/test",
         "/rescan",
+        "/page-snapshots",
         "/",
         "/rules",
         "/relay-status",
@@ -206,7 +207,7 @@ LABELS = {
     },
     "method": {"GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH", "OTHER"},
     "lane": {"home", "departments", "keywords", "brands", "priority", "requests",
-             "newest", "value", "value80", "research"},
+             "newest", "value", "value80", "research", "new80"},
     "state": {
         "pending",
         "leased",
@@ -483,6 +484,8 @@ LABELS["rate_limit_source"] = {"local", "server", "unknown"}
 # fast-read stock mix/transport facts and restock-watch timings (see docs/logging.md).
 NUMBERS |= {"stockIn", "stockOut", "stockOther", "bytes", "ageSeconds", "products", "valueCents",
             "awayMs", "sinceOutMs", "sinceReturnMs", "outReads", "reads"}
+# fast-read searchHash (2.32.6): 32-bit FNV-1a of a normalised query, never its text.
+NUMBERS |= {"searchHash"}
 NUMBERS |= {"status", "provider_code", "retry_after_seconds", "ratelimit_remaining",
             "search_matched", "below_minimum", "unavailable", "value_missing", "searched",
             "matched", "deduplicated", "held"}

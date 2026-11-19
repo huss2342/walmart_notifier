@@ -281,6 +281,15 @@ test('search reads keep a query hash, the hot flag and the upload request id, ne
     undefined);
 });
 
+test('freshness probe reads log the new80 lane and only a true fresh flag', () => {
+  const f = fixture();
+  const e = f.api.cleanDiagnostic('fast-read', { lane: 'new80', outcome: 'items', page: 1, fresh: true }, 1);
+  assert.deepEqual([e.lane, e.fresh], ['new80', true]);
+  assert.equal(f.api.cleanDiagnostic('fast-read', { lane: 'value80', outcome: 'items', fresh: 'yes' }, 1).fresh,
+    undefined);
+  assert.equal(f.api.cleanDiagnostic('page-delivered', { lane: 'home', fresh: true }, 1).fresh, undefined);
+});
+
 test('direct reads log their stock mix, size, CDN age and product count', () => {
   const f = fixture();
   const e = f.api.cleanDiagnostic('fast-read', { lane: 'value80', outcome: 'items', page: 2, items: 41,
@@ -290,7 +299,7 @@ test('direct reads log their stock mix, size, CDN age and product count', () => 
 
 const background = fs.readFileSync(new URL('../extension/background.js', import.meta.url), 'utf8');
 function ingestFixture({ fetchImpl, authorization } = {}) {
-  const events = [], calls = [];
+  const events = [], calls = [], snapshots = [];
   const context = vm.createContext({ URL, Date, Promise, AbortController, setTimeout, clearTimeout,
     console: { error() {} }, MAX_INGEST_ITEMS: 200, FETCH_TIMEOUT_MS: 500,
     DIAGNOSTIC_HEX: /^[0-9a-f]{32}$/,
@@ -308,14 +317,16 @@ function ingestFixture({ fetchImpl, authorization } = {}) {
     auxiliaryScans: { async ownsTab() { return false; } },
     restockWatch: { mark: async items => items },
     authorizedRole: authorization || (async () => ({ authorized: true, tabId: 1, state: { tabId: 1 } })),
-    roleFor: () => ({ generation: 7, active: true })
+    roleFor: () => ({ generation: 7, active: true }),
+    // The page snapshot log (measurement): every delivered home-tab page.
+    recordTabSnapshot: (...args) => { snapshots.push(args); }
   });
   const functions = background.slice(background.indexOf('function batchLabel('),
     background.indexOf('// --- reviewer-tab coordinator'));
   const page = background.slice(background.indexOf('async function handlePageReport('),
     background.indexOf('async function navigateToPageOne('));
   vm.runInContext(functions + '\n' + page + '\nthis.api = {enqueuePost, handlePageReport};', context);
-  return { api: context.api, events, calls, context };
+  return { api: context.api, events, calls, context, snapshots };
 }
 const products = count => Array.from({ length: count }, (_, i) => ({ item_id: `ip-${1000000 + i}`, available: true }));
 
@@ -370,6 +381,22 @@ test('a successful post followed by a stale page acknowledgement never authorize
   assert.equal(r.reason, 'stale-generation');
   assert.equal(f.events.some(e => e.event === 'page-delivered'), false);
   assert.ok(f.events.some(e => e.outcome === 'accepted-stale' && e.documentId === 90 && e.requestId === 'a'.repeat(32)));
+});
+
+test('every home-tab page sent is handed to the page snapshot log once, with its tab URL', async () => {
+  const f = ingestFixture();
+  const url = 'https://www.walmart.com/reviews/claim-product?sort=price_high&page=2';
+  const r = await f.api.handlePageReport({ generation: 7, documentId: 90, page: 2, items: products(3) },
+    { tab: { id: 1, url } });
+  assert.equal(r.ok, true);
+  assert.equal(f.snapshots.length, 1);
+  const [tabUrl, items, page, context, result, startedAt] = f.snapshots[0];
+  assert.equal(tabUrl, url);
+  assert.equal(items.length, 3);
+  assert.equal(page, 2);
+  assert.equal(context.lane, 'home');
+  assert.equal(result.ok, true);
+  assert.ok(Number.isFinite(startedAt));
 });
 
 test('content diagnostics include internal target identity for hashing at the recorder boundary', async () => {

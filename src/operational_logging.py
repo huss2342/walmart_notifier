@@ -33,6 +33,7 @@ ROUTES = frozenset(
         "/test-notification",
         "/bot-check",
         "/rescan",
+        "/page-snapshots",
     }
 )
 _EVENTS = frozenset(

@@ -97,9 +97,10 @@ _CARD_COUNTS = frozenset({
 # alone held only about five days; 16 MiB segments rotate ~6 times a day.
 ARCHIVE_SEGMENT_BYTES = 16 * 1024 * 1024
 ARCHIVE_TOTAL_BYTES = 512 * 1024 * 1024
+# new80: sort=new&min_price=79, read only by freshness probes (extension 2.32.7).
 _LANES = frozenset({
     "home", "departments", "keywords", "brands", "priority", "requests", "newest", "value",
-    "value80", "research",
+    "value80", "research", "new80",
 })
 _CARD_DECISIONS = frozenset({
     "accepted", "out-of-stock", "variant", "card-unavailable", "not-free", "missing-title",
@@ -111,7 +112,7 @@ _EVENT_KEYS = _NUMERIC_FIELDS | _CARD_COUNTS | {
     "at", "event", "reason", "mode", "lane", "samples", "failureCode", "operation",
     "stage", "state", "outcome", "requestId", "streamId", "intakePhase", "component",
     "statusCode", "errorStage", "errorReason", "releaseReason", "cleanupConfirmed", "transport",
-    "targetId", "decision", "hot",
+    "targetId", "decision", "hot", "fresh",
 } | _RESTOCK_KEYS
 _SCANNER_STATE_LABELS = {
     "phase": frozenset({
@@ -359,13 +360,15 @@ def _event(value: object) -> dict:
             data.get("outcome"), frozenset({"items", "blocked", "error", "unavailable"})
         )
         if data.get("lane") not in {"newest", "value", "value80", "requests", "priority",
-                                    "departments", "research"}:
+                                    "departments", "research", "new80"}:
             raise ValueError(INVALID_REPORT)
-        # A read of one of the hot searches; the extension records only `true`.
-        if "hot" in data:
-            if data["hot"] is not True:
-                raise ValueError(INVALID_REPORT)
-            clean["hot"] = True
+        # A read of one of the hot searches, or an extra read of a freshness
+        # probe; the extension records each only as `true`.
+        for flag in ("hot", "fresh"):
+            if flag in data:
+                if data[flag] is not True:
+                    raise ValueError(INVALID_REPORT)
+                clean[flag] = True
     elif name == "restock-watch":
         # Public item ids and fixed labels only: the evidence behind a "Back in stock".
         if type(data.get("itemId")) is not str or _ITEM_ID.fullmatch(data["itemId"]) is None:
@@ -395,7 +398,7 @@ def _event(value: object) -> dict:
         raise ValueError(INVALID_REPORT)
     if "decision" in data and name != "scanner-recovery":
         raise ValueError(INVALID_REPORT)
-    if "hot" in data and name != "fast-read":
+    if ("hot" in data or "fresh" in data) and name != "fast-read":
         raise ValueError(INVALID_REPORT)
     if name != "restock-watch" and _RESTOCK_KEYS & data.keys():
         raise ValueError(INVALID_REPORT)

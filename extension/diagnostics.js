@@ -44,8 +44,9 @@ const DIAGNOSTIC_NUMBERS = [
 const RESTOCK_STAGES = ['returned', 'confirmed', 'rejected', 'followup'];
 const RESTOCK_STOCK_STATES = ['in-stock', 'out-of-stock', 'absent'];
 const RESTOCK_SIGNALS = ['in', 'out', 'other', 'none'];
+// new80: sort=new&min_price=79, read only by freshness probes (fast-reads.js).
 const DIAGNOSTIC_LANES = new Set(['home', 'departments', 'keywords', 'brands', 'priority', 'requests',
-  'newest', 'value', 'value80', 'research']);
+  'newest', 'value', 'value80', 'research', 'new80']);
 const FAST_READ_OUTCOMES = ['items', 'blocked', 'error', 'unavailable'];
 const CARD_DECISIONS = new Set([
   'accepted', 'out-of-stock', 'variant', 'card-unavailable', 'not-free', 'missing-title'
@@ -327,10 +328,13 @@ function cleanDiagnostic(event, details, at = Date.now()) {
   }
   if (event === 'fast-read') {
     if (!FAST_READ_OUTCOMES.includes(details?.outcome) ||
-        !['newest', 'value', 'value80', 'requests', 'priority', 'departments', 'research'].includes(details?.lane)) return null;
+        !['newest', 'value', 'value80', 'requests', 'priority', 'departments', 'research', 'new80']
+          .includes(details?.lane)) return null;
     entry.outcome = details.outcome;
     // A read of one of the hot searches (fast-reads.js), recorded only when true.
     if (details.hot === true) entry.hot = true;
+    // An extra read of a freshness probe (fast-reads.js), recorded only when true.
+    if (details.fresh === true) entry.fresh = true;
   }
   if (event === 'restock-watch') {
     // Public item ids and fixed labels only; never titles, URLs or raw field values.

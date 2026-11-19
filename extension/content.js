@@ -517,13 +517,14 @@ function fastReadUrl(raw) {
           !/[\p{C}]/u.test(value) && value === url.searchParams.get('q')) continue;
       // One department, exactly as the department tab loads it.
       if (key === 'catId' && /^\d{1,16}(?:_\d{1,16})*$/.test(value)) continue;
-      // The $80+ list: highest value first, listings with a version at $79+.
+      // The $80+ list: highest value first, listings with a version at $79+
+      // (and, for freshness probes only, the same list newest first).
       if (key === 'min_price' && value === '79') continue;
       return null;
     }
     if (url.searchParams.has('q') !== url.searchParams.has('queryNups')) return null;
     if (url.searchParams.has('min_price') &&
-        (url.searchParams.get('sort') !== 'price_high' || url.searchParams.has('q'))) return null;
+        (!['price_high', 'new'].includes(url.searchParams.get('sort')) || url.searchParams.has('q'))) return null;
     if (url.searchParams.has('catId')) {
       return url.searchParams.getAll('catId').length === 1 && !url.searchParams.has('sort') &&
         !url.searchParams.has('q') ? url : null;
@@ -594,6 +595,64 @@ function fastReadItems(product, query = '') {
   };
 }
 
+// Measurement rows for the page snapshot log (Nov 19 freshness study): every
+// product on a read page, in page order: [usItemId, position, free price in cents
+// or null, stock i/o/x/n, extra?]. extra.c is Walmart's category path of an $80+
+// offer; extra.d holds date-like product fields with a value. On Nov 19 none had
+// one: startDate was null on all 2,100 products of the research reads.
+const SNAPSHOT_DATE_KEY = /^[A-Za-z]{1,40}$/;
+const SNAPSHOT_DATE_NAME = /date|time|created|added|launch|release/i;
+const SNAPSHOT_DATE_VALUE = /^[0-9A-Za-z:.+ -]{1,40}$/;
+
+function snapshotCategory(product) {
+  const category = product.category;
+  if (!category || typeof category !== 'object') return '';
+  const pathId = category.categoryPathId;
+  if (typeof pathId === 'string' && pathId.length <= 200 && /^\d{1,16}(?::\d{1,16}){0,15}$/.test(pathId)) {
+    return pathId;
+  }
+  const path = Array.isArray(category.path) ? category.path : [];
+  for (const step of path.slice(0, 16).reverse()) {
+    const id = /\/(\d{1,16}(?:_\d{1,16}){0,15})\/?(?:[?#].*)?$/.exec(typeof step?.url === 'string' ? step.url : '')?.[1];
+    if (id && id.length <= 200) return id;
+  }
+  return '';
+}
+
+function snapshotDates(product) {
+  const dates = {};
+  let count = 0;
+  for (const key of Object.keys(product).slice(0, 300)) {
+    if (count >= 4 || !SNAPSHOT_DATE_KEY.test(key) || !SNAPSHOT_DATE_NAME.test(key)) continue;
+    const value = product[key];
+    if ((typeof value === 'string' && SNAPSHOT_DATE_VALUE.test(value)) ||
+        (Number.isSafeInteger(value) && value >= 0 && value <= 1e15)) {
+      dates[key] = value;
+      count += 1;
+    }
+  }
+  return count ? dates : null;
+}
+
+function snapshotRow(product, position) {
+  if (product?.__typename !== 'Product' || !/^\d{6,20}$/.test(String(product.usItemId || ''))) return null;
+  const lines = product.priceInfo?.priceDetails?.priceLines;
+  const free = Array.isArray(lines) ? lines.find(line => line?.lineType === 'FREE_PRICE') : null;
+  const raw = free?.values?.find?.(value => value?.key === 'PRICE')?.value;
+  const parsed = typeof raw === 'string' && /^\d[\d,]{0,9}(?:\.\d{1,2})?$/.test(raw)
+    ? Math.round(parseFloat(raw.replace(/,/g, '')) * 100) : null;
+  const cents = parsed !== null && parsed <= 1e9 ? parsed : null;
+  const v2 = product.availabilityStatusV2?.value;
+  const stock = v2 === 'IN_STOCK' ? 'i' : v2 === 'OUT_OF_STOCK' ? 'o' : typeof v2 === 'string' && v2 ? 'x' : 'n';
+  const extra = {};
+  const category = cents !== null && cents >= 8_000 ? snapshotCategory(product) : '';
+  if (category) extra.c = category;
+  const dates = snapshotDates(product);
+  if (dates) extra.d = dates;
+  const row = [String(product.usItemId), position, cents, stock];
+  return Object.keys(extra).length ? [...row, extra] : row;
+}
+
 async function fastRead(raw) {
   const url = fastReadUrl(raw);
   if (!url) return { ok: false, reason: 'scope' };
@@ -627,9 +686,14 @@ async function fastRead(raw) {
   if (!Array.isArray(stacks)) return { ok: false, status };
   const seen = new Set();
   const items = [];
+  const snapshot = [];
   let products = 0; // Every product on the page, free offer or not: zero means truly empty.
   for (const product of stacks.flatMap(stack => Array.isArray(stack?.items) ? stack.items : [])) {
-    if (product?.__typename === 'Product') products += 1;
+    if (product?.__typename === 'Product') {
+      products += 1;
+      const row = snapshot.length < 200 ? snapshotRow(product, products) : null;
+      if (row) snapshot.push(row);
+    }
     const item = fastReadItems(product, query);
     if (!item || seen.has(item.item_id)) continue;
     seen.add(item.item_id);
@@ -643,7 +707,7 @@ async function fastRead(raw) {
   const stock = { in: 0, out: 0, other: 0 };
   for (const item of items) stock[item.stock.v2 === 'in' ? 'in' : item.stock.v2 === 'out' ? 'out' : 'other'] += 1;
   const age = Number.parseInt(response.headers?.get?.('age') || '', 10);
-  return { ok: true, status, items, products, stock, bytes: html.length,
+  return { ok: true, status, items, products, stock, snapshot, bytes: html.length,
     ...(Number.isSafeInteger(age) && age >= 0 ? { age } : {}),
     ...(Number.isInteger(maxPage) ? { totalPages: maxPage } : {}),
     ...(Number.isSafeInteger(total) && total >= 0 ? { totalItems: total } : {}) };

@@ -1,7 +1,7 @@
 // Owns the one reviewer tab that is allowed to relay, posts its items to the
 // local notifier, and restarts its sweep on a Chrome alarm.
 
-importScripts('sweep-modes.js', 'runtime-policy.js', 'diagnostics.js', 'local-client.js', 'scanner-settings.js', 'relay-settings.js', 'scanner-control.js', 'challenge-evidence.js', 'verification-engine.js', 'verification-observation.js', 'verification-protocol.js', 'verification-driver.js', 'verification-native.js', 'verification-automation.js', 'department-data.js', 'auxiliary-scans.js', 'fast-reads.js', 'restock-watch.js', 'tab-workspace.js', 'facet-input.js');
+importScripts('sweep-modes.js', 'runtime-policy.js', 'diagnostics.js', 'local-client.js', 'scanner-settings.js', 'relay-settings.js', 'scanner-control.js', 'challenge-evidence.js', 'verification-engine.js', 'verification-observation.js', 'verification-protocol.js', 'verification-driver.js', 'verification-native.js', 'verification-automation.js', 'department-data.js', 'auxiliary-scans.js', 'page-snapshots.js', 'fast-reads.js', 'restock-watch.js', 'tab-workspace.js', 'facet-input.js');
 
 const DEFAULTS = {
   ...Object.fromEntries(Object.entries(ReviewerScannerSettings.defaults)
@@ -103,7 +103,7 @@ function recordVerificationChanges(changes) {
 }
 
 const auxiliaryScans = ReviewerAuxiliaryScans.create(chrome, {
-  home: REVIEWER_HOME, config, paused: pausedUntil, post: enqueuePost,
+  home: REVIEWER_HOME, config, paused: pausedUntil, post: postAuxiliaryPage,
   windowId: scannerWindowId,
   diagnostic: recordDiagnostic, probe: probeOnce, onBotCheck: handleBotCheck,
   initialStartDelay: (settings, name) => Math.max(5, Math.min(60, Number(settings.pageDelaySeconds) || 15)) * 1000 *
@@ -128,6 +128,8 @@ const fastReads = ReviewerFastReads.create(chrome, {
   mustSend: items => restockWatch.awaiting(items),
   paused: async () => Boolean(await pausedUntil()),
   diagnostic: details => recordDiagnostic('fast-read', details),
+  // Every read and the freshness probes' records go to the page snapshot log.
+  snapshot: record => pageSnapshots.add(record),
   // A blocked direct read runs the normal bot-check path at once: pause, verification
   // automation (the bypasser), evidence capture and the #collector-health alert.
   onBlocked: (_minutes, tabId) => Number.isInteger(tabId) ? handleBotCheck(tabId, 'fast-read') : undefined,
@@ -160,6 +162,52 @@ const fastReads = ReviewerFastReads.create(chrome, {
       .map((catId, index) => ({ catId, index: index + 1 }));
   }
 });
+
+// Page snapshot log (measurement, page-snapshots.js): batched to the local
+// notifier only; never a Walmart request.
+const pageSnapshots = ReviewerPageSnapshots.create({
+  upload: async body => {
+    const { endpoint, token } = await config();
+    const headers = { 'Content-Type': 'application/json', ...(token ? { 'X-Ingest-Token': token } : {}) };
+    const response = await ReviewerLocalClient.json(
+      ReviewerLocalClient.route(checkedEndpoint(endpoint), '/page-snapshots'),
+      { method: 'POST', headers, cache: 'no-store', body: JSON.stringify(body) }, { timeoutMs: 10_000 });
+    return { ok: response.ok, status: response.status };
+  }
+});
+
+// One delivered tab page in the snapshot log: lane, page, the tab's sort,
+// min_price and catId, the hash of its search (never the text) and each item's
+// id, position, price and stock in the order the tab read them.
+async function recordTabSnapshot(tabUrl, items, page, context, result, startedAt) {
+  try {
+    let url = tabUrl;
+    if (!url && Number.isInteger(context?.tabId)) url = (await chrome.tabs.get(context.tabId).catch(() => null))?.url;
+    let params = null;
+    try { params = new URL(url).searchParams; } catch { params = null; }
+    const minPrice = Number.parseInt(params?.get('min_price') || '', 10);
+    const catId = params?.get('catId') || '';
+    const hash = ReviewerFastReads.queryHash(params?.get('q') || '');
+    pageSnapshots.add({ kind: 'read', source: 'tab', at: startedAt, durationMs: Math.max(0, Date.now() - startedAt),
+      lane: context?.lane, page: Number.isSafeInteger(page) && page >= 0 && page <= 1_000 ? page : 0,
+      outcome: result?.ok ? 'items' : 'error',
+      ...(/^[a-z_]{1,24}$/.test(params?.get('sort') || '') ? { sort: params.get('sort') } : {}),
+      ...(Number.isSafeInteger(minPrice) && minPrice >= 0 && minPrice <= 1e6 ? { minPrice } : {}),
+      ...(/^\d{1,16}(?:_\d{1,16})*$/.test(catId) ? { catId } : {}),
+      ...(hash !== null ? { searchHash: hash } : {}),
+      ...(['initial', 'late', 'live'].includes(context?.intakePhase) ? { intakePhase: context.intakePhase } : {}),
+      ...(Number.isSafeInteger(context?.targetIndex) && context.targetIndex > 0 ? { targetIndex: context.targetIndex } : {}),
+      items: ReviewerFastReads.rowsOf({ items: Array.isArray(items) ? items : [] }) });
+  } catch { /* Measurement never affects delivery. */ }
+}
+
+// Every auxiliary tab page goes through here: delivered as before, then logged.
+async function postAuxiliaryPage(items, page, canSend, context = {}, options = {}) {
+  const startedAt = Date.now();
+  const result = await enqueuePost(items, page, canSend, context, options);
+  recordTabSnapshot(null, items, page, context, result, startedAt);
+  return result;
+}
 
 const tabWorkspace = ReviewerTabWorkspace.create(chrome, {
   config, paused: pausedUntil, authorize: authorizedScanner,
@@ -1478,6 +1526,7 @@ async function handlePageReport(msg, sender) {
     lane: 'home', intakePhase: ['late', 'live'].includes(msg.intakePhase) ? msg.intakePhase : 'initial' };
   const result = await enqueuePost(msg.items, msg.page,
     async () => (await authorizedRole(sender, msg.generation)).authorized, context);
+  recordTabSnapshot(sender?.tab?.url, msg.items, msg.page, context, result, startedAt);
   const after = await authorizedRole(sender, msg.generation);
   if (result.ok && after.authorized) {
     await chrome.storage.session.remove(`recovery:${after.tabId}`);

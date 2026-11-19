@@ -21,6 +21,7 @@ const sweepModesSource = fs.readFileSync(
 const policySource = fs.readFileSync(new URL('../extension/runtime-policy.js', import.meta.url), 'utf8');
 const diagnosticsSource = fs.readFileSync(new URL('../extension/diagnostics.js', import.meta.url), 'utf8');
 const auxiliaryScansSource = fs.readFileSync(new URL('../extension/auxiliary-scans.js', import.meta.url), 'utf8') +
+  ';' + fs.readFileSync(new URL('../extension/page-snapshots.js', import.meta.url), 'utf8') +
   ';' + fs.readFileSync(new URL('../extension/fast-reads.js', import.meta.url), 'utf8') +
   ';' + fs.readFileSync(new URL('../extension/restock-watch.js', import.meta.url), 'utf8');
 const tabWorkspaceSource = fs.readFileSync(new URL('../extension/tab-workspace.js', import.meta.url), 'utf8');
