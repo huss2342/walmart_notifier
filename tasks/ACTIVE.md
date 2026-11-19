@@ -2,6 +2,18 @@
 
 Updated November 12, 2026 (America/Chicago).
 
+## Freshness measurement (November 19 16:02 CST; backend live, extension 2.32.7 reload pending)
+
+Owner wants 90%+ of $80+ items on Discord within 60 s (hot searches project ~73%).
+Commit 2121620 adds data/page-snapshots.jsonl (every read: lane/page/sort and per
+product id/position/price/stock; 200 MiB cap) and capped $80+ freshness probes
+(<=100 extra reads/day). After 1-2 days run
+`python data/freshness-20261119/analyze.py --hours 48` to get list lag per shape
+and whether any catalogue shape is fresh. Decision: fresh shape -> read it fast
+at same load; only search fresh -> search grid (~32 words/min for 90% of 520
+recent $80+ titles, about 2x load; owner decides). Rollback image
+`reviewer-notifier:before-freshness-20261119`.
+
 ## Hot searches (November 19 14:07 CST; backend live, extension 2.32.6 reload pending)
 
 Research reads (fresh1-/fresh2- ids in data/research-results.jsonl): reviewer
