@@ -2,6 +2,20 @@
 
 Updated November 12, 2026 (America/Chicago).
 
+## Hot searches (November 19 14:07 CST; backend live, extension 2.32.6 reload pending)
+
+Research reads (fresh1-/fresh2- ids in data/research-results.jsonl): reviewer
+search (q=) ignores sort=price_high and min_price and returns only items
+claimable now (chair 4, dresser 0), so it shows new items at once; the 309-item
+catalogue lists lag minutes. No search-based $80+ list exists. Fix (owner
+approved ~+6 reads/min): up to 6 adaptive hot searches every 60 s (seeds chair,
+ktaxon, sofa, tablet, trampoline, rack = 29 of 46 late $80+ items in 72h),
+scored by new in-stock $80+ items per page-1 read. MIN_SPACING_MS 1050, STEP_MS
+100: simulated 34.5 -> 40.9 reads/min, $80+ and member cadences unchanged.
+Commit a826bc6. Rollback image `reviewer-notifier:before-hot-searches-20261119`;
+extension backups data/hot-searches-20261119/before/. Re-measure on-time $80+
+after a few days with data/coverage-audit-20261119 scripts (target was 57% -> ~73%).
+
 ## Audit fixes batch 2 (November 19 12:36 CST; backend live, extension 2.32.5 reload pending)
 
 Second audit (4 fresh reviewers) + owner coverage request. Rollback image
