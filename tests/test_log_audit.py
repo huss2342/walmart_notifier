@@ -25,6 +25,66 @@ def test_browser_reader_covers_the_released_event_and_metadata_contract():
     assert log_audit.LABELS["outcome"] >= browser_diagnostics._VERIFICATION_OUTCOMES
     for field, choices in browser_diagnostics._VERIFICATION_LABELS.items():
         assert choices <= log_audit.LABELS[field]
+    assert log_audit.LABELS["decision"] >= browser_diagnostics._SCANNER_RECOVERY_DECISIONS
+    assert log_audit.LABELS["outcome"] >= browser_diagnostics._SCANNER_RECOVERY_OUTCOMES
+    assert browser_diagnostics._SCANNER_STATE_LABELS == log_audit.SCANNER_STATE_LABELS
+    # The restock evidence stays readable: labels, timings and the item it is about.
+    assert log_audit.LABELS["stage"] >= browser_diagnostics._RESTOCK_STAGES
+    assert log_audit.LABELS["stockState"] >= browser_diagnostics._RESTOCK_STOCK_STATES
+    assert log_audit.LABELS["stockSource"] >= browser_diagnostics._RESTOCK_SOURCES
+    assert log_audit.LABELS["signalV2"] >= browser_diagnostics._RESTOCK_SIGNALS
+    assert log_audit.LABELS["signalStatus"] >= browser_diagnostics._RESTOCK_SIGNALS
+
+
+def test_scanner_recovery_audit_retains_safe_state_identity_and_bounded_summary(tmp_path):
+    state = {"phase": "waiting-user", "focusReason": "expired", "visibility": "hidden",
+             "reachable": True, "active": True, "busy": False, "highTraffic": False,
+             "paused": False, "enabled": True, "progressAt": NOW * 1000 - 300000,
+             "lastActivityAt": NOW * 1000, "nextActionAt": NOW * 1000 + 5000}
+    events = [{"at": NOW * 1000, "event": name, "lane": "home", "targetId": "b" * 32,
+               "state": state, "requestId": REQUEST, "query": "never-echo-query"}
+              for name in ("scanner-state", "scanner-recovery")]
+    events[1].update(reason="progress-timeout", outcome="deferred", decision="progress-advanced")
+    events.append({**events[1], "at": NOW * 1000 + 1000, "outcome": "accepted", "decision": "none"})
+    write_events(tmp_path / "browser-diagnostic-events.jsonl", events)
+    result = audit(tmp_path, request_id=REQUEST, trace=True)
+    assert result["counts"]["browser:scanner-state"] == 1
+    assert result["trace"][0]["state"] == state
+    assert result["trace"][0]["targetId"] == "b" * 32
+    assert result["scanner_recovery_counts"] == {
+        "home:progress-timeout:accepted:none": 1,
+        "home:progress-timeout:deferred:progress-advanced": 1,
+    }
+    assert "never-echo" not in json.dumps(result)
+
+
+def test_scanner_audit_discards_unknown_state_fields_and_private_decisions():
+    raw = {"at": NOW * 1000, "event": "scanner-recovery", "lane": "home",
+           "reason": "progress-timeout", "outcome": "accepted", "decision": "private-text",
+           "state": {"phase": "private-url", "busy": True, "progressAt": True,
+                     "lastActivityAt": 12.5, "url": "private-url", "token": "private-token"},
+           "targetId": "private-target"}
+    clean, recognized = log_audit._safe_event(raw, "browser")
+    assert recognized
+    assert clean["state"] == {"phase": "other", "busy": True}
+    assert clean["decision"] == "other"
+    assert "targetId" not in clean
+    assert "private" not in json.dumps(clean)
+
+
+def test_rate_limit_audit_preserves_only_fixed_provenance_and_numeric_metadata():
+    clean, recognized = log_audit._safe_event({
+        "timestamp": NOW, "event": "worker_error", "rate_limit_source": "local",
+        "global_limit": True,
+        "status": 429, "provider_code": 20028, "retry_after_seconds": 2.5,
+        "url": "private-url", "response": "private-body",
+    }, "delivery")
+    assert recognized
+    assert clean["rate_limit_source"] == "local"
+    assert clean["global_limit"] is True
+    assert clean["status"] == 429 and clean["provider_code"] == 20028
+    assert clean["retry_after_seconds"] == 2.5
+    assert "private" not in json.dumps(clean)
 
 
 def test_priority_lane_jsonl_trace_preserves_lane_and_drops_private_data(tmp_path):
@@ -626,3 +686,25 @@ def test_sqlite_is_opt_in_read_only_metadata_without_payloads(tmp_path):
 def test_invalid_filters_or_limits_fail_without_echoing_values(tmp_path, kwargs):
     with pytest.raises(ValueError, match="Invalid audit options"):
         log_audit.audit(tmp_path, **kwargs)
+
+
+def test_restock_watch_events_trace_by_item_with_labels_and_timings_only(tmp_path):
+    returned = {"at": NOW * 1000, "event": "restock-watch", "itemId": "ip-20755219869",
+                "stage": "returned", "stockState": "in-stock", "stockSource": "data",
+                "signalV2": "in", "signalStatus": "in", "signalOos": False, "variant": True,
+                "conflict": False, "valueCents": 19999, "awayMs": 240000, "sinceOutMs": 60000,
+                "outReads": 2, "lane": "value80", "page": 2, "requestId": REQUEST,
+                "title": "never-echo-title", "signalV2x": "never"}
+    followup = {**returned, "at": NOW * 1000 + 40000, "stage": "followup",
+                "stockState": "out-of-stock", "signalV2": "out", "signalStatus": "out",
+                "signalOos": True, "sinceReturnMs": 40000, "reads": 0}
+    write_events(tmp_path / "browser-diagnostic-events.jsonl",
+                 [returned, followup, {**returned, "itemId": "ip-12345678"}])
+    result = audit(tmp_path, item_id="ip-20755219869", trace=True)
+    assert result["events"] == 2
+    rows = [event for event in result["trace"] if event["event"] == "restock-watch"]
+    assert [(r["stage"], r["stockState"], r["signalV2"]) for r in rows] == [
+        ("returned", "in-stock", "in"), ("followup", "out-of-stock", "out")]
+    assert rows[0]["awayMs"] == 240000 and rows[1]["sinceReturnMs"] == 40000
+    assert rows[0]["variant"] is True and rows[1]["signalOos"] is True
+    assert "never-echo" not in json.dumps(result)

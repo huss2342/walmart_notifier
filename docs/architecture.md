@@ -319,6 +319,87 @@ decides how hard this hits the site. The walk defers while the user is
 mid-interaction, and the refresh alarm clears the visited set to start a fresh
 pass -- but skips tabs whose sweep is still running.
 
+## Direct reads
+
+Restocks: the extension remembers $80+ offers it saw out of stock
+(`restock-watch.js`, session storage) and flags their return once a second
+in-stock read at least 9 s after the first confirms it (the first is held back
+and its page re-read 10 s later; single-read blips are never sent). The backend
+re-arms the item's channel jobs when the offer was away at least 15 minutes,
+at most once an hour per item, and the alert reads "Back in stock". Research
+reads: `data/research-reads.json` lists reviewer list pages for the extension to
+read once, behind the $80+ pages; summaries land in
+`data/research-results.jsonl`. Product pages are never read.
+
+`fast-reads.js` reads catalogue pages from their server-rendered data with an
+ordinary same-origin request made inside an open reviewer tab: no rendering, no
+scrolling, no focus turn. One read runs at a time and read starts are 1.4-1.8
+seconds apart (about 37 a minute; the owner raised the earlier 24), so the
+schedule decides where that fixed budget goes, never how much of it there is.
+After any bot-check sign the spacing returns to 2.5-2.9 seconds for a day.
+
+Each step reads the most important due target. Lower rank always goes first;
+within a rank, the target most overdue for its own interval goes first:
+
+| Rank | Target | Revisit |
+|---|---|---|
+| 0 | `sort=price_high` page 1 (ahead of everything); every other page holding an $80+ item; the `min_price=79` list, pages holding an $80+ offer / the rest | 10 s; 20 s; 40 s / 3 min |
+| 1 | Member request searches (`sort=new` page 1); `sort=new` page 1 itself | 6 min (12 min while empty); 30-45 s |
+| 2 | `price_high` pages down to $40 (at most 12) as one pass, priority searches, search pages 2-3 | pass every 4 min; 12 min; members 12 min, priority 24 min |
+| 3 | `sort=new` pages 2-4 | 5 min, 15 min |
+| 4 | Department pages: page 1 (size), then deepest first | only slots nothing above needs |
+
+With four $80+ pages, the 8-page `min_price=79` list, 52 member and 27
+priority searches, ranks 0-3 use nearly all 37 reads a minute (a 3-hour simulation and a 30-minute regression test keep
+every rank on cadence), so department reads get only the slots left over, about
+1-2 a minute, alongside the department tab's own rounds.
+
+Walmart's price order is only approximate: each page ends with a few cheaper
+items (on November 12 page 1 ended at $64 while page 2 ran $142 to $91), so a
+page belongs to the fast zone when it holds any $80+ item, and when a quarter of
+its items are $80+ the next page is checked at the fast cadence too. Walmart
+orders this list by each product's listing price, while the reviewer offer is
+"valued at" a particular variant's price, so a few multi-variant or discounted
+products sit far below their value. Walmart's `min_price=80` filter keeps
+every listing with a version at $80 or more: on November 12 it held 262 items
+on 7 pages, with 71 of the 72 $80+ offers seen in any list, including the two
+that `price_high` never showed near the top (school supply boxes at $119.99, in
+stock for hours, and a $111.99 fiberglass kit). `min_price=79` held all 72 for
+one page more (287 items, 8 pages): an $87.56 air filter sits on a listing
+Walmart prices at $79.xx. That list's pages are read as their own lane (`value80`): a page holding any $80+ offer, in stock or awaiting a
+restock, every 40 seconds, the rest every 3 minutes. A lone $80+ item far below
+the main `price_high` block no longer pulls the pages between into the fast
+zone. Other filters and sorts tested the same day added nothing: page size
+(`ps`), `sort=price_low`, `best_seller`, `affinityOverride=default` (the
+"Shipping" setting), and `max_price`. The slower pass continues while pages hold
+any $40+ item. Both zones follow every read, and each value read logs how many $80+ items
+its page holds. The pages under $80 are read
+as one pass, top-down and back to back: a newly listed item only pushes those
+below it further down, onto a page the pass has not read yet, so a shifting list
+cannot hide an item between page reads. Measured November 10-12,
+`price_high` pages 1-4 found 70% of all $80+ items first, while `sort=new`,
+then read every 5 seconds, found nothing worth $10 or more: new listings are
+rare and cheap, and most finds are restocks of older listings that `sort=new`
+never surfaces. Department reads use Walmart's default order, the same pages
+the department tab loads; three unreadable pages in a row pause them for 30
+minutes. A read must match the requested sort, department, query and page in
+the page data, or it ingests nothing. Any bot-check sign stops all direct reads
+for five minutes and hands the tab to the normal bot-check path.
+
+The scan coordinator can ask for one direct read of a target's first page. When
+a department or search page stays blank, or a department filter cannot be bound,
+that read settles it: no products means the target is recorded empty with no
+further reloads; products with fewer pages than the saved resume page means the
+target was shrinking and is read again from page 1; and when every page the
+server reports was delivered this round, a blank page after them completes the
+target (some department pagers never show an end marker). Any doubt keeps the ordinary
+bounded retries, and a content message can never claim emptiness by itself. A
+blank department page whose own fresh server data holds no products reports at
+once instead of waiting out the 30-second render budget. The requests tab skips,
+without loading it, a member search a direct read found empty in the last 15
+minutes. `tools/lane_yield.py` reports first sightings by lane, page and value
+band from the local logs.
+
 ## Expressing "either condition"
 
 A rule ANDs its own clauses; `first_match` ORs across rules. So "at least $80

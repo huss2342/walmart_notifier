@@ -84,6 +84,16 @@ if (location.pathname === '/options.html') {
     fixtureStorage.lastVerificationAlertError =
       'Verification was detected, but the notifier alert was not confirmed. Check the local notifier connection.';
   }
+  const readAt = Date.now();
+  fixtureStorage.reviewerDiagnostics = [
+    { event: 'page-loaded', at: readAt - 50_000 },
+    { event: 'fast-read', at: readAt - 21_000, lane: 'newest', page: 1, items: 40, durationMs: 2100, outcome: 'items' },
+    { event: 'fast-read', at: readAt - 12_000, lane: 'value80', page: 2, count: 29, items: 32, durationMs: 1400,
+      outcome: 'items' },
+    { event: 'fast-read', at: readAt - 6_000, lane: 'requests', page: 1, items: 12, durationMs: 1100, outcome: 'items' },
+    { event: 'fast-read', at: readAt - 3_000, lane: 'value', page: 1, count: 18, items: 30, durationMs: 1205,
+      outcome: 'items' }
+  ];
   Object.assign(fixtureStorage, {
     lastRelay: Date.now(), lastSeen: 2, lastNew: 2, lastQueued: 2,
     lastNotified: 0, lastValueKnown: 2, lastValueUnknown: 0,

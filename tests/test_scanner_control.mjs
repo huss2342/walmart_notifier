@@ -11,6 +11,30 @@ const settings = () => ({ schemaVersion: 1, auxiliaryDepartments: true, auxiliar
   rotateScannerTabs: true, verificationAssistEnabled: true, verificationNativeEnabled: false,
   pathPattern: '^/reviews/claim-product' });
 
+test('dedicated request searches synchronize independently and clear stale watches on failure', async () => {
+  const f = fixture();
+  f.bodies.set('/request-searches', { schemaVersion: 1, queries: ['couch', 'ice cream maker'] });
+  assert.equal(await f.bridge.syncRequests(), true);
+  assert.deepEqual(f.data.requestSearchQueries, ['couch', 'ice cream maker']);
+  assert.ok(f.data.requestSearchSyncedAt > 0);
+  f.bodies.set('/request-searches', new Error('unavailable'));
+  assert.equal(await f.bridge.syncRequests(), false);
+  assert.deepEqual(f.data.requestSearchQueries, []);
+  assert.ok(f.data.requestSearchSyncError);
+  f.bodies.set('/request-searches', { schemaVersion: 1, queries: [] });
+  assert.equal(await f.bridge.syncRequests(), true);
+  assert.equal(f.data.requestSearchSyncError, '');
+});
+
+test('request search sync rejects malformed responses as a whole without accepting URLs or controls', async () => {
+  const f = fixture();
+  for (const queries of [null, [''], ['https://evil.example'], ['hi\nthere'], [42]]) {
+    f.bodies.set('/request-searches', { schemaVersion: 1, queries });
+    assert.equal(await f.bridge.syncRequests(), false);
+    assert.deepEqual(f.data.requestSearchQueries, []);
+  }
+});
+
 test('selection failures retain actionable fixed codes without exporting raw messages', () => {
   const f = fixture();
   for (const [message, code] of [
@@ -21,7 +45,7 @@ test('selection failures retain actionable fixed codes without exporting raw mes
   ]) assert.equal(f.failureCode(message), code);
   assert.equal(f.failureCode('private raw error and token'), 'unexpected-error');
 });
-function fixture() {
+function fixture({ onResearch } = {}) {
   const data = { endpoint: 'http://127.0.0.1:8787/ingest', token: 'never-export-this-token',
     auxiliaryDepartments: false, verificationAssistBudget: { attempts: [1, 2, 3] } };
   const paths = [];
@@ -51,7 +75,8 @@ function fixture() {
       !['127.0.0.1', 'localhost'].includes(url.hostname)) throw new Error('unsafe endpoint'); return raw; },
     paused: async () => paused,
     snapshot: async () => ({ schemaVersion: 1, verification: { pausedUntil: 0 } }),
-    onCommand: async name => { actions.push(name); if (result instanceof Error) throw result; return result; }
+    onCommand: async name => { actions.push(name); if (result instanceof Error) throw result; return result; },
+    ...(onResearch ? { onResearch } : {})
   });
   return { data, paths, actions, bodies, locks, make, bridge: make(), validate: context.validatedScannerSettings,
     failureCode: context.scannerFailureCode, laneCoverage: context.scannerLaneCoverage,
@@ -256,4 +281,26 @@ test('a status outage cannot block independently queued settings or commands', a
   assert.equal(await f.bridge.syncSettings(), true);
   assert.equal(await f.bridge.syncCommands(), true);
   assert.equal(f.actions.length, 1);
+});
+
+test('research reads run once each, post their summaries and wait when no answer is possible', async () => {
+  const asked = [];
+  let answer = url => ({ ok: true, products: [{ usItemId: '1' }], url });
+  const f = fixture({ onResearch: async url => { asked.push(url); return answer(url); } });
+  const home = 'https://www.walmart.com/reviews/claim-product';
+  f.bodies.set('/research-reads', { schemaVersion: 1, reads: [{ id: 'e1', url: `${home}?sort=price_low` },
+    { id: 'bad id', url: home }, { id: 'e2', url: `${home}?sort=price_high&min_price=80` }] });
+  f.bodies.set('/research-results', { ok: true });
+  assert.equal(await f.bridge.syncResearch(), true);
+  assert.deepEqual(asked, [`${home}?sort=price_low`, `${home}?sort=price_high&min_price=80`]);
+  const posts = f.paths.filter(row => row.path === '/research-results').map(row => JSON.parse(row.body));
+  assert.deepEqual(posts.map(row => [row.id, row.result.ok]), [['e1', true], ['e2', true]]);
+  assert.deepEqual(f.data.researchReadIds, ['e1', 'e2']);
+  assert.equal(await f.bridge.syncResearch(), true);
+  assert.equal(asked.length, 2, 'done ids are never read again');
+  f.bodies.set('/research-reads', { schemaVersion: 1, reads: [{ id: 'e3', url: home }, { id: 'e4', url: home }] });
+  answer = () => null; // backoff or pause: nothing posted, nothing marked done
+  assert.equal(await f.bridge.syncResearch(), true);
+  assert.equal(asked.length, 3);
+  assert.deepEqual(f.data.researchReadIds, ['e1', 'e2']);
 });

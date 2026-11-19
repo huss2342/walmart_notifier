@@ -1,7 +1,9 @@
 """Browser log correlation, bounded loss accounting and durable receipts."""
 
 import json
+import subprocess
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
 
@@ -141,6 +143,38 @@ def test_ingest_stage_correlation_is_optional_bounded_and_machine_readable():
     assert store.snapshot()["report"] == incoming
 
 
+@pytest.mark.parametrize("lane", ["newest", "value", "requests", "priority", "departments"])
+def test_fast_read_lanes_and_fast_intake_phase_survive_strict_boundary(lane):
+    incoming = report((1, 2))
+    incoming["events"][0].update(
+        event="fast-read", lane=lane, outcome="items", page=2, items=40, new=1,
+        duplicates=39, durationMs=900, responseStatus=200, totalPages=9, targetIndex=3,
+        count=1200, mode="high-value",
+    )
+    incoming["events"][1].update(
+        event="ingest-stage", lane=lane, stage="queued", outcome="waiting",
+        intakePhase="fast", requestId="d" * 32, page=2, items=40,
+    )
+    store = BrowserDiagnosticsStore(":memory:")
+    store.record_report(incoming)
+    assert store.snapshot()["report"] == incoming
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda event: event.update(event="fast-read", lane="home", outcome="items"),
+        lambda event: event.update(event="fast-read", lane="keywords", outcome="items"),
+        lambda event: event.update(intakePhase="burst"),
+    ],
+)
+def test_fast_read_contract_still_rejects_unknown_lanes_and_phases(change):
+    incoming = report()
+    change(incoming["events"][0])
+    with pytest.raises(ValueError, match="Invalid browser diagnostics report"):
+        BrowserDiagnosticsStore(":memory:").record_report(incoming)
+
+
 def test_failed_archive_cannot_advance_receipt_or_snapshot(tmp_path):
     class Archive:
         fail = False
@@ -231,3 +265,170 @@ def test_verification_attempt_timing_and_fixed_error_class_survive_archive(tmp_p
     private["events"][0]["errorReason"] = "private-error"
     with pytest.raises(ValueError):
         store.record_report(private)
+
+
+def scanner_state():
+    return {"phase": "waiting-focus", "focusReason": "waiting-turn", "visibility": "hidden",
+            "reachable": True, "active": True, "busy": False, "highTraffic": False,
+            "paused": False, "enabled": True, "progressAt": NOW - 1000,
+            "lastActivityAt": NOW, "nextActionAt": NOW + 5000}
+
+
+@pytest.mark.parametrize("event", ["scanner-state", "scanner-recovery"])
+def test_scanner_state_and_recovery_archive_typed_context(tmp_path, event):
+    incoming = report()
+    incoming["events"][0].update(event=event, state=scanner_state(), targetId="c" * 32)
+    if event == "scanner-recovery":
+        incoming["events"][0].update(reason="progress-timeout", outcome="deferred",
+                                     decision="progress-advanced")
+    store = BrowserDiagnosticsStore(tmp_path / "snapshot.json")
+    store.record_report(incoming)
+    assert store.snapshot()["report"] == incoming
+    archive = tmp_path / "browser-diagnostic-events.jsonl"
+    archived = json.loads(archive.read_text().splitlines()[0])
+    assert archived["state"] == scanner_state()
+    assert archived["targetId"] == "c" * 32
+
+
+@pytest.mark.parametrize("field,value", [
+    ("phase", "private-error"), ("focusReason", "private-url"), ("visibility", "secret"),
+    ("busy", 1), ("reachable", None), ("progressAt", 1.5), ("nextActionAt", -1),
+    ("lastActivityAt", 10**15 + 1), ("url", "private-url"), ("targetKey", "private-query"),
+])
+def test_scanner_state_rejects_untyped_or_extra_nested_fields(field, value):
+    incoming = report()
+    incoming["events"][0].update(event="scanner-state", state={**scanner_state(), field: value})
+    with pytest.raises(ValueError):
+        BrowserDiagnosticsStore(":memory:").record_report(incoming)
+
+
+@pytest.mark.parametrize("change", [
+    {"reason": "private-error"}, {"outcome": "private-response"}, {"decision": "private-text"},
+    {"targetId": "invalid"}, {"targetId": "A" * 32}, {"targetKey": "private-query"},
+    {"lane": "private-lane"}, {"state": {}},
+])
+def test_scanner_recovery_rejects_invalid_labels_and_raw_keys(change):
+    incoming = report()
+    incoming["events"][0].update({"event": "scanner-recovery", "state": scanner_state(),
+                                 "reason": "progress-timeout", "outcome": "accepted", **change})
+    with pytest.raises(ValueError):
+        BrowserDiagnosticsStore(":memory:").record_report(incoming)
+
+
+def test_scanner_recovery_requires_labels_and_lane_but_state_cannot_gain_decision():
+    for removed in ("reason", "outcome", "lane"):
+        incoming = report()
+        incoming["events"][0].update(event="scanner-recovery", state=scanner_state(),
+                                     reason="progress-timeout", outcome="accepted")
+        incoming["events"][0].pop(removed)
+        with pytest.raises(ValueError):
+            BrowserDiagnosticsStore(":memory:").record_report(incoming)
+    incoming = report()
+    incoming["events"][0].update(event="scanner-state", state=scanner_state(), decision="none")
+    with pytest.raises(ValueError):
+        BrowserDiagnosticsStore(":memory:").record_report(incoming)
+
+
+def test_real_javascript_scanner_event_projection_matches_python_contract():
+    incoming = report()
+    event = incoming["events"][0]
+    event.update(event="scanner-recovery", reason="passive-rebind", outcome="accepted",
+                 decision="none", state=scanner_state(), targetId="b" * 32)
+    event["url"] = "private-url"
+    event["state"]["token"] = "private-token"
+    script = """
+const fs = require('node:fs'), vm = require('node:vm');
+const c = vm.createContext({ Date });
+vm.runInContext(fs.readFileSync('extension/diagnostics.js', 'utf8') +
+  ';this.clean = cleanDiagnostic;this.schema = SCANNER_STATE_LABELS;', c);
+const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+const output = { event: c.clean(input.event, input, input.at), schema: c.schema };
+process.stdout.write(JSON.stringify(output));
+"""
+    result = subprocess.run(["node", "-e", script], cwd=Path(__file__).resolve().parents[1],
+                            input=json.dumps(event), capture_output=True, text=True, check=True)
+    output = json.loads(result.stdout)
+    incoming["events"] = [output["event"]]
+    store = BrowserDiagnosticsStore(":memory:")
+    store.record_report(incoming)
+    assert store.snapshot()["report"] == incoming
+    assert {field: set(choices) for field, choices in output["schema"].items()} == {
+        field: set(choices) for field, choices in module._SCANNER_STATE_LABELS.items()
+    }
+    assert "private" not in json.dumps(output)
+
+
+def test_research_reads_are_logged_as_their_own_fast_read_lane():
+    incoming = report((1,))
+    incoming["events"][0].update(
+        event="fast-read", lane="research", outcome="items", page=1, items=40,
+        durationMs=900, responseStatus=200, totalPages=25,
+    )
+    store = BrowserDiagnosticsStore(":memory:")
+    store.record_report(incoming)
+    assert store.snapshot()["report"] == incoming
+
+
+def restock_event(**changes):
+    event = {"at": NOW, "event": "restock-watch", "itemId": "ip-20755219869", "stage": "returned",
+             "stockState": "in-stock", "stockSource": "data", "signalV2": "in",
+             "signalStatus": "in", "signalOos": False, "variant": True, "conflict": False,
+             "valueCents": 19999, "awayMs": 240000, "sinceOutMs": 60000, "outReads": 2,
+             "lane": "value80", "page": 2, "requestId": "d" * 32, "streamId": STREAM, "eventSeq": 1}
+    event.update(changes)
+    return event
+
+
+def test_restock_watch_and_read_stock_summary_survive_the_strict_boundary():
+    incoming = report((1, 2))
+    incoming["events"][0] = restock_event()
+    incoming["events"][1].update(
+        event="fast-read", lane="value80", outcome="items", page=2, items=41, new=0, duplicates=31,
+        durationMs=1881, responseStatus=200, totalPages=8, count=20, stockIn=31, stockOut=10,
+        stockOther=0, bytes=1203425, ageSeconds=37, products=41,
+    )
+    store = BrowserDiagnosticsStore(":memory:")
+    store.record_report(incoming)
+    assert store.snapshot()["report"] == incoming
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"itemId": "20755219869"},
+        {"itemId": "ip-1"},
+        {"stage": "armed"},
+        {"stockState": "gone"},
+        {"signalV2": "IN_STOCK"},
+        {"signalStatus": "yes"},
+        {"stockSource": "page"},
+        {"conflict": "false"},
+        {"variant": 1},
+        {"signalOos": None},
+        {"title": "Mitonos weights"},
+        {"awayMs": -1},
+    ],
+)
+def test_restock_watch_rejects_free_text_and_unknown_labels(change):
+    incoming = report((1,))
+    incoming["events"][0] = restock_event(**change)
+    with pytest.raises(ValueError, match="Invalid browser diagnostics report"):
+        BrowserDiagnosticsStore(":memory:").record_report(incoming)
+
+
+def test_restock_fields_are_refused_on_other_events():
+    incoming = report((1,))
+    incoming["events"][0]["itemId"] = "ip-20755219869"
+    with pytest.raises(ValueError, match="Invalid browser diagnostics report"):
+        BrowserDiagnosticsStore(":memory:").record_report(incoming)
+
+
+@pytest.mark.parametrize("stage, state", [("returned", "in-stock"), ("confirmed", "in-stock"),
+                                          ("rejected", "out-of-stock"), ("rejected", "absent"),
+                                          ("followup", "absent")])
+def test_restock_hold_and_confirmation_stages_survive_the_strict_boundary(stage, state):
+    incoming = report((1,))
+    incoming["events"][0] = restock_event(stage=stage, stockState=state, sinceReturnMs=10600)
+    store = BrowserDiagnosticsStore(":memory:")
+    store.record_report(incoming)
+    assert store.snapshot()["report"] == incoming

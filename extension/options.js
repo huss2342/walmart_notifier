@@ -31,6 +31,9 @@ const checkConnectionEl = $('checkConnection');
 const testNotificationEl = $('testNotification');
 const testResultEl = $('testResult');
 
+const extensionVersion = chrome.runtime.getManifest?.()?.version;
+if (extensionVersion) $('extensionVersion').textContent = ` ${extensionVersion}`;
+
 const verificationStateLabels = {
   watching: 'Watching for verification checks.',
   'waiting-page': 'Verification detected; waiting for its tab to finish loading.',
@@ -655,7 +658,8 @@ async function renderAuxiliaryStatus() {
     if (!result?.ok || !Array.isArray(result.lanes)) throw new Error('Status unavailable.');
     const frag = document.createDocumentFragment();
     let rendered = 0;
-    const names = { departments: 'Department scan', keywords: 'Keyword scan', priority: 'Priority scan' };
+    const names = { departments: 'Department scan', keywords: 'Keyword scan', priority: 'Priority scan',
+      requests: 'Member request scan' };
     const labels = {
       disabled: 'Disabled', idle: 'Waiting to start', ready: 'Waiting to start', starting: 'Starting',
       scanning: 'Scanning', running: 'Scanning', discovering: 'Discovering filters',
@@ -709,6 +713,76 @@ async function renderAuxiliaryStatus() {
   } catch {
     target.textContent = 'Additional scan status is unavailable. Reload the extension if it was just updated.';
   }
+}
+
+function since(at) {
+  const seconds = Math.max(0, Math.round((Date.now() - at) / 1000));
+  return seconds < 90 ? `${seconds} s ago` : ago(at);
+}
+
+const FAST_LANES = [
+  ['value', 'Highest value'], ['value80', '$80+ list'], ['newest', 'Newest'],
+  ['requests', 'Member requests'], ['priority', 'Priority searches'], ['departments', 'Departments']
+];
+
+/**
+ * Direct (no-render) reads from the retained diagnostics. That history holds
+ * the last 300 events of every kind, about a minute when scanning is busy, so
+ * slower lanes appear only when they read recently.
+ */
+function renderFastStatus(history, fastState) {
+  const target = $('fastStatus');
+  const now = Date.now();
+  const events = Array.isArray(history) ? history.filter(entry => Number.isFinite(entry?.at) && entry.at <= now) : [];
+  const reads = events.filter(entry => entry.event === 'fast-read');
+  const frag = document.createDocumentFragment();
+  if (Number(fastState?.until) > now) {
+    frag.appendChild(line('bad', 'Direct reads paused after a bot-check sign.',
+      `They resume in about ${Math.ceil((fastState.until - now) / 60_000)} minutes; the scanning tabs keep running.`));
+  } else if (Number(fastState?.slowUntil) > now) {
+    frag.appendChild(line('warn', 'Gentler direct-read pacing after a recent bot-check sign.',
+      `Normal pacing returns in about ${Math.ceil((fastState.slowUntil - now) / 3_600_000)} hours.`));
+  }
+  if (!reads.length) {
+    frag.appendChild(line('hint', 'No direct reads in the retained history.',
+      'They run while a reviewer scanner tab is open and scanning is not paused.'));
+    target.replaceChildren(frag);
+    return;
+  }
+  const covered = Math.min(120_000, Math.max(1_000, now - Math.min(...events.map(entry => entry.at))));
+  const recent = reads.filter(entry => entry.at >= now - covered).length;
+  frag.appendChild(line('hint', `${recent} direct read${recent === 1 ? '' : 's'} in the last ${Math.round(covered / 1000)} s`,
+    `(about ${Math.round(recent * 60_000 / covered)} a minute).`));
+  for (const [lane, name] of FAST_LANES) {
+    const last = reads.filter(entry => entry.lane === lane).at(-1);
+    if (!last) continue;
+    let detail = `last read ${since(last.at)}`;
+    if (Number.isSafeInteger(last.page)) detail += `, page ${last.page}`;
+    if (['value', 'value80'].includes(lane) && Number.isSafeInteger(last.count)) {
+      detail += `, ${last.count} offer${last.count === 1 ? '' : 's'} at $80+`;
+    }
+    if (Number.isSafeInteger(last.items)) detail += ` of ${last.items} items`;
+    if (Number.isFinite(last.durationMs)) detail += ` (${(last.durationMs / 1000).toFixed(1)} s)`;
+    const failed = last.outcome !== 'items';
+    // Highest-value page 1 is read every 10 seconds; minutes of silence means trouble.
+    const quiet = lane === 'value' && now - last.at > 120_000;
+    frag.appendChild(line(failed || quiet ? 'warn' : 'ok', `${name}:`,
+      `${detail}.${failed ? ` Last result: ${last.outcome}.` : ''}`));
+  }
+  target.replaceChildren(frag);
+}
+
+const OVERALL = {
+  ok: 'Running', warn: 'Check status', bad: 'Needs attention', offline: 'Notifier offline',
+  paused: 'Paused: verification'
+};
+
+function renderOverall(frag, { health, pausedUntil }) {
+  const el = $('overallStatus');
+  const level = frag.querySelector?.('.bad') ? 'bad' : frag.querySelector?.('.warn') ? 'warn' : 'ok';
+  const key = pausedUntil > 0 ? 'paused' : !health ? 'offline' : level;
+  el.className = `pill ${key === 'paused' || key === 'offline' ? 'bad' : level}`;
+  el.textContent = OVERALL[key];
 }
 
 /** Render only named aggregate fields; never expose queue payloads or errors. */
@@ -813,15 +887,17 @@ async function renderStatus() {
           pageDelaySeconds = 15, botCheck, sweepMode = 'none', reviewerDiagnostics = [],
           diagnosticsSyncedAt = 0, diagnosticsSyncError = '', scanSettingsSyncError = '',
           lastVerificationCapture, lastVerificationCaptureError = '',
-          lastVerificationAlertError = '' } = await chrome.storage.local.get(
+          lastVerificationAlertError = '', reviewerFastReads } = await chrome.storage.local.get(
     ['endpoint', 'lastRelay', 'lastSeen', 'lastNotified', 'lastQueued', 'lastPage',
      'lastNew', 'lastDuplicates', 'lastFiltered', 'lastMatched', 'lastFailed',
      'lastPending', 'lastSeeded', 'lastValueKnown', 'lastValueUnknown', 'lastMinValue',
      'lastMaxValue', 'lastError', 'lastErrorAt', 'lastSweepPages', 'lastSweepDone',
      'refreshMinutes', 'pageDelaySeconds', 'botCheck', 'sweepMode', 'reviewerDiagnostics',
      'diagnosticsSyncedAt', 'diagnosticsSyncError', 'scanSettingsSyncError',
-     'lastVerificationCapture', 'lastVerificationCaptureError', 'lastVerificationAlertError']
+     'lastVerificationCapture', 'lastVerificationCaptureError', 'lastVerificationAlertError',
+     'reviewerFastReads']
   );
+  renderFastStatus(reviewerDiagnostics, reviewerFastReads);
   const { sweep, tabCount, pausedUntil } = await activeSweep();
   const health = await serverHealth();
   const discord = health?.discord && typeof health.discord === 'object' ? health.discord : null;
@@ -1012,6 +1088,7 @@ async function renderStatus() {
       'bad', `Last error${lastErrorAt ? ` (${ago(lastErrorAt)})` : ''}:`, lastError
     ));
   }
+  renderOverall(frag, { health, pausedUntil });
   statusEl.replaceChildren(frag);
 }
 

@@ -97,6 +97,43 @@ def get(base, path="/health"):
         return resp.status, json.loads(resp.read())
 
 
+def test_request_searches_endpoint_is_private_and_reports_unavailable(live_server, monkeypatch):
+    from types import SimpleNamespace
+
+    queries = ['couch', 'ice cream maker']
+    monkeypatch.setattr(server.Handler.notifier, 'requests',
+                        SimpleNamespace(search_queries=lambda: queries), raising=False)
+    assert get(live_server, '/request-searches') == (200, {'schemaVersion': 1, 'queries': queries})
+    # Elite auto-claim requests join the same lane; duplicates of Pro searches are dropped.
+    monkeypatch.setattr(server.Handler.notifier, 'elite_signal',
+                        SimpleNamespace(search_queries=lambda: ['Couch', 'gaming laptop']), raising=False)
+    assert get(live_server, '/request-searches') == (200, {'schemaVersion': 1, 'queries': queries + ['gaming laptop']})
+    monkeypatch.setattr(server.Handler.notifier, 'elite_signal', None, raising=False)
+    server.Handler.token = 'private'
+    for headers in ({}, {'X-Ingest-Token': 'private', 'Origin': 'https://evil.example'}):
+        with pytest.raises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(urllib.request.Request(
+                f'{live_server}/request-searches', headers=headers), timeout=5)
+        assert error.value.code == 403
+    request = urllib.request.Request(f'{live_server}/request-searches',
+                                     headers={'X-Ingest-Token': 'private'})
+    assert json.load(urllib.request.urlopen(request, timeout=5))['queries'] == queries
+    server.Handler.token = ''
+
+    def broken():
+        raise OSError('private path')
+
+    monkeypatch.setattr(server.Handler.notifier.requests, 'search_queries', broken)
+    with pytest.raises(urllib.error.HTTPError) as error:
+        get(live_server, '/request-searches')
+    assert error.value.code == 503
+    assert b'private path' not in error.value.read()
+
+
+def test_request_searches_disabled_returns_empty_without_creating_storage(live_server):
+    assert get(live_server, '/request-searches') == (200, {'schemaVersion': 1, 'queries': []})
+
+
 def test_scan_settings_json_roundtrip_and_manual_file_edit(live_server):
     assert get(live_server, "/relay-settings") == (200, {"settings": None})
     scan = {"schemaVersion": 1, "refreshMinutes": 10,
@@ -1449,3 +1486,62 @@ def test_scanner_status_mirrors_safe_optional_lane_failure_code(live_server):
     }]
     assert request(live_server, "POST", "/scanner-status", report) == (200, {"ok": True})
     assert get(live_server, "/scanner-status")[1]["report"] == report
+
+
+# --- research reads -----------------------------------------------------------
+
+
+def research_request(base, method, path, payload=None, headers=None):
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(f"{base}{path}", data=data, method=method,
+                                 headers={"Content-Type": "application/json", **(headers or {})})
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return resp.status, json.loads(resp.read())
+
+
+def test_research_reads_default_to_none_and_serve_the_owner_file(live_server, tmp_path):
+    assert research_request(live_server, "GET", "/research-reads") == (
+        200, {"schemaVersion": 1, "reads": []})
+    reads = [{"id": "e1.price-high-p1", "url": f"{server.RESEARCH_URL}?sort=price_high"},
+             {"id": "e5", "url": f"{server.RESEARCH_URL}?sort=price_low&min_price=80"}]
+    (tmp_path / "research-reads.json").write_text(json.dumps({"reads": reads}))
+    assert research_request(live_server, "GET", "/research-reads") == (
+        200, {"schemaVersion": 1, "reads": reads})
+
+
+@pytest.mark.parametrize("url", [
+    "https://www.walmart.com/ip/123456", "https://evil.example/reviews/claim-product",
+    "https://www.walmart.com/reviews/claim-productx",
+    "https://www.walmart.com/reviews/claim-product?" + "a" * 800,
+])
+def test_research_reads_refuse_anything_but_reviewer_list_pages(live_server, tmp_path, url):
+    (tmp_path / "research-reads.json").write_text(json.dumps({"reads": [{"id": "x", "url": url}]}))
+    with pytest.raises(urllib.error.HTTPError) as error:
+        research_request(live_server, "GET", "/research-reads")
+    assert error.value.code == 500
+    assert json.loads(error.value.read()) == {"error": "Invalid research-reads.json."}
+
+
+def test_research_results_append_one_line_each(live_server, tmp_path):
+    first = {"id": "e1", "url": server.RESEARCH_URL, "result": {"ok": True}}
+    assert research_request(live_server, "POST", "/research-results", first) == (200, {"ok": True})
+    research_request(live_server, "POST", "/research-results", {"id": "e2", "result": {}})
+    saved = (tmp_path / "research-results.jsonl").read_text().splitlines()
+    lines = [json.loads(line) for line in saved]
+    assert [line["id"] for line in lines] == ["e1", "e2"]
+    assert lines[0]["result"] == {"ok": True} and lines[0]["received_at"] > 0
+    with pytest.raises(urllib.error.HTTPError) as error:
+        research_request(live_server, "POST", "/research-results", {"id": "bad id!"})
+    assert error.value.code == 400
+
+
+@pytest.mark.parametrize("path,method", [("/research-reads", "GET"), ("/research-results", "POST")])
+def test_research_routes_require_the_token_and_reject_web_origins(live_server, path, method):
+    server.Handler.token = "existing-secret"
+    payload = None if method == "GET" else {"id": "e1"}
+    for headers in [{}, {"X-Ingest-Token": "existing-secret", "Origin": "https://evil.example"}]:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            research_request(live_server, method, path, payload, headers)
+        assert error.value.code == 403
+    allowed = {"X-Ingest-Token": "existing-secret", "Origin": "chrome-extension://abc"}
+    assert research_request(live_server, method, path, payload, allowed)[0] == 200

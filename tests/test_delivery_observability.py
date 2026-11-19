@@ -214,3 +214,88 @@ def test_welcome_and_membership_cycles_have_distinct_operational_components(tmp_
         worker.tick()
     cycles = [fields for event, fields in events if event == "welcome_cycle"]
     assert {fields["component"] for fields in cycles} == {"welcome", "membership"}
+
+
+def test_discord_error_projection_keeps_bounded_http_fields_and_caller_delay(tmp_path):
+    error = DiscordError("Private token and /members/123", status=429, provider_code=20028,
+                         retry_after=120, global_limit=True, request_bytes=12, response_bytes=34,
+                         outcome=DeliveryOutcome.NOT_SUBMITTED)
+    fields = error_fields(error, retry_after_seconds=0.01)
+    assert fields["status"] == 429 and fields["provider_code"] == 20028
+    assert fields["retry_after_seconds"] == 0.01 and fields["global_limit"] is True
+    assert fields["rate_limit_source"] == "unknown"
+    assert fields["request_bytes"] == 12 and fields["response_bytes"] == 34
+    monitor = DeliveryMonitor(tmp_path, entry_point="collector_worker", console=False)
+    monitor.emit("worker_error", **fields)
+    row = records(monitor)[0]
+    assert {key: row[key] for key in fields} == fields
+    assert "Private" not in json.dumps(row) and "/members/" not in json.dumps(row)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("status", True), ("status", 600), ("provider_code", "Private"),
+    ("provider_code", 1_000_000_001), ("retry_after", float("inf")),
+    ("retry_after", -1), pytest.param("retry_after", 10 ** 400, id="oversized-integer"),
+    ("global_limit", "Private"),
+])
+def test_discord_error_projection_rejects_invalid_provider_metadata(field, value):
+    error = DiscordError(status=429)
+    setattr(error, field, value)
+    projected = "retry_after_seconds" if field == "retry_after" else field
+    assert projected not in error_fields(error)
+
+
+def test_discord_error_provenance_cannot_log_arbitrary_provider_text(tmp_path):
+    error = DiscordError(status=429, rate_limit_source="Private arbitrary value")
+    assert error.rate_limit_source == "unknown"
+    assert error_fields(error)["rate_limit_source"] == "unknown"
+    monitor = DeliveryMonitor(tmp_path, entry_point="collector_worker", console=False)
+    monitor.emit("worker_error", rate_limit_source="Private arbitrary value",
+                 global_limit="Private")
+    assert "Private" not in json.dumps(records(monitor))
+    assert "rate_limit_source" not in error_fields(DiscordError(status=503))
+    assert "Private" not in json.dumps(error_fields(error, token="Private", route="Private"))
+
+
+@pytest.mark.parametrize("status,retry_after,expected_delay", [(429, 0, 0.01), (503, 123, 2)])
+def test_real_channel_retry_logs_preserve_selected_delay(
+    tmp_path, status, retry_after, expected_delay
+):
+    store = JobStore(tmp_path / "queue.sqlite3")
+    store.record([product()], now=1000)
+    with store._connect() as db:
+        db.execute("UPDATE jobs SET state='skipped' WHERE route!='pro-all'")
+    monitor = DeliveryMonitor(tmp_path, entry_point="collector_worker", console=False)
+
+    class Provider:
+        def request(self, *_args, **_kwargs):
+            raise DiscordError("Private", status=status, retry_after=retry_after,
+                               provider_code=20028)
+
+    result = deliver_due(store, Provider(), {"guild_id": "1700000000000000003",
+        "channels": {"pro-all": "1700000000000000001"}}, live=True, now=1000,
+        auditor=lambda *_args: {"ok": True}, event_sink=monitor.emit, limit=1)
+    row = next(row for row in records(monitor)
+               if row["event"] in {"dispatch_retry", "dispatch_throttled"})
+    assert result["retried"] == 1
+    assert row["retry_after_seconds"] == expected_delay
+    assert row["status"] == status and row["provider_code"] == 20028
+    if status == 429:
+        assert row["rate_limit_source"] == "unknown" and row["global_limit"] is False
+    assert "Private" not in json.dumps(row)
+
+
+def test_personal_retry_receipt_keeps_provenance_and_worker_chosen_floor(tmp_path):
+    from test_discord_request_delivery import USER, setup
+
+    monitor = DeliveryMonitor(tmp_path / "logs", entry_point="collector_worker", console=False)
+    store, _, provider, worker = setup(tmp_path, event_sink=monitor.emit)
+    provider.send_error = DiscordError("Private provider body", status=429, retry_after=0,
+                                      rate_limit_source="server", global_limit=True)
+    result = worker.tick(now=12)
+    assert result["throttled"] == 1 and store.stats()["pending"] == 1
+    rows = records(monitor)
+    row = next(row for row in rows if row["event"] == "dispatch_throttled")
+    assert row["retry_after_seconds"] == 0.05 and row["rate_limit_source"] == "server"
+    assert row["global_limit"] is True and row["status"] == 429
+    assert USER not in json.dumps(rows) and "Private" not in json.dumps(rows)

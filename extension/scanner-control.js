@@ -5,7 +5,7 @@ const SCANNER_FAILURE_CODES = new Set(['missing-document', 'unsupported-kind', '
   'missing-expansion', 'expansion-stalled', 'expansion-overflow', 'option-overflow', 'missing-selection',
   'ambiguous-selection', 'already-selected', 'cancelled', 'facet-error',
   'document-http-error', 'render-timeout', 'render-opportunity-timeout', 'navigation-timeout',
-  'navigation-scope-changed']);
+  'navigation-scope-changed', 'interior-empty', 'card-unreadable']);
 
 const SCANNER_RUNTIME_PHASES = new Set(['passive', 'starting', 'collecting', 'ingesting', 'ingest-retry',
   'relay-retry', 'complete', 'empty-timeout', 'extension-reloaded', 'manual-browsing', 'navigating',
@@ -67,7 +67,7 @@ function validatedScannerCommands(value) {
 }
 
 var ReviewerScannerControl = (() => {
-  function create(chrome, { config, checkedEndpoint, snapshot, onCommand, paused }) {
+  function create(chrome, { config, checkedEndpoint, snapshot, onCommand, paused, onResearch = async () => null }) {
     const local = chrome.storage.local;
     const queues = new Map();
     const serialize = (key, task) => {
@@ -76,13 +76,13 @@ var ReviewerScannerControl = (() => {
       return result;
     };
 
-    async function request(path, method = 'GET', payload = undefined) {
+    async function request(path, method = 'GET', payload = undefined, maxBytes = 64 * 1024) {
       const { endpoint, token } = await config();
       const url = ReviewerLocalClient.route(checkedEndpoint(endpoint), path);
       const headers = token ? { 'X-Ingest-Token': token } : {};
       if (payload !== undefined) headers['Content-Type'] = 'application/json';
       const response = await ReviewerLocalClient.json(url, { method, headers, cache: 'no-store',
-        ...(payload === undefined ? {} : { body: JSON.stringify(payload) }) }, { timeoutMs: 5_000 });
+        ...(payload === undefined ? {} : { body: JSON.stringify(payload) }) }, { timeoutMs: 5_000, maxBytes });
       if (!response.ok) throw new Error('Scanner backend unavailable.');
       return response.body;
     }
@@ -107,6 +107,36 @@ var ReviewerScannerControl = (() => {
         } catch {
           await local.set({ scannerSettingsSyncError:
             'Could not load scanner-settings.json; keeping the last usable scanner settings.' }).catch(() => undefined);
+          return false;
+        }
+      });
+    }
+
+    function syncRequests() {
+      return serialize('requests', async () => {
+        try {
+          // Grows with members (10 watches each); 64 KiB was reachable and a
+          // too-large reply paused every dedicated request search.
+          const body = await request('/request-searches', 'GET', undefined, 1024 * 1024);
+          if (!body || body.schemaVersion !== 1 || !Array.isArray(body.queries) ||
+              Object.keys(body).some(key => !['schemaVersion', 'queries'].includes(key)) ||
+              body.queries.some(query => typeof query !== 'string' || !query.trim() ||
+                /[\p{C}]/u.test(query) || /:\/\//.test(query))) {
+            throw new Error('Invalid request searches.');
+          }
+          const current = await local.get(['requestSearchQueries']);
+          const update = { requestSearchSyncedAt: Date.now(), requestSearchSyncError: '' };
+          if (JSON.stringify(current.requestSearchQueries) !== JSON.stringify(body.queries)) {
+            update.requestSearchQueries = body.queries;
+          }
+          await local.set(update);
+          return true;
+        } catch {
+          // Never keep searching removed/expired watches through a sync outage.
+          // Broad lanes continue independently; the next successful sync resumes.
+          await local.set({ requestSearchQueries: [],
+            requestSearchSyncError: 'Could not load current item requests; dedicated searches paused.' })
+            .catch(() => undefined);
           return false;
         }
       });
@@ -172,7 +202,35 @@ var ReviewerScannerControl = (() => {
         }
       });
     }
-    return { syncSettings, syncCommands, syncStatus };
+    // Owner-listed research reads: each id is read once, its summary posted to
+    // the backend. A read without an answer (pause, backoff) waits for the next sync.
+    let researching = false;
+    async function syncResearch() {
+      if (researching) return false;
+      researching = true;
+      try {
+        const body = await request('/research-reads');
+        if (!body || body.schemaVersion !== 1 || !Array.isArray(body.reads)) throw new Error('Invalid research reads.');
+        const stored = await local.get(['researchReadIds']);
+        const done = new Set(Array.isArray(stored.researchReadIds) ? stored.researchReadIds : []);
+        for (const read of body.reads.slice(0, 60)) {
+          if (typeof read?.id !== 'string' || !/^[A-Za-z0-9_.:-]{1,64}$/.test(read.id) ||
+              typeof read.url !== 'string' || done.has(read.id)) continue;
+          if (await paused()) break;
+          const result = await onResearch(read.url);
+          if (!result) break;
+          await request('/research-results', 'POST', { id: read.id, url: read.url, at: Date.now(), result });
+          done.add(read.id);
+          await local.set({ researchReadIds: [...done].slice(-1000) });
+        }
+        return true;
+      } catch {
+        return false;
+      } finally {
+        researching = false;
+      }
+    }
+    return { syncSettings, syncRequests, syncCommands, syncStatus, syncResearch };
   }
   return { create };
 })();

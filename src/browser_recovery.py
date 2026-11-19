@@ -38,6 +38,7 @@ _RECOVERY_EVENTS = frozenset({
     "docker-start-requested", "docker-start-unavailable", "chrome-profile-selected",
     "recovery-already-running", "recovery-check-failed", "recovery-state-unavailable",
     "recovery-state-cleanup-unavailable", "recovery-started", "recovery-stopped",
+    "backend-unavailable",
 })
 
 
@@ -55,6 +56,13 @@ class RecoveryJSONFormatter(logging.Formatter):
         elapsed = getattr(record, "duration_ms", None)
         if type(elapsed) in {int, float} and 0 <= elapsed <= 1e15 and math.isfinite(elapsed):
             value["duration_ms"] = elapsed
+        # Decision inputs, so a launch can be explained from the log alone.
+        for key in ("backend_reachable", "chrome_running"):
+            if hasattr(record, key) and getattr(record, key) in (True, False, None):
+                value[key] = getattr(record, key)
+        age = getattr(record, "heartbeat_age_seconds", None)
+        if _finite_number(age):
+            value["heartbeat_age_seconds"] = age
         return json.dumps(value, separators=(",", ":"), allow_nan=False)
 
 
@@ -219,8 +227,15 @@ def browser_signal(health: object, now: float) -> BrowserSignal | None:
     )
 
 
-def recovery_decision(config, state, signal, chrome_running, now, started_at, refresh=None) -> str:
-    """Pure launch decision, using the heartbeat rather than observed item age."""
+def recovery_decision(
+    config, state, signal, chrome_running, now, started_at, refresh=None, *, reachable=True,
+) -> str:
+    """Pure launch decision, using the heartbeat rather than observed item age.
+
+    ``chrome_running`` is True, False, or None when the process check failed.
+    Launching into a running Chrome always adds a reviewer tab, so it needs
+    positive evidence: a reachable notifier reporting a missing/stale heartbeat.
+    """
     if not config["enabled"]:
         return "disabled"
     if refresh == 0 or (refresh is None and state["refreshDisabled"]):
@@ -229,6 +244,10 @@ def recovery_decision(config, state, signal, chrome_running, now, started_at, re
         return "verification-paused"
     if signal is not None and signal.age <= config["staleHeartbeatSeconds"]:
         return "healthy"
+    chrome_running = chrome_running is not False
+    if chrome_running and not reachable:
+        # A slow or restarting notifier says nothing about the browser.
+        return "backend-unavailable"
     if chrome_running and signal is None:
         last_heartbeat = state["lastHeartbeatAt"]
         if last_heartbeat and now - last_heartbeat <= config["staleHeartbeatSeconds"]:
@@ -255,6 +274,7 @@ class RecoverySupervisor:
         self.state = _load_state(self.root)
         self._persisted = deepcopy(self.state)
         self.config = dict(DEFAULT_CONFIG)
+        self.inputs = {}
 
     def _persist(self):
         if not self.dry_run and self.state != self._persisted:
@@ -309,6 +329,7 @@ class RecoverySupervisor:
             log.info("docker-start-requested" if result else "docker-start-unavailable")
 
     def tick(self) -> str:
+        self.inputs = {}
         try:
             self.config = load_config(self.root)
         except (OSError, ValueError):
@@ -333,9 +354,14 @@ class RecoverySupervisor:
         health = self.platform.health(self.root)
         signal = browser_signal(health, now)
         self._observe(signal, now)
+        chrome_running = self.platform.chrome_running()
+        self.inputs = {
+            "backend_reachable": health is not None, "chrome_running": chrome_running,
+            "heartbeat_age_seconds": None if signal is None else round(signal.age, 3),
+        }
         decision = recovery_decision(
-            self.config, self.state, signal, self.platform.chrome_running(), now,
-            self.started_at, refresh,
+            self.config, self.state, signal, chrome_running, now,
+            self.started_at, refresh, reachable=health is not None,
         )
         self._persist()
         # A running notifier can receive the heartbeat that clears a saved
@@ -409,7 +435,8 @@ class HostPlatform:
         except (OSError, ValueError, RecursionError, urllib.error.URLError):
             return None
 
-    def _process_running(self, name: str) -> bool:
+    def _process_running(self, name: str) -> bool | None:
+        """None when the process table could not be read (e.g. a stalled host)."""
         try:
             # Bounded read, even if a machine has an unusually large process
             # table. Command output is never retained in logs or state.
@@ -421,11 +448,13 @@ class HostPlatform:
                 )
                 output_file.seek(0)
                 output = output_file.read(65536).lower()
-            return result.returncode == 0 and (f'"{name.lower()}"'.encode() in output)
+            if result.returncode != 0:
+                return None
+            return f'"{name.lower()}"'.encode() in output
         except (OSError, subprocess.TimeoutExpired):
-            return False
+            return None
 
-    def chrome_running(self) -> bool:
+    def chrome_running(self) -> bool | None:
         return self._process_running("chrome.exe")
 
     def find_chrome(self) -> Path | None:
@@ -515,7 +544,7 @@ class HostPlatform:
         return self._docker_command(root, ["compose", "up", "-d", "--no-build"])
 
     def start_docker(self) -> bool:
-        if self._process_running("Docker Desktop.exe"):
+        if self._process_running("Docker Desktop.exe") is True:
             return True
         candidates = [
             Path(os.environ.get("PROGRAMFILES", "C:/Program Files")) /
@@ -609,7 +638,8 @@ def main(argv=None) -> int:
                 result = runner.tick()
                 if result != previous or args.once or tick_started-last_receipt_at >= 60:
                     log.info("%s", result, extra={
-                        "duration_ms": round((time.monotonic()-tick_started)*1000, 3)})
+                        "duration_ms": round((time.monotonic()-tick_started)*1000, 3),
+                        **runner.inputs})
                     previous = result
                     last_receipt_at = tick_started
             except (OSError, ValueError, RuntimeError):

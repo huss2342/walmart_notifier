@@ -133,24 +133,56 @@ def test_stale_heartbeat_existing_chrome_launches_once_then_rearms_after_fresh_r
     assert platform.calls.count("chrome") == 2
 
 
-@pytest.mark.parametrize("gap", [None, {"runtime": {"browser": None}}],
-                         ids=["health-unavailable", "browser-cleared"])
-def test_recent_heartbeat_prevents_duplicate_chrome_after_backend_gap_and_old_startup(
-    tmp_path, gap,
+def test_recent_heartbeat_prevents_duplicate_chrome_after_backend_restart_and_old_startup(
+    tmp_path,
 ):
     platform = FakePlatform(heartbeat(), running=True)
     clock = [NOW]
     runner = supervisor(tmp_path, platform, clock)
     clock[0] += 1000
     assert runner.tick() == "healthy"
-    platform.report = gap
+    platform.report = {"runtime": {"browser": None}}
     clock[0] += 30
     assert runner.tick() == "heartbeat-grace"
     assert "chrome" not in platform.calls
-    if gap is None:
-        assert platform.calls == ["docker-info", "compose-up"]
     clock[0] += 151
     assert runner.tick() == "chrome-launched"
+
+
+@pytest.mark.parametrize("running", [True, None], ids=["chrome-running", "process-check-failed"])
+def test_unreachable_notifier_never_adds_a_tab_to_possibly_running_chrome(tmp_path, running):
+    # Nov 6 incident: /health stalled 29 s, tasklist failed under the same host
+    # stall, and the supervisor opened a reviewer tab beside live scanners.
+    platform = FakePlatform(heartbeat(), running=running)
+    clock = [NOW]
+    runner = supervisor(tmp_path, platform, clock)
+    assert runner.tick() == "healthy"
+    platform.report = None
+    for _ in range(20):
+        clock[0] += 600
+        assert runner.tick() == "backend-unavailable"
+    assert "chrome" not in platform.calls
+    assert "compose-up" in platform.calls
+    assert runner.inputs == {"backend_reachable": False, "chrome_running": running,
+                             "heartbeat_age_seconds": None}
+    platform.report = heartbeat(500)
+    assert runner.tick() == "chrome-launched"
+    assert runner.tick() == "outage-already-handled"
+
+
+def test_unreachable_notifier_still_launches_when_chrome_is_confirmed_closed(tmp_path):
+    platform = FakePlatform(None, running=False)
+    assert supervisor(tmp_path, platform, [NOW]).tick() == "chrome-launched"
+
+
+def test_tick_log_records_decision_inputs(tmp_path):
+    import logging
+    record = logging.LogRecord("browser-recovery", logging.INFO, "", 0, "%s", ("healthy",), None)
+    record.__dict__.update(backend_reachable=False, chrome_running=None,
+                           heartbeat_age_seconds=None, duration_ms=1.0)
+    value = json.loads(recovery.RecoveryJSONFormatter().format(record))
+    assert value["backend_reachable"] is False and value["chrome_running"] is None
+    assert "heartbeat_age_seconds" not in value
 
 
 def test_last_real_heartbeat_grace_survives_supervisor_restart_and_expires_on_time(tmp_path):
@@ -587,7 +619,7 @@ def test_process_and_docker_failures_return_safe_results_without_logging_excepti
     monkeypatch.setattr(recovery.subprocess, "run", timeout)
     monkeypatch.setattr(recovery.shutil, "which", lambda command: "docker.exe")
     platform = recovery.HostPlatform()
-    assert not platform.chrome_running()
+    assert platform.chrome_running() is None
     assert not platform.docker_ready(tmp_path)
     assert not platform.compose_up(tmp_path)
     assert caplog.records == []

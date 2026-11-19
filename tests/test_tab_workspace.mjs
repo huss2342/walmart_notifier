@@ -260,18 +260,25 @@ test('retired registered scanners close automatically while live and manual revi
   f.tabs.set(7, { id: 7, windowId: 7, url: 'https://www.walmart.com/ip/123', active: false, groupId: -1 });
   await f.api.sync([1, 4]);
   assert.equal(f.tabs.has(2), false, 'An unchanged retired scanner should no longer accumulate in Chrome');
-  for (const id of [1, 4, 5, 6, 7, 9]) assert.equal(f.tabs.has(id), true, `Preserve tab ${id}`);
-  assert.deepEqual(f.actions.filter(action => action.type === 'tab-remove'), [{ type: 'tab-remove', id: 2 }]);
+  // The owner asked for the old-tabs group to be closed, not kept: a stale
+  // reviewer tab left inside the scanner group is archived, then closed.
+  assert.equal(f.tabs.has(5), false);
+  for (const id of [1, 4, 6, 7, 9]) assert.equal(f.tabs.has(id), true, `Preserve tab ${id}`);
+  assert.deepEqual(f.actions.filter(action => action.type === 'tab-remove'),
+    [{ type: 'tab-remove', id: 2 }, { type: 'tab-remove', id: 5 }]);
 });
 
-test('saved explicit ownership survives worker recreation but matching gray groups alone never authorize closure', async () => {
+test('saved explicit ownership survives worker recreation and the old-tabs group is closed', async () => {
   const f = fixture({ cleanup: true });
   await f.api.sync([1, 2]);
   f.groups.set(30, { id: 30, windowId: 7, title: 'Old reviewer tabs — safe to close', color: 'grey' });
   f.tabs.set(5, { id: 5, windowId: 7, url: home, active: false, groupId: 30 });
+  f.tabs.set(6, { id: 6, windowId: 7, url: home, active: true, groupId: 30 });
   await f.recreate().sync([1]);
   assert.equal(f.tabs.has(2), false);
-  assert.equal(f.tabs.has(5), true, 'An archive title is not ownership evidence');
+  // The owner asked for old reviewer tabs to be closed, never the one in view.
+  assert.equal(f.tabs.has(5), false);
+  assert.equal(f.tabs.has(6), true, 'A tab the owner is looking at stays open');
 });
 
 test('retired owned scanners close even when their window no longer contains a live scanner', async () => {
@@ -462,6 +469,27 @@ test('an unrelated selected tab retains its selection while Chrome is focused', 
   assert.equal(answer.reason, 'manual-tab-active');
   assert.equal(answer.retryAfterMs, 5000);
   assert.equal(f.actions.some(action => action.type === 'tab-update'), false);
+});
+
+test('an unattended selected tab in a focused window cannot starve scanners once the user is away', async () => {
+  // Nov 6 incident: a recovery-launched tab stayed selected in a focused window
+  // all night and denied every scanner turn as manual browsing for 11 hours.
+  for (const [state, granted] of [['active', false], ['idle', true], ['locked', true]]) {
+    const f = fixture();
+    const queried = [];
+    f.chrome.idle = { async queryState(seconds) { queried.push(seconds); return state; } };
+    await f.api.sync([1, 2]);
+    f.activate(9);
+    const answer = await f.api.request(2, 1);
+    assert.equal(answer.granted, granted, state);
+    assert.equal(f.tabs.get(2).active, granted, state);
+    assert.ok(queried.length && queried.every(seconds => seconds === 300), state);
+  }
+  const f = fixture();
+  f.chrome.idle = { async queryState() { throw new Error('unavailable'); } };
+  await f.api.sync([1, 2]);
+  f.activate(9);
+  assert.equal((await f.api.request(2, 1)).reason, 'manual-tab-active');
 });
 
 test('background and minimized Chrome windows select scanner tabs without changing window focus or state', async () => {
@@ -1261,6 +1289,24 @@ test('releasing a turn hints only the FIFO head without granting or selecting it
   assert.equal((await f.api.release(1, 1, first.leaseId)).released, false);
   await f.runTimers();
   assert.equal(focusHints(f).length, 1, 'stale releases cannot wake another contender');
+});
+
+test('scanners that asked during user input keep FIFO order and the head wakes when input goes quiet', async () => {
+  const f = await competingReaders({ fakeTimers: true });
+  await f.api.noteActivity(1);
+  assert.equal((await f.api.request(3, 1, f.now() + 60_000)).reason, 'user-active');
+  assert.equal((await f.api.request(2, 1, f.now() + 60_000)).reason, 'user-active');
+  f.advance(20_000);
+  await f.runTimers();
+  assert.equal(focusHints(f).length, 0, 'no wakeup while input is still recent');
+  // Lanes keep polling during the quiet period, refreshing their tickets.
+  await f.api.request(3, 1, f.now() + 60_000);
+  await f.api.request(2, 1, f.now() + 60_000);
+  f.advance(10_001);
+  await f.runTimers();
+  assert.deepEqual(focusHints(f).map(entry => entry.id), [3], 'first asker is woken, nothing is selected');
+  assert.equal((await f.api.request(2, 1, f.now() + 1000)).granted, false);
+  assert.equal((await f.api.request(3, 1, f.now() + 1000)).granted, true);
 });
 
 test('lease expiry wakes the next scanner once and revocation cancels old expiry callbacks', async () => {

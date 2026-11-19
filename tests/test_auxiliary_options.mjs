@@ -556,3 +556,33 @@ test('restart additional scans uses the separate coordinator endpoint and handle
   assert.match(failed.elements.auxiliaryActionStatus.textContent, /Could not restart/);
   assert.equal(failed.elements.restartAuxiliary.disabled, false);
 });
+
+test('direct-read card shows each lane\'s newest read, failures and a bot-check pause', async () => {
+  const now = Date.now();
+  const ui = await loadOptions({ initial: {
+    reviewerDiagnostics: [
+      { event: 'page-loaded', at: now - 60_000 },
+      { event: 'fast-read', at: now - 30_000, lane: 'value', page: 2, count: 29, items: 32, durationMs: 1200,
+        outcome: 'items' },
+      { event: 'fast-read', at: now - 4_000, lane: 'value', page: 1, count: 18, items: 30, durationMs: 1205,
+        outcome: 'items' },
+      { event: 'fast-read', at: now - 9_000, lane: 'value80', page: 3, count: 22, items: 34, outcome: 'error' }
+    ],
+    reviewerFastReads: { blocks: 1, until: now + 4 * 60_000, slowUntil: now + 86_400_000 }
+  } });
+  await new Promise(resolve => setImmediate(resolve));
+  const text = ui.elements.fastStatus.textContent;
+  assert.match(text, /paused after a bot-check sign/);
+  assert.match(text, /3 direct reads in the last 60 s\s+\(about 3 a minute\)/);
+  assert.match(text, /Highest value:\s+last read \d+ s ago, page 1, 18 offers at \$80\+ of 30 items \(1\.2 s\)/);
+  assert.match(text, /\$80\+ list:\s+last read \d+ s ago, page 3.* Last result: error/);
+  assert.doesNotMatch(text, /Newest|Departments/);
+  assert.equal(ui.elements.overallStatus.textContent, 'Running');
+
+  const offline = await loadOptions({ fetchImpl: url => new URL(url).pathname === '/health'
+    ? Promise.reject(new TypeError('Failed to fetch')) : undefined });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(offline.elements.overallStatus.textContent, 'Notifier offline');
+  assert.equal(offline.elements.overallStatus.className, 'pill bad');
+  assert.match(offline.elements.fastStatus.textContent, /No direct reads/);
+});

@@ -107,6 +107,23 @@ test('an available selected heading primary can coexist with explicitly bound va
     [['ip-12345678', true, 49]]);
 });
 
+for (const badge of ['Best seller', 'Clearance', 'Reduced price', 'New']) {
+  test(`a captured ${badge} heading keeps its canonical primary separate from bound variants`, () => {
+    const title = 'Rollaway Bed Storage Cover, Thickened Storage Cover for Folding Twin Beds';
+    const product = headingCard('20321560444', `${badge}, ${title}`, {
+      outOfStock: true, valueLine: '(Valued at $35)',
+      variants: [swatch('19409553151', title), swatch('20058369569', title)] });
+    assert.deepEqual(collectFrom([product]).map(item => [item.item_id, item.available, item.value_usd, item.title]),
+      [['ip-20321560444', false, 35, title]]);
+  });
+}
+
+test('a badge-looking product word without its separator remains part of the canonical identity', () => {
+  const product = headingCard('20321560444', 'New York Folding Bed', {
+    variants: [swatch('19409553151', 'York Folding Bed')] });
+  assert.deepEqual(collectFrom([product]), []);
+});
+
 test('the captured heading layout preserves available versus unavailable local stock evidence', () => {
   const raw = structuredClone(fixtureCard());
   function available(node) {

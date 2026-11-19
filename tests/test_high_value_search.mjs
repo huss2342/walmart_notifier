@@ -22,10 +22,10 @@ test('priority searches have a short furniture-first queue independently of the 
 });
 
 test('priority searches enforce their independent list and text bounds', () => {
-  assert.equal(api.priorityQueries(Array.from({ length: 24 }, (_, i) => `Item ${i}`)).length, 24);
+  assert.equal(api.priorityQueries(Array.from({ length: 32 }, (_, i) => `Item ${i}`)).length, 32);
   assert.deepEqual(Array.from(api.priorityQueries(['\u{1f6cf}'.repeat(80)])), ['\u{1f6cf}'.repeat(80)]);
   for (const value of [{}, [7], [''], ['a'.repeat(81)], ['Bed\nDesk'], ['\tSofa'], ['Bed\u0085'], ['\ud800'],
-    Array.from({ length: 25 }, (_, i) => `Item ${i}`)]) {
+    Array.from({ length: 33 }, (_, i) => `Item ${i}`)]) {
     assert.throws(() => api.priorityQueries(value));
   }
 });

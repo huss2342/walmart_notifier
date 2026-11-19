@@ -5,21 +5,83 @@ const ReviewerAuxiliaryScans = (() => {
   const STATE_KEY = 'reviewerAuxiliaryScans';
   const TABS_KEY = 'reviewerAuxiliaryTabs';
   const ALARM = 'auxiliaryScan';
-  const LANES = Object.freeze(['departments', 'keywords', 'priority']);
-  const enabled = (name, settings) => name === 'departments' ? settings.auxiliaryDepartments === true
-    : name === 'keywords' ? settings.auxiliaryKeywords === true
-      : name === 'priority' && settings.auxiliaryPriority === true;
+  // One descriptor per lane; add a lane here. Object order drives fair
+  // rotation and start delays. keyPrefix and salt are persisted/observable
+  // (target keys, refresh jitter), so never change them for an existing lane.
+  // Query lanes supply queries/normalize; append is the rule that lets a
+  // longer list extend a saved queue: 'prefix' (same order) or 'superset'.
+  const LANE_SPECS = Object.freeze({
+    departments: Object.freeze({ salt: 1, enabled: settings => settings.auxiliaryDepartments === true }),
+    keywords: Object.freeze({ salt: 2, keyPrefix: 'keyword', append: 'prefix',
+      enabled: settings => settings.auxiliaryKeywords === true,
+      queries: settings => auxiliaryQueries(settings.auxiliaryKeywordQueries ?? undefined),
+      normalize: value => auxiliaryQueries(value) }),
+    priority: Object.freeze({ salt: 3, keyPrefix: 'priority', append: 'prefix',
+      enabled: settings => settings.auxiliaryPriority === true,
+      refreshMinutes: settings => Math.max(1, Math.min(120, Number(settings.auxiliaryPriorityRefreshMinutes) || 1)),
+      queries: settings => priorityQueries(settings.auxiliaryPriorityQueries),
+      normalize: value => priorityQueries(value) }),
+    requests: Object.freeze({ salt: 4, keyPrefix: 'request', append: 'superset', refreshMinutes: () => 1,
+      enabled: settings => memberQueries(settings).length > 0,
+      queries: settings => memberQueries(settings),
+      normalize: value => requestQueries(value) })
+  });
+  const LANES = Object.freeze(Object.keys(LANE_SPECS));
+  const enabled = (name, settings) => LANE_SPECS[name]?.enabled(settings) === true;
+
+  function requestQueries(value) {
+    if (!Array.isArray(value)) return [];
+    const seen = new Set();
+    return value.filter(query => {
+      if (typeof query !== 'string' || !query.trim() || /[\p{C}]/u.test(query) || /:\/\//.test(query)) return false;
+      const key = query.trim().toLocaleLowerCase('en-US');
+      if (seen.has(key)) return false;
+      seen.add(key); return true;
+    }).map(query => query.trim());
+  }
+  // Searches the priority tab already runs are skipped here: its results carry
+  // the same query, so the backend still matches them to member requests.
+  function memberQueries(settings) {
+    const queries = requestQueries(settings.requestSearchQueries);
+    if (settings.auxiliaryPriority !== true) return queries;
+    let priority;
+    try { priority = priorityQueries(settings.auxiliaryPriorityQueries); } catch { return queries; }
+    const key = query => query.toLocaleLowerCase('en-US').replace(/\s+/g, ' ');
+    const covered = new Set(priority.map(key));
+    return queries.filter(query => !covered.has(key(query)));
+  }
   const MAX_TARGETS = 2000;
   const MAX_FAILURES = 50;
   const STALE_MS = 120_000;
   const WAIT_OPPORTUNITY_MS = 300_000;
   const CONTENT_FAILURES = new Set(['document-http-error', 'render-timeout',
-    'render-opportunity-timeout', 'navigation-timeout', 'navigation-scope-changed']);
+    'render-opportunity-timeout', 'navigation-timeout', 'navigation-scope-changed', 'interior-empty', 'card-unreadable']);
   const RETRIES = [5_000, 15_000];
 
   function create(chrome, dependencies) {
     const { home, config, paused, post } = dependencies;
-    const diagnostic = dependencies.diagnostic || (async () => {});
+    const diagnosticSink = dependencies.diagnostic || (async () => {});
+    const targetIdentity = async targetKey => {
+      try {
+        return typeof diagnosticTargetId === 'function' ? await diagnosticTargetId(targetKey) : null;
+      } catch { return null; }
+    };
+    const diagnostic = async (event, details = {}) => {
+      const { targetKey, ...safe } = details;
+      const targetId = await targetIdentity(targetKey);
+      return diagnosticSink(event, { ...safe, ...(targetId ? { targetId } : {}) });
+    };
+    const recoveryDiagnostic = (lane, reason, outcome, probe, decision = 'none') => {
+      if (typeof recordScannerRecovery !== 'function') return;
+      try {
+        Promise.resolve(recordScannerRecovery(lane.lane, reason, outcome, {
+          probe, progressAt: lane.lastActivityAt || 0, enabled: true, paused: false, decision,
+          tabId: lane.tabId, generation: lane.generation, round: lane.round,
+          targetIndex: lane.cursor + 1, targetKey: currentTarget(lane)?.key,
+          documentId: probe?.documentId || 0
+        })).catch(() => {});
+      } catch { /* Logging never controls recovery. */ }
+    };
     let tail = Promise.resolve();
     const mutate = task => {
       const result = tail.then(task, task);
@@ -35,11 +97,10 @@ const ReviewerAuxiliaryScans = (() => {
       // ordinary target spacing remains the floor for a deferred recovery.
       if (!(refresh > 0)) return lane.targets.some(target => target.coverageStatus === 'unresolved')
         ? lane.completedAt + Math.max(spacing(settings), RETRIES.at(-1)) : 0;
-      const requested = lane.lane === 'priority'
-        ? Math.max(1, Math.min(120, Number(settings.auxiliaryPriorityRefreshMinutes) || 1)) : refresh;
+      const spec = LANE_SPECS[lane.lane];
+      const requested = spec?.refreshMinutes ? spec.refreshMinutes(settings) : refresh;
       const interval = Math.max(60_000, requested * 60_000);
-      return lane.completedAt + interval + cycleJitterMs(interval, lane.completedAt,
-        lane.lane === 'priority' ? 3 : lane.lane === 'keywords' ? 2 : 1);
+      return lane.completedAt + interval + cycleJitterMs(interval, lane.completedAt, spec?.salt || 1);
     };
 
     function cleanUrl(raw) {
@@ -94,8 +155,7 @@ const ReviewerAuxiliaryScans = (() => {
     }
 
     function queries(name, settings) {
-      return name === 'priority' ? priorityQueries(settings.auxiliaryPriorityQueries)
-        : auxiliaryQueries(settings.auxiliaryKeywordQueries ?? undefined);
+      return (LANE_SPECS[name]?.queries || LANE_SPECS.keywords.queries)(settings);
     }
 
     function fingerprint(name, settings) {
@@ -110,25 +170,28 @@ const ReviewerAuxiliaryScans = (() => {
         const url = new URL(home);
         url.searchParams.set('q', query);
         url.searchParams.set('queryNups', query);
-        return { key: `${name === 'priority' ? 'priority' : 'keyword'}:${query.toLocaleLowerCase('en-US')}`, kind: 'keyword', label: query,
+        return { key: `${LANE_SPECS[name]?.keyPrefix || 'keyword'}:${query.toLocaleLowerCase('en-US')}`, kind: 'keyword', label: query,
           targetUrl: url.toString(), selection: null, attempts: 0 };
       });
     }
 
-    function appendKeywordTargets(name, lane, settings) {
-      if (name !== 'keywords' || !Array.isArray(lane.targets)) return false;
+    function appendQueryTargets(name, lane, settings) {
+      const spec = LANE_SPECS[name];
+      if (!spec?.append || !Array.isArray(lane.targets)) return false;
       let previous;
       try {
         previous = JSON.parse(lane.fingerprint);
         // Only fingerprints produced from an actual normalized query list
         // prove that old work is still the exact prefix of this configuration.
         if (!Array.isArray(previous) ||
-            JSON.stringify(auxiliaryQueries(previous)) !== JSON.stringify(previous)) return false;
+            JSON.stringify(spec.normalize(previous)) !== JSON.stringify(previous)) return false;
       } catch { return false; }
       const next = queries(name, settings);
-      if (next.length <= previous.length || previous.some((query, index) => next[index] !== query)) return false;
+      if (next.length <= previous.length || (spec.append === 'superset'
+        ? previous.some(query => !next.includes(query))
+        : previous.some((query, index) => next[index] !== query))) return false;
       const known = new Set(lane.targets.map(target => target.key));
-      for (const target of initialTargets(name, settings).slice(previous.length)) {
+      for (const target of initialTargets(name, settings)) {
         if (known.has(target.key)) continue;
         known.add(target.key);
         lane.targets.push({ coverageStatus: 'pending', attemptedAt: 0, ...target });
@@ -147,7 +210,8 @@ const ReviewerAuxiliaryScans = (() => {
     async function read() {
       const stored = (await chrome.storage.local.get([STATE_KEY]))[STATE_KEY];
       const state = stored?.version === 1 && stored.lanes && typeof stored.lanes === 'object'
-        ? clone(stored) : { version: 1, lanes: {} };
+        // chrome.storage already returns a fresh copy; no second deep clone.
+        ? stored : { version: 1, lanes: {} };
       // Existing v1 queues remain resumable, but their cursor did not prove a
       // terminal page. Revisit advanced targets before calling them verified;
       // old bounded failure history cannot reconstruct every skipped target.
@@ -189,7 +253,7 @@ const ReviewerAuxiliaryScans = (() => {
       const compatible = previous?.fingerprint === fingerprint(name, settings);
       const carried = compatible ? (previous.targets || [])
         .filter(target => target.coverageStatus === 'unresolved' && !target.duplicateOf)
-        .map(target => ({ ...clone(target), attempts: 0, attemptedAt: 0, completedAt: 0 })) : [];
+        .map(target => ({ ...clone(target), attempts: 0, attemptedAt: 0, completedAt: 0, deliveredPages: [] })) : [];
       const keys = new Set(carried.map(target => target.key));
       const targets = [...carried, ...initial.filter(target => !keys.has(target.key))]
         .map(target => ({ coverageStatus: 'pending', attemptedAt: 0, ...target }));
@@ -290,11 +354,55 @@ const ReviewerAuxiliaryScans = (() => {
       lane.checkpointUrl = null;
     }
 
+    async function revalidateInteriorBoundary(lane, details) {
+      const target = currentTarget(lane);
+      if (details.revalidateBoundary !== true || details.restartSweep !== true ||
+          target?.selection || target?.discoveryOnly || !target) return false;
+      let tab;
+      let probe;
+      let page;
+      try {
+        tab = await chrome.tabs.get(lane.tabId);
+        page = Number(new URL(tab.url).searchParams.get('page') || 1);
+        probe = await dependencies.probe?.(lane.tabId);
+      } catch { recoveryDiagnostic(lane, 'interior-empty', 'deferred', probe, 'receiver-unavailable'); return false; }
+      if (probe?.ready !== true || probe.active !== true || probe.generation !== lane.generation ||
+          probe.busy === true || probe.botCheck === true || probe.highTraffic === true) {
+        const decision = probe?.busy ? 'user-input' : probe?.botCheck ? 'verification'
+          : probe?.highTraffic ? 'traffic' : 'receiver-unavailable';
+        recoveryDiagnostic(lane, 'interior-empty', 'deferred', probe, decision);
+        return false;
+      }
+      const receipt = (await chrome.storage.local.get([`sweep:${lane.tabId}`]))[`sweep:${lane.tabId}`];
+      if (!Number.isSafeInteger(page) || page <= 1 || receipt?.generation !== lane.generation ||
+          receipt?.targetKey !== target.key || !Array.isArray(receipt.visited) || receipt.visited.includes(page) ||
+          !Number.isSafeInteger(receipt.total) || receipt.total <= page ||
+          !Number.isSafeInteger(receipt.endRetries?.[page]) || receipt.endRetries[page] < 3) {
+        recoveryDiagnostic(lane, 'interior-empty', 'deferred', probe, receipt ? 'boundary-unproven' : 'receipt-missing');
+        return false;
+      }
+      // The page, receiver and saved proof can yield to a scope/pause change.
+      // Validate again before replacing the working receipt with a fresh search.
+      const auth = await authorized({ tab }, lane.generation);
+      if (!auth?.allowed || auth.target?.key !== target.key) {
+        recoveryDiagnostic(lane, 'interior-empty', 'deferred', probe, 'scope-changed');
+        return false;
+      }
+      const checkpoint = clone(receipt);
+      delete checkpoint.boundaryRevalidation;
+      target.boundaryRevalidation = { at: Date.now(), checkpoint, checkpointUrl: tab.url };
+      target.checkpoint = null;
+      target.checkpointUrl = null;
+      await clearSweep(lane);
+      recoveryDiagnostic(lane, 'interior-empty', 'accepted', probe);
+      return true;
+    }
+
     async function advance(state, lane, settings, { failed = false, limited = false,
       duplicateOf = '', reason = '', pages = 0, emptyResult = false, documentId = 0 } = {}) {
       const target = currentTarget(lane);
       const completionContext = { lane: lane.lane, tabId: lane.tabId, generation: lane.generation,
-        round: lane.round, targetIndex: lane.cursor + 1,
+        round: lane.round, targetIndex: lane.cursor + 1, targetKey: target?.key,
         attempt: (target?.attempts || 0) + (failed ? 0 : 1), documentId };
       if (failed || limited) await retainCheckpoint(lane);
       const count = Number(pages);
@@ -345,9 +453,86 @@ const ReviewerAuxiliaryScans = (() => {
         outcome: duplicateOf ? 'duplicate' : failed || limited ? 'unresolved' : emptyResult ? 'empty' : 'items' });
     }
 
+    // A blank page or an unbindable department usually means a target with
+    // nothing left in it. One direct read of its first page settles that instead
+    // of several full reloads; no answer keeps the ordinary retries.
+    function emptyProbeUrl(target) {
+      try {
+        if (target?.kind === 'keyword') {
+          const url = new URL(target.targetUrl);
+          if (!url.searchParams.get('q')) return null;
+          url.searchParams.delete('page');
+          url.searchParams.set('sort', 'new');
+          return url.toString();
+        }
+        if (target?.kind !== 'department') return null;
+        const catId = new URL(target.selection?.url || target.targetUrl).searchParams.get('catId');
+        if (!/^\d{1,16}(?:_\d{1,16})*$/.test(catId || '')) return null;
+        const url = new URL(home);
+        url.searchParams.set('catId', catId);
+        return url.toString();
+      } catch { return null; }
+    }
+
+    // Runs before the coordinator lock, so other lanes never wait on the read.
+    // Only this coordinator supplies the result; a content message cannot.
+    async function probeUnusable(message, sender) {
+      if (typeof dependencies.fastProbe !== 'function') return null;
+      const bindFailure = /could not authorize selected filter|selected filter could not be authorized/i
+        .test(String(message.reason || ''));
+      if (message.failureCode !== 'render-timeout' && !bindFailure) return null;
+      try {
+        const auth = await authorized(sender, message.generation, { selection: true });
+        const url = auth?.allowed ? emptyProbeUrl(auth.target) : null;
+        if (!url) return null;
+        const reply = await dependencies.fastProbe(url);
+        return reply?.ok === true && Number.isSafeInteger(reply.products) && reply.products >= 0
+          ? { key: auth.target.key, products: reply.products,
+            totalPages: Number.isSafeInteger(reply.totalPages) && reply.totalPages > 0 ? reply.totalPages : 0 }
+          : null;
+      } catch { return null; }
+    }
+
+    // A resumed page that no longer exists renders blank on every retry. Archive
+    // the stale progress, as boundary revalidation does, and read the target again
+    // from its first page, which re-learns the real page count.
+    async function restartFromFirstPage(lane, target) {
+      const checkpoint = clone(target.checkpoint || lane.checkpoint);
+      if (checkpoint) delete checkpoint.boundaryRevalidation;
+      target.boundaryRevalidation = { at: Date.now(), checkpoint,
+        checkpointUrl: target.checkpointUrl || lane.checkpointUrl || null };
+      target.checkpoint = null;
+      target.checkpointUrl = null;
+      await clearSweep(lane);
+    }
+
+    function resumePage(lane, target) {
+      const visited = new Set(((lane.checkpoint || target.checkpoint)?.visited || [])
+        .filter(page => Number.isSafeInteger(page) && page > 0));
+      let next = 1;
+      while (visited.has(next)) next += 1;
+      return next;
+    }
+
     async function fail(state, lane, settings, reason, details = {}) {
       const target = currentTarget(lane);
       if (!target) return role(lane, false);
+      const probe = details.emptyProbe?.key === target.key ? details.emptyProbe : null;
+      if (probe?.products === 0) {
+        // The server's first page holds no products at all: an empty target,
+        // settled with one direct read instead of repeated full reloads.
+        await advance(state, lane, settings, { emptyResult: true, documentId: details.documentId || 0 });
+        return { ...role(lane, false), recover: 'empty' };
+      }
+      // Every page the server reports for this target was read and delivered
+      // this round, so the blank page after them is past its end, not a failure.
+      // (Some department pagers never show an end marker the page can prove.)
+      const delivered = new Set(target.deliveredPages || []);
+      if (probe?.totalPages > 0 && !target.selection &&
+          Array.from({ length: probe.totalPages }, (_, index) => index + 1).every(page => delivered.has(page))) {
+        await advance(state, lane, settings, { pages: probe.totalPages, documentId: details.documentId || 0 });
+        return { ...role(lane, false), recover: 'complete' };
+      }
       target.attempts = (Number(target.attempts) || 0) + 1;
       target.coverageStatus = 'unresolved';
       lane.lastError = CONTENT_FAILURES.has(details.failureCode) ? details.failureCode :
@@ -355,12 +540,13 @@ const ReviewerAuxiliaryScans = (() => {
       lane.lastActivityAt = Date.now();
       // Capture the failing lease before advance() replaces its generation.
       const context = { lane: lane.lane, tabId: lane.tabId, generation: lane.generation,
-        round: lane.round, targetIndex: lane.cursor + 1, attempt: target.attempts,
+        round: lane.round, targetIndex: lane.cursor + 1, targetKey: target.key, attempt: target.attempts,
         reason: lane.lastError, ...(CONTENT_FAILURES.has(details.failureCode) ? { failureCode: details.failureCode } : {}) };
       if (Number.isSafeInteger(details.documentId) && details.documentId > 0) context.documentId = details.documentId;
       if (Number.isInteger(details.responseStatus) && details.responseStatus >= 100 && details.responseStatus <= 599) {
         context.responseStatus = details.responseStatus;
       }
+      const revalidatedBoundary = await revalidateInteriorBoundary(lane, details);
       if (target.attempts > RETRIES.length) {
         await advance(state, lane, settings, { failed: true, reason: lane.lastError,
           documentId: details.documentId || 0 });
@@ -372,11 +558,18 @@ const ReviewerAuxiliaryScans = (() => {
         // rendering its cards. Reloading that destination repeats an
         // unconfirmed selection; retry the actual control from its parent.
         await clearSweep(lane);
-      } else {
+      } else if (!revalidatedBoundary) {
         // A failed document does not invalidate acknowledged earlier pages.
         // Retain the same outstanding range through every bounded recovery;
         // after that budget it waits behind healthy targets for the next round.
         await retainCheckpoint(lane);
+        // Except a resume page past the target's current end (it shrank), or a
+        // blank resume page on the last retry: read from page one instead.
+        const next = resumePage(lane, target);
+        if (next > 1 && ((probe && next > Math.max(1, probe.totalPages)) ||
+            (details.failureCode === 'render-timeout' && target.attempts === RETRIES.length))) {
+          await restartFromFirstPage(lane, target);
+        }
       }
       lane.generation += 1;
       lane.status = 'waiting';
@@ -398,7 +591,9 @@ const ReviewerAuxiliaryScans = (() => {
         return { ...role(before.lane, false), ok: false, reason: 'inactive-or-unbound-target' };
       }
       const startedAt = Date.now();
+      const targetId = await targetIdentity(before.target?.key);
       const context = { lane: before.lane.lane, tabId: before.lane.tabId, generation: message.generation,
+        ...(targetId ? { targetId } : {}),
         documentId: message.documentId, round: before.lane.round, targetIndex: before.lane.cursor + 1,
         intakePhase: ['late', 'live'].includes(message.intakePhase) ? message.intakePhase : 'initial' };
       const result = await post(message.items, message.page,
@@ -409,6 +604,9 @@ const ReviewerAuxiliaryScans = (() => {
           const latest = await authorized(sender, message.generation);
           if (!latest?.allowed) return;
           latest.lane.lastActivityAt = Date.now();
+          if (latest.target && Number.isSafeInteger(message.page) && message.page > 0 && message.page <= 100) {
+            latest.target.deliveredPages = [...new Set([...(latest.target.deliveredPages || []), message.page])];
+          }
           await save(latest.state);
         });
         await diagnostic('auxiliary-page-delivered', { ...context, requestId: result.requestId,
@@ -431,6 +629,7 @@ const ReviewerAuxiliaryScans = (() => {
     async function handle(message, sender) {
       if (!await ownsTab(sender?.tab?.id)) return null;
       if (message.type === 'reviewer:page') return page(message, sender);
+      const emptyProbe = message.type === 'reviewer:unusable' ? await probeUnusable(message, sender) : null;
       return mutate(async () => {
         const selecting = ['reviewer:role', 'reviewer:aux-selected', 'reviewer:unusable'].includes(message.type);
         const auth = await authorized(sender, message.generation, { selection: selecting });
@@ -497,7 +696,9 @@ const ReviewerAuxiliaryScans = (() => {
           await save(state);
           return role(lane);
         }
-        if (message.type === 'reviewer:unusable') return fail(state, lane, settings, message.reason, message);
+        if (message.type === 'reviewer:unusable') {
+          return fail(state, lane, settings, message.reason, { ...message, emptyProbe });
+        }
         if (message.type === 'reviewer:sweep-complete') {
           if (message.emptyResult === true) {
             const receipt = (await chrome.storage.local.get([`sweep:${lane.tabId}`]))[`sweep:${lane.tabId}`];
@@ -537,7 +738,10 @@ const ReviewerAuxiliaryScans = (() => {
         // worker loss in that gap must not delete the last acknowledged pages.
         await retainCheckpoint(lane);
         const waitingUrl = chrome.runtime?.getURL?.('scanner-wait.html') || 'about:blank';
-        tab = await chrome.tabs.create({ url: waitingUrl, active: false });
+        const windowId = await dependencies.windowId?.();
+        if (await paused() || !enabled(lane.lane, await config())) return null;
+        tab = await chrome.tabs.create({ url: waitingUrl, active: false,
+          ...(Number.isInteger(windowId) ? { windowId } : {}) });
         const oldTabId = lane.tabId;
         lane.tabId = tab.id;
         lane.generation += 1;
@@ -563,6 +767,18 @@ const ReviewerAuxiliaryScans = (() => {
         return;
       }
       if (!await reserveTab(state, lane)) return;
+      // A member search a direct read found empty minutes ago would load the
+      // same empty page: record it as empty without a page load and move on.
+      const provenEmpty = () => {
+        const next = currentTarget(lane);
+        return lane.lane === 'requests' && next?.kind === 'keyword' && !next.checkpoint && !lane.checkpoint &&
+          dependencies.recentlyEmpty?.(next.label) === true;
+      };
+      while (provenEmpty()) {
+        currentTarget(lane).attemptedAt ||= Date.now();
+        await advance(state, lane, settings, { emptyResult: true });
+        if (lane.cursor >= lane.targets.length) return;
+      }
       const target = currentTarget(lane);
       if (!target) return;
       lane.status = 'scanning';
@@ -596,7 +812,7 @@ const ReviewerAuxiliaryScans = (() => {
       await save(state);
       await chrome.tabs.update(lane.tabId, { url: destination, active: false });
       await diagnostic('auxiliary-target-start', { lane: lane.lane, tabId: lane.tabId,
-        generation: lane.generation, round: lane.round, targetIndex: lane.cursor + 1,
+        generation: lane.generation, round: lane.round, targetIndex: lane.cursor + 1, targetKey: target.key,
         attempt: (target.attempts || 0) + 1 });
     }
 
@@ -614,7 +830,7 @@ const ReviewerAuxiliaryScans = (() => {
         return;
       }
       const expectedFingerprint = fingerprint(name, settings);
-      if (lane && lane.fingerprint !== expectedFingerprint && appendKeywordTargets(name, lane, settings)) {
+      if (lane && lane.fingerprint !== expectedFingerprint && appendQueryTargets(name, lane, settings)) {
         await save(state);
       }
       if (!lane || lane.fingerprint !== expectedFingerprint) {
@@ -709,6 +925,20 @@ const ReviewerAuxiliaryScans = (() => {
               failureCode: 'navigation-scope-changed', documentId: probe.documentId });
             return;
           }
+          // A document can request its role before its navigation commits and
+          // receive a valid passive reply. Rebind at the completion tick rather
+          // than waiting for its next poll, but never treat that as progress or
+          // renew the finite unresponsive-document deadline.
+          if (probe?.ready === true && probe.active === false && probe.phase === 'passive' &&
+              probe.generation === lane.generation && probe.busy !== true && probe.highTraffic !== true &&
+              Date.now() - (Number(lane.lastActivityAt) || 0) < STALE_MS) {
+            const auth = await authorized({ tab }, lane.generation, { selection: true });
+            if (auth?.allowed) {
+              await sendRole(auth.lane);
+              recoveryDiagnostic(auth.lane, 'passive-rebind', 'requested', probe);
+              return;
+            }
+          }
           let matches = probe?.ready === true && probe.active === true &&
             (probe.generation === undefined || probe.generation === lane.generation);
           // A live assigned document explicitly waiting for Walmart traffic is
@@ -722,8 +952,9 @@ const ReviewerAuxiliaryScans = (() => {
           }
           // busy is the content script's trusted-input grace, not a claim of
           // useful progress. Suspend the wait bound during that real guard.
-          if (matches && (probe.busy === true ||
-              ['manual-tab-active', 'user-active'].includes(probe.focusReason))) {
+          // focusReason is a cached denial, not current input evidence. The
+          // content reader still requests fresh workspace authority to act.
+          if (matches && probe.busy === true) {
             lane.waitResumedAt = Date.now();
             await save(state);
             return;
@@ -751,10 +982,9 @@ const ReviewerAuxiliaryScans = (() => {
     }
 
     async function ensureAlarm() {
-      const settings = await config();
-      if (LANES.some(name => enabled(name, settings))) {
-        if (!await chrome.alarms.get(ALARM)) await chrome.alarms.create(ALARM, { periodInMinutes: 0.5 });
-      } else await chrome.alarms.clear(ALARM);
+      // Poll even with no current watches so the first Discord request starts
+      // automatically. No reviewer tab is allocated until work exists.
+      if (!await chrome.alarms.get(ALARM)) await chrome.alarms.create(ALARM, { periodInMinutes: 0.5 });
     }
 
     async function tick() {
@@ -785,6 +1015,31 @@ const ReviewerAuxiliaryScans = (() => {
           }
         });
       }
+      try { await scheduleWake(); } catch { /* The alarm remains the fallback. */ }
+    }
+
+    // The 30s alarm alone left the 15s start slot idle ~40% of the time
+    // (measured p50 gap 24s). Wake exactly when the next waiting lane is due.
+    let wakeTimer = null;
+    async function scheduleWake() {
+      if (typeof setTimeout !== 'function') return;
+      const settings = await config();
+      const state = await read();
+      const due = Object.values(state.lanes || {})
+        // Only future slots: a lane already due but unable to start (focus,
+        // pause) is retried by the alarm, never by a tight timer loop.
+        .filter(lane => enabled(lane.lane, settings) && lane.status === 'waiting' && lane.nextAt > Date.now())
+        .map(lane => lane.nextAt);
+      if (wakeTimer !== null) clearTimeout(wakeTimer);
+      wakeTimer = null;
+      if (!due.length) return;
+      const wait = Math.min(...due) - Date.now() + 50;
+      if (wait >= 30_000) return; // The alarm covers longer waits.
+      wakeTimer = setTimeout(() => {
+        wakeTimer = null;
+        tick().catch(() => {});
+      }, wait);
+      wakeTimer?.unref?.();
     }
 
     async function pause() {
@@ -830,7 +1085,8 @@ const ReviewerAuxiliaryScans = (() => {
         const lane = state.lanes[name];
         const targets = lane.targets.filter(target => target.kind !== 'discovery' && !target.duplicateOf);
         return { lane: name, tabId: lane.tabId, generation: lane.generation,
-          targetLabel: currentTarget(lane)?.label || '', status: lane.status,
+          targetLabel: currentTarget(lane)?.label || '', targetKey: currentTarget(lane)?.key || '',
+          lastProgressAt: lane.lastActivityAt || 0, status: lane.status,
           completedTargets: targets.filter(target => target.coverageStatus === 'complete').length,
           emptyTargets: targets.filter(target => target.coverageStatus === 'complete' && target.result === 'empty').length,
           attemptedTargets: targets.filter(target => target.attemptedAt > 0).length,

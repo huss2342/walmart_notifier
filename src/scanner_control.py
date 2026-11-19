@@ -209,6 +209,8 @@ LANE_STATUSES = frozenset(
         "error",
     }
 )
+# Browser scan lanes besides the homepage scan (extension LANE_SPECS order).
+SCANNER_LANES = frozenset({"departments", "keywords", "priority", "requests"})
 _COMPONENTS = frozenset(
     {
         "settings",
@@ -216,6 +218,7 @@ _COMPONENTS = frozenset(
         "departments",
         "keywords",
         "priority",
+        "requests",
         "verification",
         "commands",
     }
@@ -256,6 +259,8 @@ _FAILURE_CODES = frozenset(
         "render-opportunity-timeout",
         "navigation-timeout",
         "navigation-scope-changed",
+        "interior-empty",
+        "card-unreadable",
     }
 )
 _IDENTIFIER = re.compile(r"[A-Za-z0-9_-]{1,64}")
@@ -375,7 +380,7 @@ def validate_settings(value: object) -> dict:
         incoming = data["auxiliaryPriorityQueries"]
         clean["auxiliaryPriorityQueries"] = None
         if incoming is not None:
-            if type(incoming) is not list or len(incoming) > 24:
+            if type(incoming) is not list or len(incoming) > 32:
                 raise ValueError(INVALID_SETTINGS)
             queries = []
             seen = set()
@@ -447,7 +452,7 @@ def validate_status(value: object) -> dict:
         }
     )
     lanes = data["lanes"]
-    if type(lanes) is not list or len(lanes) > 3:
+    if type(lanes) is not list or len(lanes) > len(SCANNER_LANES):
         raise ValueError(INVALID_STATUS)
     clean_lanes = []
     seen = set()
@@ -459,7 +464,8 @@ def validate_status(value: object) -> dict:
             optional=_LANE_OPTIONAL_NUMBERS | {"lastFailureCode", "runtime"},
         )
         name = _choice(
-            lane["lane"], frozenset({"departments", "keywords", "priority"}), INVALID_STATUS
+            lane["lane"],
+            SCANNER_LANES, INVALID_STATUS
         )
         if name in seen:
             raise ValueError(INVALID_STATUS)

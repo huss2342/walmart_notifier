@@ -9,6 +9,7 @@ import hashlib
 import heapq
 import json
 import math
+import os
 import re
 import sqlite3
 import time
@@ -204,7 +205,8 @@ LABELS = {
         "ERROR",
     },
     "method": {"GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH", "OTHER"},
-    "lane": {"home", "departments", "keywords", "brands", "priority"},
+    "lane": {"home", "departments", "keywords", "brands", "priority", "requests",
+             "newest", "value", "value80", "research"},
     "state": {
         "pending",
         "leased",
@@ -256,6 +258,13 @@ LABELS = {
         "DiscordError",
     },
     "reason": {
+        "input-pointerdown",
+        "input-click",
+        "input-keydown",
+        "input-wheel",
+        "input-touchstart",
+        "input-scroll",
+        "tab-activated",
         "unsupported-platform",
         "invalid-request",
         "invalid-origin",
@@ -336,6 +345,7 @@ LABELS["transition"] = {
     "recovered",
     "queued",
     "rearmed",
+    "restocked",
 }
 LABELS["failureCode"] = {
     "none",
@@ -437,7 +447,49 @@ EVENTS |= {
     "browser-error",
     "sync-state",
     "verification-state",
+    "scanner-state",
+    "scanner-recovery",
+    "user-activity",
+    "fast-read",
+    "restock-watch",
+    "discord_api",
 }
+SCANNER_STATE_LABELS = {
+    "phase": {"unknown", "passive", "starting", "collecting", "ingesting", "ingest-retry",
+              "relay-retry", "complete", "empty-timeout", "extension-reloaded", "manual-browsing",
+              "navigating", "recovering", "transient-end-retry", "waiting-content",
+              "waiting-navigation",
+              "waiting-selection", "waiting-page-change", "waiting-target-change", "waiting-user",
+              "waiting-verification", "waiting-focus", "reading-page", "waiting-traffic"},
+    "focusReason": {"unknown", "none", "busy", "waiting-turn", "manual-tab-active",
+                    "window-unfocused",
+                    "user-active", "not-authorized", "expired", "paused", "disabled", "unavailable",
+                    "short-lease", "hidden", "cancelled", "revoked", "selection-changed",
+                    "not-scanner",
+                    "activation-unavailable"},
+    "visibility": {"visible", "hidden", "unknown"},
+}
+SCANNER_STATE_FLAGS = {"reachable", "active", "busy", "highTraffic", "paused", "enabled"}
+SCANNER_STATE_NUMBERS = {"progressAt", "lastActivityAt", "nextActionAt"}
+SCANNER_RECOVERY_DECISIONS = {"none", "stale-document", "progress-advanced", "user-input",
+                              "verification",
+                              "traffic", "scope-changed", "receipt-missing", "boundary-unproven",
+                              "receiver-unavailable", "cooldown", "disabled", "storage-unavailable"}
+SCANNER_RECOVERY_REASONS = {"progress-timeout", "stale-document", "passive-rebind",
+                            "interior-empty"}
+SCANNER_RECOVERY_OUTCOMES = {"requested", "accepted", "deferred", "unavailable"}
+LABELS["decision"] |= SCANNER_RECOVERY_DECISIONS
+LABELS["rate_limit_source"] = {"local", "server", "unknown"}
+# fast-read stock mix/transport facts and restock-watch timings (see docs/logging.md).
+NUMBERS |= {"stockIn", "stockOut", "stockOther", "bytes", "ageSeconds", "products", "valueCents",
+            "awayMs", "sinceOutMs", "sinceReturnMs", "outReads", "reads"}
+NUMBERS |= {"status", "provider_code", "retry_after_seconds", "ratelimit_remaining",
+            "search_matched", "below_minimum", "unavailable", "value_missing", "searched",
+            "matched", "deduplicated", "held"}
+LABELS["caller"] = {"channel", "personal", "welcome", "membership", "trials", "gateway",
+                    "request-runtime", "other"}
+LABELS["method"] = {"GET", "POST", "PATCH", "PUT", "DELETE"}
+ENDPOINT = re.compile(r"(?:/(?:[a-z@-]{1,32}|\{[a-z_]{1,20}\}))+")
 NUMBERS |= {
     "tabId",
     "generation",
@@ -499,6 +551,9 @@ LABELS["outcome"] |= {
     "ready",
     "interrupted",
     "http-error",
+    "requested",
+    "deferred",
+    "unavailable",
 }
 LABELS["component"] |= {
     "message",
@@ -542,7 +597,12 @@ LABELS["reason"] |= {
     "activation-unavailable",
     "not-scanner",
     "selection-changed",
+    "progress-timeout",
+    "stale-document",
+    "passive-rebind",
+    "interior-empty",
 }
+LABELS["failureCode"] |= {"interior-empty", "card-unreadable"}
 LABELS["mode"] = {"none", "sweep", "high-value"}
 LABELS["operation"] = {"pager", "facet-controls", "page-scroll", "page-navigation"}
 LABELS["stage"] = {
@@ -555,8 +615,15 @@ LABELS["stage"] = {
     "unusable",
     "zero-page-complete",
     "recovered",
+    "returned",
+    "confirmed",
+    "rejected",
+    "followup",
 }
-LABELS["intakePhase"] = {"initial", "late", "live"}
+LABELS["stockState"] = {"in-stock", "out-of-stock", "absent"}
+LABELS["stockSource"] = {"data", "card"}
+LABELS["signalV2"] = LABELS["signalStatus"] = {"in", "out", "other", "none"}
+LABELS["intakePhase"] = {"initial", "late", "live", "fast"}
 LABELS["statusCode"] = {
     "starting",
     "unsupported",
@@ -640,25 +707,49 @@ def _safe_event(row, source):
     for field, choices in LABELS.items():
         if isinstance(row.get(field), str):
             clean[field] = row[field] if row[field] in choices else "other"
+    if clean["event"] == "scanner-recovery":
+        for field, choices in (("reason", SCANNER_RECOVERY_REASONS),
+                               ("outcome", SCANNER_RECOVERY_OUTCOMES),
+                               ("decision", SCANNER_RECOVERY_DECISIONS)):
+            if field in clean and clean[field] not in choices:
+                clean[field] = "other"
     if isinstance(row.get("route"), str):
         clean["route"] = row["route"] if row["route"] in ROUTES else "other"
+    if isinstance(row.get("endpoint"), str):
+        clean["endpoint"] = row["endpoint"] if ENDPOINT.fullmatch(row["endpoint"]) else "other"
     for field in NUMBERS | DURATIONS.keys():
         if _number(row.get(field)):
             clean[field] = row[field]
-    for field in ("ok", "pressSent", "pressConfirmed", "releaseConfirmed", "cleanupConfirmed"):
+    for field in ("ok", "pressSent", "pressConfirmed", "releaseConfirmed", "cleanupConfirmed",
+                  "global_limit", "signalOos", "variant", "conflict"):
         if type(row.get(field)) is bool:
             clean[field] = row[field]
     # Delivery request_id is an integer watch ID. Only HTTP IDs join HTTP traces.
+    if type(row.get("request_id")) is int and _number(row["request_id"]):
+        clean["watch_id"] = row["request_id"]
     for field in ("http_request_id", "requestId", "request_id"):
         request = row.get(field)
         if isinstance(request, str) and HEX_ID.fullmatch(request):
             clean["http_request_id"] = request
             break
-    for field in ("run_id", "streamId", "correlation_id"):
+    for field in ("run_id", "streamId", "correlation_id", "targetId"):
         if isinstance(row.get(field), str) and HEX_ID.fullmatch(row[field]):
             clean[field] = row[field]
+    if (clean["event"] in {"scanner-state", "scanner-recovery"}
+            and isinstance(row.get("state"), dict)):
+        state = row["state"]
+        clean["state"] = {
+            field: state[field] if state[field] in choices else "other"
+            for field, choices in SCANNER_STATE_LABELS.items() if isinstance(state.get(field), str)
+        }
+        clean["state"].update({field: state[field] for field in SCANNER_STATE_FLAGS
+                               if type(state.get(field)) is bool})
+        clean["state"].update({field: state[field] for field in SCANNER_STATE_NUMBERS
+                               if type(state.get(field)) is int and 0 <= state[field] <= 10**15})
     if isinstance(row.get("dispatch_id"), str) and JOB_ID.fullmatch(row["dispatch_id"]):
         clean["dispatch_id"] = row["dispatch_id"]
+    if isinstance(row.get("itemId"), str) and ITEM_ID.fullmatch(row["itemId"]):
+        clean["itemId"] = row["itemId"]
     return clean, recognized
 
 
@@ -666,6 +757,8 @@ def _links(row):
     items, jobs, pairs = set(), set(), collections.defaultdict(set)
     if isinstance(row.get("item_id"), str) and ITEM_ID.fullmatch(row["item_id"]):
         items.add(row["item_id"])
+    if isinstance(row.get("itemId"), str) and ITEM_ID.fullmatch(row["itemId"]):
+        items.add(row["itemId"])  # restock-watch events carry one item
     for item_key, job_key, limit in (
         ("item_ids", "job_ids", 10),
         ("observation_item_ids", "observation_job_ids", 500),
@@ -772,6 +865,7 @@ def _related(candidates, *, item_id, request_id, maximum, quality):
 def _has_item(row, wanted):
     return (
         row.get("item_id") == wanted
+        or row.get("itemId") == wanted
         or isinstance(row.get("item_ids"), list)
         and wanted in row["item_ids"]
         or isinstance(row.get("observation_item_ids"), list)
@@ -871,8 +965,13 @@ def _open_log(path, quality, max_bytes):
 
 def _ledger(directory, *, since, until, item_id, related=None):
     result = {"available": False, "counts": {}}
-    path = directory / "discord_bridge" / "collector.sqlite3"
-    if not path.is_file() or not path.resolve().is_relative_to(directory.resolve()):
+    # The container keeps its queue on a named volume (DISCORD_QUEUE_PATH);
+    # an operator-set path is trusted, the default must stay in the data dir.
+    override = os.environ.get("DISCORD_QUEUE_PATH", "").strip()
+    path = Path(override) if override else directory / "discord_bridge" / "collector.sqlite3"
+    if not path.is_file() or (
+        not override and not path.resolve().is_relative_to(directory.resolve())
+    ):
         return result
     try:
         with closing(
@@ -1083,6 +1182,10 @@ def audit(
         [],
     )
     events = 0
+    scanner_recovery_counts = collections.Counter()
+    scanner_state_counts = collections.Counter()
+    discord_api_counts = collections.Counter()
+    request_totals = collections.defaultdict(collections.Counter)
     candidates = []
 
     def consume(event):
@@ -1091,6 +1194,22 @@ def audit(
         name = event["source"]
         statuses[name]["events"] += 1
         counts[name + ":" + event["event"]] += 1
+        if event["event"] == "scanner-recovery":
+            labels = ("lane", "reason", "outcome", "decision")
+            scanner_recovery_counts[":".join(event.get(field, "other") for field in labels)] += 1
+        if event["event"] == "request_match" and _number(event.get("watch_id")):
+            for key in ("matched", "search_matched", "below_minimum", "unavailable",
+                        "deduplicated", "held"):
+                if _number(event.get(key)):
+                    request_totals[str(event["watch_id"])][key] += event[key]
+        if event["event"] == "discord_api":
+            discord_api_counts[":".join([event.get("caller", "other"), event.get("method", "other"),
+                                         event.get("endpoint", "other"),
+                                         str(event.get("status", "other"))])] += 1
+        if event["event"] == "scanner-state":
+            scanner_state_counts[":".join([event.get("lane", "other"),
+                                          event.get("state", {}).get("phase", "other"),
+                                          event.get("state", {}).get("focusReason", "other")])] += 1
         for key, multiplier in DURATIONS.items():
             if key in event:
                 durations[name + ":" + event["event"] + ":" + key].append(event[key] * multiplier)
@@ -1213,6 +1332,10 @@ def audit(
         "window": {"since": since, "until": until},
         "events": events,
         "counts": dict(sorted(counts.items())),
+        "scanner_recovery_counts": dict(sorted(scanner_recovery_counts.items())),
+        "discord_api_counts": dict(discord_api_counts.most_common()),
+        "request_totals": {key: dict(value) for key, value in sorted(request_totals.items())},
+        "scanner_state_counts": dict(sorted(scanner_state_counts.items())),
         "sources": statuses,
         "quality": quality,
         "durations_seconds": {

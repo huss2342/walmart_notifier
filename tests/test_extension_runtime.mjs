@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
+import { createHash, webcrypto } from 'node:crypto';
 import { reviewerLocks } from './fixtures/reviewer-locks.mjs';
 
 const backgroundSource = fs.readFileSync(
@@ -19,7 +20,9 @@ const sweepModesSource = fs.readFileSync(
 );
 const policySource = fs.readFileSync(new URL('../extension/runtime-policy.js', import.meta.url), 'utf8');
 const diagnosticsSource = fs.readFileSync(new URL('../extension/diagnostics.js', import.meta.url), 'utf8');
-const auxiliaryScansSource = fs.readFileSync(new URL('../extension/auxiliary-scans.js', import.meta.url), 'utf8');
+const auxiliaryScansSource = fs.readFileSync(new URL('../extension/auxiliary-scans.js', import.meta.url), 'utf8') +
+  ';' + fs.readFileSync(new URL('../extension/fast-reads.js', import.meta.url), 'utf8') +
+  ';' + fs.readFileSync(new URL('../extension/restock-watch.js', import.meta.url), 'utf8');
 const tabWorkspaceSource = fs.readFileSync(new URL('../extension/tab-workspace.js', import.meta.url), 'utf8');
 const facetInputSource = fs.readFileSync(new URL('../extension/facet-input.js', import.meta.url), 'utf8');
 const departmentDataSource = fs.readFileSync(new URL('../extension/department-data.js', import.meta.url), 'utf8');
@@ -76,7 +79,7 @@ function jsonResponse(body, status = 200) {
 function loadBackground({
   tabs = [], probes = new Map(), summary = {}, fetchImpl = null, alarms = {},
   localArea = null, sessionArea = null, nativeRestart = null, automation = null,
-  productionDefaults = false, scannerBackend = false
+  productionDefaults = false, scannerBackend = false, diagnosticCrypto = false
 } = {}) {
   const local = localArea || storageArea();
   // Primary-only scenarios explicitly opt out of the additional default lanes.
@@ -124,7 +127,7 @@ function loadBackground({
       async get(id) { return tabs.find((tab) => tab.id === id); },
       async create(options) {
         tabActions.push({ type: 'create', options });
-        const tab = { id: 1000 + tabs.length, windowId: 1, index: tabs.length,
+        const tab = { id: 1000 + tabs.length, windowId: options.windowId ?? 1, index: tabs.length,
           status: 'loading', url: options.url };
         tabs.push(tab);
         return tab;
@@ -160,6 +163,7 @@ function loadBackground({
     windows: { onFocusChanged: event() }
   };
   const context = vm.createContext({
+    ...(diagnosticCrypto ? { crypto: webcrypto, TextEncoder } : {}),
     chrome,
     navigator: { locks: reviewerLocks() },
     URL,
@@ -177,9 +181,9 @@ function loadBackground({
     `${sweepModesSource}\n${policySource}\n${diagnosticsSource}\n${localClientSource}\n${scannerSettingsSource}\n${relaySettingsSource}\n${scannerControlSource}\n` +
     // Legacy collector cases isolate the existing server contract; explicit
     // backend-control cases below and the dedicated suite run the real bridge.
-    (scannerBackend ? '' : 'ReviewerScannerControl.create = () => ({syncSettings: async () => true, syncCommands: async () => true, syncStatus: async () => true});\n') +
+    (scannerBackend ? '' : 'ReviewerScannerControl.create = () => ({syncSettings: async () => true, syncRequests: async () => true, syncCommands: async () => true, syncStatus: async () => true});\n') +
     `${challengeEvidenceSource}\n${verificationObservationSource}\n${verificationProtocolSource}\n${verificationAutomationSource}\n${departmentDataSource}\n${auxiliaryScansSource}\n${tabWorkspaceSource}\n${facetInputSource}\n${backgroundSource.replace(/^importScripts\([^\n]+\);/m, '')}\n;globalThis.__test = {` +
-      'selectPrimary, readCoordinator, handlePageReport, restartPrimary, post, checkedEndpoint,' +
+      'selectPrimary, readCoordinator, handlePageReport, restartPrimary, post, checkedEndpoint, retryRestockReturns,' +
       'isBotCheckUrl, handleBotCheck, pausedUntil, refreshTick, scheduleRefresh,' +
       'initialization, ensureAlarms, reportBrowserStatus, verificationAutomation, auxiliaryScans, tabWorkspace, scannerControl, scannerStatusSnapshot, syncRelaySettings: () => syncRelaySettings()};',
     context
@@ -204,6 +208,23 @@ function workerMessage(bg, message, sender = { id: 'fixture', url: 'chrome-exten
     if (handled !== true) reject(new Error(`Unhandled message: ${message.type}`));
   });
 }
+
+test('content target identity is hashed before persistent diagnostics and survives ordinal changes', async () => {
+  const bg = loadBackground({ diagnosticCrypto: true });
+  await bg.api.initialization;
+  const targetKey = 'keyword:water filter';
+  const expected = createHash('sha256').update(targetKey).digest('hex').slice(0, 32);
+  for (const [round, targetIndex] of [[63, 106], [64, 1]]) {
+    await workerMessage(bg, { type: 'reviewer:diagnostic', event: 'navigation-ready',
+      details: { lane: 'keywords', targetKey, round, targetIndex, generation: 9 } },
+    { tab: { id: 11, url: 'https://www.walmart.com/reviews/claim-product' } });
+  }
+  const events = bg.local.data.reviewerDiagnostics.filter(event => event.event === 'navigation-ready');
+  assert.equal(events.length, 2);
+  assert.ok(events.every(event => event.targetId === expected));
+  assert.deepEqual(Array.from(events, event => event.targetIndex), [106, 1]);
+  assert.equal(JSON.stringify(bg.local.data.reviewerDiagnostics).includes(targetKey), false);
+});
 
 test('catalogue reports relay every in-stock card without additional Walmart requests', async () => {
   let walmartRequests = 0;
@@ -537,6 +558,37 @@ for (const stage of ['selection', 'revocation']) test(`backend home restart pres
 function contentMessage(content, message) {
   return new Promise(resolve => content.chrome.runtime.onMessage.listeners[0](message, {}, resolve));
 }
+
+test('backend watches automatically start dedicated reviewer searches and removed watches revoke the lane', async () => {
+  let queries = ['ice cream maker'];
+  const bg = loadBackground({ scannerBackend: true, fetchImpl(url) {
+    const path = new URL(url).pathname;
+    return jsonResponse(path === '/request-searches' ? { schemaVersion: 1, queries }
+      : path === '/scanner-settings' ? { settings: null }
+        : path === '/scanner-commands' ? { commands: null } : { ok: true });
+  } });
+  await bg.api.initialization;
+  assert.deepEqual(Array.from(bg.local.data.requestSearchQueries), queries);
+  await bg.api.auxiliaryScans.tick();
+  const lane = (await bg.api.auxiliaryScans.status()).lanes.find(row => row.lane === 'requests');
+  assert.ok(lane);
+  bg.api.setNow(lane.nextAt);
+  await bg.api.auxiliaryScans.tick();
+  const tab = await bg.chrome.tabs.get(lane.tabId);
+  // The fake records navigation; simulate Chrome committing that document.
+  Object.assign(tab, { status: 'complete',
+    url: bg.tabActions.findLast(action => action.type === 'update' && action.id === lane.tabId).options.url });
+  const role = await workerMessage(bg, { type: 'reviewer:role' }, { tab });
+  assert.equal(role.active, true);
+  assert.equal(new URL(role.auxiliary.targetUrl).searchParams.get('q'), 'ice cream maker');
+  const report = await bg.api.scannerStatusSnapshot();
+  assert.equal(report.lanes.find(row => row.lane === 'requests').enabled, true);
+  assert.equal(report.settings.requestSearchQueries, undefined, 'Personal watches are not saved scanner preferences');
+  queries = [];
+  await bg.api.scannerControl.syncRequests();
+  await bg.api.auxiliaryScans.tick();
+  assert.equal((await bg.api.auxiliaryScans.status()).lanes.find(row => row.lane === 'requests').status, 'disabled');
+});
 
 test('diagnostics retain a bounded history and export only allowlisted fields', async () => {
   const bg = loadBackground();
@@ -1188,6 +1240,25 @@ test('coordinator deterministically picks the leftmost reachable tab, then stays
 
   probes.set(11, new Error('content script gone'));
   assert.equal((await api.selectPrimary()).state.tabId, 22);
+});
+
+test('an in-page pager change keeps the home tab instead of failing over or reopening it', async () => {
+  const tabs = [
+    { id: 11, windowId: 1, index: 2, status: 'complete', url: 'https://www.walmart.com/reviews/claim-product' },
+    { id: 22, windowId: 1, index: 4, status: 'complete', url: 'https://www.walmart.com/reviews/claim-product' }
+  ];
+  const probes = new Map([
+    [11, { ready: true, active: false, generation: 0 }],
+    [22, { ready: true, active: false, generation: 0 }]
+  ]);
+  const bg = loadBackground({ tabs, probes });
+  assert.equal((await bg.api.selectPrimary()).state.tabId, 11);
+  // Walmart's Next button now changes the page in-document: Chrome keeps the
+  // tab 'complete' while its content script is briefly unreachable.
+  await workerMessage(bg, { type: 'reviewer:diagnostic', event: 'navigation-native', details: { page: 1 } },
+    { tab: tabs[0] });
+  probes.set(11, new Error('navigating'));
+  assert.equal((await bg.api.selectPrimary()).state.tabId, 11);
 });
 
 test('full-catalogue monitoring promotes an unfiltered tab over a sticky manual search', async () => {
@@ -2331,6 +2402,7 @@ function loadContent({ pageAck = { ok: false, retryable: true }, localArea = nul
       'itemSignature: () => itemSignature(), ' +
       'setCollector(value) { collect = value; itemSignature = () => value().map(item => item.item_id).sort().join("|"); }, ' +
       'setLastInteraction(value) { lastInteraction = value; }, ' +
+      'setFocusReason(value) { lastFacetFocusReason = value; }, ' +
       'setRoleRequestInFlight(value) { roleRequestInFlight = value; }, ' +
       'setNow(value) { Date.now = () => value; }, ' +
       'setRandom(value) { Math.random = () => value; }, ' +
@@ -3230,6 +3302,86 @@ test('failed category recovery retains the temporary mode and its completed quer
   assert.equal(bg.local.data.sweepMode, 'none');
 });
 
+test('a temporarily unreachable home scanner keeps its slot and checkpoint across fallback pagination', async () => {
+  const { bg, content, tab, probes, generation } = await fallbackRound();
+  content.document.visibilityState = 'visible';
+  await startConfirmedFallback({ bg, content, generation });
+  bg.api.setNow(1_031_000);
+  await runNavigation(content);
+  assert.equal(new URL(tab.url).searchParams.get('q'), 'Accessories');
+  const checkpoint = { ...bg.local.data['sweep:1'], visited: [1], total: 8 };
+  bg.local.data['sweep:1'] = checkpoint;
+  probes.delete(tab.id);
+  const unavailable = await bg.api.selectPrimary();
+  assert.equal(unavailable.state.tabId, null, 'Unreachable documents cannot keep scan authority');
+  assert.equal(unavailable.state.interruptedTabId, tab.id, 'The existing tab still occupies the home slot');
+  assert.deepEqual(bg.local.data['sweep:1'], checkpoint);
+  tab.url += '&page=2';
+  await bg.chrome.tabs.onUpdated.listeners[0](tab.id, { url: tab.url, status: 'complete' }, tab);
+  assert.equal(await bg.api.ensureReviewerTab(), false, 'A delayed document never causes a fifth tab');
+  assert.equal(bg.tabActions.filter(action => action.type === 'create').length, 0);
+  probes.set(tab.id, { ready: true, reviewerReady: true, active: false });
+  const restored = await bg.api.selectPrimary();
+  assert.equal(restored.state.tabId, tab.id);
+  assert.equal(restored.state.paginationFallback, true);
+  assert.deepEqual([...bg.local.data['sweep:1'].visited], [1]);
+  assert.ok(restored.state.generation > generation, 'Recovered content receives fresh authority');
+});
+
+test('all four reserved scanner tabs stay in the workspace while the home receiver is unavailable', async () => {
+  const tab = { ...REVIEW_TAB, id: 1 };
+  const probes = new Map([[1, { ready: true, active: true }]]);
+  const bg = loadBackground({ tabs: [tab], probes, productionDefaults: true,
+    localArea: storageArea({ auxiliaryPriority: true }) });
+  await bg.api.initialization;
+  await bg.api.auxiliaryScans.tick();
+  await bg.api.selectPrimary();
+  const auxiliary = await bg.api.auxiliaryScans.managedTabIds();
+  assert.equal(auxiliary.length, 3);
+  probes.delete(1);
+  const registrations = [];
+  bg.api.tabWorkspace.sync = async ids => { registrations.push([...ids]); return { ok: true }; };
+  await workerMessage(bg, { type: 'reviewer:role' }, { tab });
+  assert.deepEqual(registrations.at(-1).sort((a, b) => a - b), [1, ...auxiliary].sort((a, b) => a - b));
+  assert.equal(bg.tabActions.filter(action => action.type === 'create').length, 3);
+  assert.equal((await bg.api.readCoordinator()).tabId, null);
+  assert.equal((await bg.api.readCoordinator()).interruptedTabId, 1);
+});
+
+test('scanner creation uses the scanner window instead of the current browsing window', async () => {
+  const tab = { ...REVIEW_TAB, id: 1, windowId: 7 };
+  const probes = new Map([[1, { ready: true, active: true }]]);
+  const bg = loadBackground({ tabs: [tab], probes, productionDefaults: true,
+    localArea: storageArea({ auxiliaryPriority: true }) });
+  await bg.api.initialization;
+  await bg.api.auxiliaryScans.tick();
+  await bg.api.selectPrimary();
+  const creations = () => bg.tabActions.filter(action => action.type === 'create');
+  assert.equal(creations().length, 3);
+  assert.ok(creations().every(action => action.options.windowId === 7), 'All three workers join the home window');
+  const query = bg.chrome.tabs.query;
+  bg.chrome.tabs.query = async () => (await query()).filter(candidate => candidate.id !== 1);
+  assert.equal(await bg.api.ensureReviewerTab(), true);
+  assert.equal(creations().at(-1).options.windowId, 7, 'A replacement home tab joins the auxiliary window');
+});
+
+test('a reserved home slot still releases a manual search and replaces a closed tab', async () => {
+  for (const outcome of ['manual', 'closed']) {
+    const { bg, content, tab, probes, generation } = await fallbackRound();
+    content.document.visibilityState = 'visible';
+    await startConfirmedFallback({ bg, content, generation });
+    bg.api.setNow(1_031_000);
+    await runNavigation(content);
+    probes.delete(1);
+    await bg.api.selectPrimary();
+    if (outcome === 'manual') tab.url = 'https://www.walmart.com/reviews/claim-product?q=MyManualSearch';
+    else bg.chrome.tabs.query = async () => [];
+    assert.equal(await bg.api.ensureReviewerTab(), true, outcome);
+    assert.equal(bg.tabActions.filter(action => action.type === 'create').length, 1, outcome);
+    assert.deepEqual([...bg.local.data['sweep:1'].visited], [], 'Opening a replacement does not claim old content');
+  }
+});
+
 test('Chrome URL and loading events preserve the fallback lease across search navigation', async () => {
   const { bg, content, tab, generation } = await fallbackRound();
   await startConfirmedFallback({ bg, content, generation });
@@ -4012,6 +4164,24 @@ test('site scroll restoration during pagination preserves the fresh-card navigat
   assert.equal(loads, 0);
 });
 
+test('a bare trusted scroll is not user activity, but scrolling right after real input is', () => {
+  const content = loadContent();
+  content.api.role.tabId = 7;
+  content.api.role.generation = 3;
+  const active = () => content.sentMessages.filter(m => m.type === 'reviewer:user-active').length;
+  content.api.setNow(100_000);
+  content.listeners.get('scroll')({ isTrusted: true });
+  assert.equal(active(), 0, 'page-load scroll restoration and anchoring never pause scanners');
+  content.listeners.get('wheel')({ isTrusted: true });
+  assert.equal(active(), 1);
+  content.api.setNow(101_200);
+  content.listeners.get('scroll')({ isTrusted: true });
+  assert.equal(active(), 2, 'the scroll that follows a wheel still counts as the user');
+  content.api.setNow(110_000);
+  content.listeners.get('scroll')({ isTrusted: true });
+  assert.equal(active(), 2);
+});
+
 test('direct user input during native paging still yields before reading changed cards', async () => {
   for (const event of ['wheel', 'touchstart', 'pointerdown', 'keydown', 'click']) {
     const content = loadContent();
@@ -4488,6 +4658,9 @@ test('a persistently empty interior page fails the sweep with an explicit restar
   await content.api.handleEndPage(9);
   const failed = content.sentMessages.find(message => message.type === 'reviewer:unusable');
   assert.equal(failed?.restartSweep, true);
+  assert.equal(failed?.revalidateBoundary, true,
+    'Only a fully confirmed empty interior asks managed scans to reconcile their old page range');
+  assert.equal(failed?.failureCode, 'interior-empty');
   assert.equal(content.local.data.lastSweepDone, undefined);
   assert.deepEqual(content.local.data['sweep:1'].visited, [1]);
   assert.equal(content.local.data['sweep:1'].endRetries[2], 3);
@@ -7266,6 +7439,30 @@ test('navigation waits its turn instead of changing a page behind another scanne
   assert.equal(calls, 2);
 });
 
+test('repeated focus denials log once per reason and the grant carries the denial count', async () => {
+  const content = navigationFocusFixture();
+  const diagnostics = [];
+  const replies = ['busy', 'busy', 'busy', 'waiting-turn', 'waiting-turn'];
+  let navigations = 0;
+  content.chrome.runtime.sendMessage = async message => {
+    if (message.type === 'reviewer:diagnostic') diagnostics.push(message);
+    if (message.type !== 'reviewer:focus') return { ok: true };
+    const reason = replies.shift();
+    if (reason) return { ok: true, enabled: true, granted: false, reason, retryAfterMs: 5000 };
+    content.document.visibilityState = 'visible';
+    return { ok: true, enabled: true, granted: true, until: 103_000 };
+  };
+  await content.api.navigateWithFocus(() => navigations++, 9);
+  for (let attempt = 0; attempt < 5 && !navigations; attempt++) {
+    await content.timerCallbacks.get(content.api.getActionTimer()).callback();
+  }
+  assert.equal(navigations, 1);
+  const focus = diagnostics.filter(m => m.event?.startsWith('focus-'));
+  assert.deepEqual(focus.map(m => [m.event, m.details.reason]),
+    [['focus-denied', 'busy'], ['focus-denied', 'waiting-turn'], ['focus-granted', undefined]]);
+  assert.equal(focus.at(-1).details.count, 5);
+});
+
 test('a proven scope-changing auxiliary pager uses bound URL navigation without accepting its modified scope', () => {
   const content = navigationFocusFixture();
   let clicked = 0;
@@ -8046,6 +8243,221 @@ test('scheduled home refresh preserves a live high-traffic waiting page and stat
   assert.equal((await bg.api.scannerStatusSnapshot()).primary.phase, 'waiting-traffic');
 });
 
+async function stalledHomeFixture() {
+  let now = 1_000_000;
+  const tab = { ...REVIEW_TAB };
+  const probe = { ready: true, active: true, generation: 8, documentId: 12345, phase: 'waiting-user',
+    focusReason: 'expired', sweeping: true, busy: false };
+  const bg = loadBackground({ tabs: [tab], probes: new Map([[11, () => ({ ...probe,
+    lastActivityAt: now, nextActionAt: now + 5_000 })]]) });
+  await bg.api.initialization;
+  bg.api.setNow(now);
+  bg.session.data.reviewerCoordinator = { tabId: 11, generation: 8, selectedAt: now };
+  bg.local.data['sweep:11'] = { generation: 8, total: 12, visited: [1, 2, 3],
+    startedAt: now, lastProgressAt: now };
+  bg.local.data.refreshMinutes = 5;
+  const recoveries = [];
+  const send = bg.chrome.tabs.sendMessage;
+  bg.chrome.tabs.sendMessage = async (id, message) => {
+    if (message.type === 'reviewer:recover') recoveries.push({ id, ...message });
+    return send(id, message);
+  };
+  return { bg, probe, tab, recoveries, now: () => now,
+    advance(ms) { now += ms; bg.api.setNow(now); } };
+}
+
+function contentRecoveryReceipt(content, generation = content.api.role.generation) {
+  let probe;
+  content.chrome.runtime.onMessage.listeners[0]({ type: 'reviewer:probe' }, {}, value => { probe = value; });
+  const sweep = content.local.data[`sweep:${content.api.role.tabId}`];
+  return { expectedDocumentId: probe.documentId,
+    expectedProgressAt: sweep?.generation === generation ? Number(sweep.lastProgressAt) || 0 : 0,
+    expectedSweepStartedAt: sweep?.generation === generation ? Number(sweep.startedAt) || 0 : 0 };
+}
+
+function contentRecoveryReply(content, message) {
+  return new Promise(resolve => content.chrome.runtime.onMessage.listeners[0](message, {}, resolve));
+}
+
+for (const outcome of ['rejected', 'unavailable']) {
+  test(`a ${outcome} primary recovery retries on a bounded heartbeat rather than claiming a five-minute success`, async () => {
+    const f = await stalledHomeFixture();
+    f.advance(300_001);
+    const send = f.bg.chrome.tabs.sendMessage.bind(f.bg.chrome.tabs);
+    f.bg.chrome.tabs.sendMessage = async (id, message) => {
+      const result = await send(id, message);
+      if (message.type === 'reviewer:recover') {
+        if (outcome === 'unavailable') throw new Error('No receiving document');
+        return { ok: false };
+      }
+      return result;
+    };
+    await f.bg.api.refreshTick();
+    assert.equal(f.recoveries.length, 1);
+    assert.equal(f.bg.session.data.reviewerPrimaryProgress.recoveredAt, 0,
+      'Only an accepted content recovery may start the success cooldown');
+    f.advance(1_000); await f.bg.api.refreshTick();
+    assert.equal(f.recoveries.length, 1, 'A failed receiver still has a bounded attempt floor');
+    f.advance(29_000); await f.bg.api.refreshTick();
+    assert.equal(f.recoveries.length, 2);
+  });
+}
+
+test('new primary page progress during recovery persistence cannot cancel its queued navigation', async () => {
+  const f = await stalledHomeFixture();
+  const content = loadContent({ localArea: f.bg.local, initialUrl: f.tab.url });
+  content.api.setNow(f.now());
+  content.api.setLastInteraction(100_000);
+  Object.assign(content.api.role, { active: true, tabId: 11, primaryTabId: 11, generation: 8 });
+  f.probe.documentId = contentRecoveryReceipt(content).expectedDocumentId;
+  content.api.queueWhenIdle(() => {}, 15_000);
+  const planned = content.api.getActionTimer();
+  f.advance(300_001); content.api.setNow(f.now());
+  const set = f.bg.chrome.storage.session.set.bind(f.bg.chrome.storage.session);
+  let injected = false;
+  f.bg.chrome.storage.session.set = async values => {
+    const record = values.reviewerPrimaryProgress;
+    if (!injected && (record?.attemptedAt > 0 || record?.recoveredAt > 0)) {
+      injected = true;
+      f.bg.local.data['sweep:11'].lastProgressAt = f.now();
+      f.bg.local.data['sweep:11'].visited.push(4);
+    }
+    return set(values);
+  };
+  const send = f.bg.chrome.tabs.sendMessage.bind(f.bg.chrome.tabs);
+  f.bg.chrome.tabs.sendMessage = (id, message) => message.type === 'reviewer:recover'
+    ? contentRecoveryReply(content, message) : send(id, message);
+  await f.bg.api.refreshTick();
+  assert.equal(injected, true);
+  assert.ok(content.timerCallbacks.has(planned), 'A delayed recovery must leave new page work intact');
+  assert.deepEqual(f.bg.local.data['sweep:11'].visited, [1, 2, 3, 4]);
+  assert.equal(f.bg.session.data.reviewerPrimaryProgress.recoveredAt, 0);
+});
+
+test('a guarded primary recovery cannot apply to a replacement document in the same generation', async () => {
+  const f = loadContent();
+  f.api.setNow(1_000_000);
+  f.api.setLastInteraction(100_000);
+  Object.assign(f.api.role, { active: true, tabId: 1, primaryTabId: 1, generation: 9 });
+  f.api.setPhase('waiting-user');
+  const guards = contentRecoveryReceipt(f);
+  f.timerCallbacks.clear();
+  const reply = await contentRecoveryReply(f, { type: 'reviewer:recover', generation: 9,
+    reason: 'progress-timeout', ...guards, expectedDocumentId: guards.expectedDocumentId + 1 });
+  assert.equal(reply.ok, false);
+  assert.equal(f.timerCallbacks.size, 0);
+});
+
+test('home useful-progress deadline survives fresh heartbeats, short future waits and auxiliary intake', async () => {
+  const f = await stalledHomeFixture();
+  const original = structuredClone(f.bg.local.data['sweep:11']);
+  for (let tick = 0; tick < 9; tick += 1) {
+    f.advance(30_000);
+    f.bg.local.data.lastRelay = f.now();
+    await f.bg.api.refreshTick();
+    assert.equal(f.recoveries.length, 0, 'Ordinary page pacing keeps its rendering opportunity');
+  }
+  f.advance(30_001);
+  await f.bg.api.refreshTick();
+  assert.equal(f.recoveries.length, 1, 'An expired user wait cannot hide stalled primary coverage');
+  assert.equal(f.recoveries[0].reason, 'progress-timeout');
+  assert.equal(f.recoveries[0].generation, 8);
+  assert.deepEqual(f.bg.local.data['sweep:11'], original);
+  assert.equal(f.bg.tabActions.length, 0, 'Recovery resumes the current page without a reload or fresh round');
+  f.advance(30_000); await f.bg.api.refreshTick();
+  assert.equal(f.recoveries.length, 1, 'Repeated probes cannot issue recovery on every heartbeat');
+});
+
+for (const guard of ['busy', 'traffic', 'ingest-retry']) {
+  test(`home useful-progress opportunity is suspended during ${guard}`, async () => {
+    const f = await stalledHomeFixture();
+    f.advance(250_000);
+    if (guard === 'busy') f.probe.busy = true;
+    else if (guard === 'traffic') f.probe.highTraffic = true;
+    else if (guard === 'ingest-retry') f.probe.phase = 'ingest-retry';
+    await f.bg.api.refreshTick();
+    f.advance(900_000); await f.bg.api.refreshTick();
+    assert.equal(f.recoveries.length, 0);
+    Object.assign(f.probe, { busy: false, highTraffic: false, phase: 'waiting-user', focusReason: 'expired' });
+    f.advance(1); await f.bg.api.refreshTick();
+    assert.equal(f.recoveries.length, 0, 'A real guard must leave a fresh opportunity after release');
+    f.advance(300_001); await f.bg.api.refreshTick();
+    assert.equal(f.recoveries.length, 1);
+  });
+}
+
+for (const reason of ['manual-tab-active', 'user-active']) {
+  test(`an old home ${reason} denial cannot replace current input evidence`, async () => {
+    const f = await stalledHomeFixture();
+    f.probe.focusReason = reason;
+    f.advance(300_001); await f.bg.api.refreshTick();
+    assert.equal(f.recoveries.length, 1, 'A stale label cannot keep the watchdog suspended forever');
+    const content = loadContent();
+    content.api.setNow(1_000_000);
+    content.api.setLastInteraction(100_000);
+    content.api.setFocusReason(reason);
+    Object.assign(content.api.role, { active: true, tabId: 1, primaryTabId: 1, generation: 9 });
+    content.api.setPhase('waiting-user');
+    content.timerCallbacks.clear();
+    let reply;
+    content.chrome.runtime.onMessage.listeners[0]({ type: 'reviewer:recover', generation: 9,
+      reason: 'progress-timeout' }, {}, value => { reply = value; });
+    assert.equal(reply.ok, true);
+    assert.ok(content.timerCallbacks.size > 0, 'The next relay must recheck live workspace guards');
+  });
+}
+
+test('a newly acknowledged primary page renews its useful-progress deadline', async () => {
+  const f = await stalledHomeFixture();
+  f.advance(290_000); await f.bg.api.refreshTick();
+  f.bg.local.data['sweep:11'].lastProgressAt = f.now();
+  f.bg.local.data['sweep:11'].visited.push(4);
+  f.advance(290_000); await f.bg.api.refreshTick();
+  assert.equal(f.recoveries.length, 0);
+  f.advance(10_001); await f.bg.api.refreshTick();
+  assert.equal(f.recoveries.length, 1);
+});
+
+test('an explicit primary progress recovery resumes an expired input wait without discarding receipts', () => {
+  const f = loadContent();
+  f.api.setNow(1_000_000);
+  f.api.setLastInteraction(100_000);
+  Object.assign(f.api.role, { active: true, tabId: 1, primaryTabId: 1, generation: 9 });
+  f.api.setPhase('waiting-user');
+  const sweep = { generation: 9, total: 12, visited: [1], lastProgressAt: 100_000 };
+  f.local.data['sweep:1'] = sweep;
+  f.timerCallbacks.clear();
+  let reply;
+  f.chrome.runtime.onMessage.listeners[0]({ type: 'reviewer:recover', generation: 9,
+    reason: 'progress-timeout' }, {}, value => { reply = value; });
+  assert.equal(reply.ok, true);
+  assert.ok(f.timerCallbacks.size > 0, 'The current page must get a new relay opportunity');
+  assert.deepEqual(f.local.data['sweep:1'], sweep);
+});
+
+for (const guard of ['input', 'generation', 'scope', 'verification', 'traffic', 'ingest-retry']) {
+  test(`primary progress recovery retains the content ${guard} guard`, () => {
+    const f = loadContent();
+    f.api.setNow(1_000_000);
+    f.api.setLastInteraction(100_000);
+    Object.assign(f.api.role, { active: true, tabId: 1, primaryTabId: 1, generation: 9 });
+    f.api.setPhase(guard === 'ingest-retry' ? 'ingest-retry' : 'waiting-user');
+    if (guard === 'input') f.api.setLastInteraction(999_000);
+    if (guard === 'scope') {
+      f.location.href = 'https://www.walmart.com/reviews/claim-product?q=manual';
+      f.location.search = '?q=manual';
+    }
+    if (guard === 'verification') f.body.innerText = 'Robot or human? Press & Hold';
+    if (guard === 'traffic') f.body.innerText = HIGH_TRAFFIC_TEXT;
+    f.timerCallbacks.clear();
+    let reply;
+    f.chrome.runtime.onMessage.listeners[0]({ type: 'reviewer:recover', generation: guard === 'generation' ? 8 : 9,
+      reason: 'progress-timeout' }, {}, value => { reply = value; });
+    assert.equal(reply.ok, false);
+    assert.equal(f.timerCallbacks.size, 0, 'A denied recovery cannot schedule extraction or navigation');
+  });
+}
+
 test('recovery_20261030: a hidden blank department gets a bounded rendering turn before its budget expires', async () => {
   const content = recoveryBlankDepartment();
   recoveryFocus(content);
@@ -8067,6 +8479,21 @@ test('recovery_20261030: trusted input suspends blank readiness accounting', asy
   await content.api.ensureAuxiliaryTarget(9);
   assert.equal(content.api.getPhase(), 'waiting-user');
   assert.equal(content.sentMessages.some(m => m.type === 'reviewer:unusable'), false);
+});
+
+test('render timeout distinguishes present but unreadable product cards from a blank result document', async () => {
+  const content = recoveryBlankDepartment();
+  content.document.visibilityState = 'visible';
+  content.body.innerText = 'Recognized Reviewer\nFree\n(Valued at $35)\nUnrecognized card';
+  content.document.querySelectorAll = selector => selector === 'a[href*="/ip/"]'
+    ? [{ getAttribute: name => name === 'href' ? '/ip/Unrecognized/20321560444' : null }] : [];
+  recoveryFocus(content, { enabled: false, granted: false, reason: 'disabled' });
+  await content.api.ensureAuxiliaryTarget(9);
+  content.api.setNow(131_000);
+  await content.api.ensureAuxiliaryTarget(9);
+  assert.equal(content.sentMessages.find(message => message.type === 'reviewer:unusable')?.failureCode,
+    'card-unreadable');
+  assert.equal(content.sentMessages.some(message => message.type === 'reviewer:sweep-complete'), false);
 });
 
 test('recovery_20261030: bounded denied readiness becomes an opportunity failure without completing a target', async () => {
@@ -8267,4 +8694,105 @@ test('an OOS-only auxiliary document reaches intake and page reading instead of 
   assert.equal(pages[0].items[0].available, false, 'Shared sender still filters unavailable offers');
   assert.ok(content.local.data['sweep:1'].visited.includes(1));
   assert.equal(content.sentMessages.some(message => message.type === 'reviewer:unusable'), false);
+});
+
+// Departments that hold nothing: the page's own fresh server data settles it
+// quickly, and the coordinator's direct read then decides empty versus retry.
+function serverEmptyDepartment({ items = [], page = 1, catId = '4044', settled = true, selection = false } = {}) {
+  const home = 'https://www.walmart.com/reviews/claim-product';
+  const targetUrl = `${home}?catId=4044`;
+  const content = loadContent({ initialUrl: targetUrl, departmentData: true });
+  content.api.setNow(Date.now() + (settled ? 10_000 : 0));
+  content.body.innerText = 'Reviewer gallery loading';
+  content.document.readyState = 'complete';
+  content.api.setCollector(() => []);
+  content.document.querySelectorAll = () => [];
+  content.document.querySelector = selector => selector === '#__NEXT_DATA__' ? { textContent: JSON.stringify({
+    props: { pageProps: { initialSearchQueryVariables: { query: '', catId, facet: '', page },
+      initialData: { searchResult: { itemStacks: [{ items }] } } } } }) } : null;
+  Object.assign(content.api.role, { active: true, tabId: 1, generation: 9, auxiliary: selection
+    ? { lane: 'departments', targetKey: 'Home', targetUrl: home,
+      selection: { kind: 'department', label: 'Home', parentUrl: home, url: targetUrl } }
+    : { lane: 'departments', targetKey: 'Home', targetUrl } });
+  recoveryFocus(content);
+  return content;
+}
+
+test('a blank department whose fresh server data holds no products reports at once', async () => {
+  const content = serverEmptyDepartment();
+  await content.api.ensureAuxiliaryTarget(9);
+  assert.equal(content.sentMessages.find(m => m.type === 'reviewer:unusable')?.failureCode, 'render-timeout');
+  assert.equal(content.sentMessages.some(m => m.type === 'reviewer:sweep-complete'), false,
+    'the coordinator, not the page, decides the target is empty');
+});
+
+test('an unbindable department with no products in its server data reports without the 30 s wait', async () => {
+  const content = serverEmptyDepartment({ selection: true });
+  await content.api.ensureAuxiliaryTarget(9);
+  assert.ok(content.sentMessages.some(m => m.type === 'reviewer:unusable' && /could not be authorized/.test(m.reason)));
+});
+
+test('products, stale server data or a just-loaded document keep the full render budget', async () => {
+  for (const options of [{ items: [{ __typename: 'Product', usItemId: '20321560444' }] }, { page: 2 },
+    { catId: '4171' }, { settled: false }, { selection: true, settled: false }]) {
+    const content = serverEmptyDepartment(options);
+    await content.api.ensureAuxiliaryTarget(9);
+    assert.equal(content.sentMessages.some(m => m.type === 'reviewer:unusable'), false, JSON.stringify(options));
+  }
+});
+
+// Nov 19, 11:05 CST: a backend restart answered the upload confirming 28
+// returns with HTTP 503 and the confirmation was consumed; only a later read of
+// the same page within 5 minutes could still carry it. A refused upload now
+// leaves the restock queued until a 2xx carries it.
+test('a restock confirmation refused by a restarting backend is re-sent until a 2xx acknowledges it', async () => {
+  const local = storageArea({ restockWatch: { 'ip-20812616510': 1 } });
+  let refuse = true;
+  const bodies = [];
+  const bg = loadBackground({ localArea: local, fetchImpl(url, init) {
+    if (!String(url).endsWith('/ingest')) return jsonResponse({});
+    const items = JSON.parse(init.body).items;
+    bodies.push(items);
+    return refuse ? jsonResponse({ error: 'durable intake unavailable; retry' }, 503) : jsonResponse({ seen: items.length });
+  } });
+  await bg.api.initialization;
+  const offer = { item_id: 'ip-20812616510', title: 'Ostomy belt', value_usd: 90, available: true };
+  let now = 5_000_000;
+  bg.api.setNow(now);
+  const held = await bg.api.post([offer], 3, undefined, { lane: 'value80' });
+  assert.equal(held.held, 1, 'first in-stock read held');
+  assert.equal(bodies.length, 0);
+  bg.api.setNow(now += 10_000);
+  const refused = await bg.api.post([offer], 3, undefined, { lane: 'value80' });
+  assert.equal(refused.ok, false);
+  assert.equal(refused.retryable, true);
+  assert.equal(bodies.at(-1)[0].restocked, true, 'the confirming upload carried the flag');
+  assert.equal(local.data.restockReturns['ip-20812616510'].acked, false, 'not consumed by the refused upload');
+  // The page is gone or not read again; the backend comes back 20 s later.
+  bg.api.setNow(now += 20_000);
+  await bg.api.retryRestockReturns();
+  assert.equal(bodies.length, 2, 'retried on its own while still refused');
+  refuse = false;
+  bg.api.setNow(now += 20_000);
+  await bg.api.retryRestockReturns();
+  assert.equal(bodies.length, 3);
+  assert.deepEqual(JSON.parse(JSON.stringify(bodies.at(-1))),
+    [{ item_id: 'ip-20812616510', title: 'Ostomy belt', value_usd: 90, available: true, restocked: true }]);
+  assert.equal(local.data.restockReturns['ip-20812616510'].acked, true, 'acknowledged by the 2xx');
+  bg.api.setNow(now += 20_000);
+  await bg.api.retryRestockReturns();
+  assert.equal(bodies.length, 3, 'never re-sent after the acknowledgement');
+  const next = await bg.api.post([offer], 3, undefined, { lane: 'value80' });
+  assert.equal(next.ok, true);
+  assert.equal(bodies.at(-1)[0].restocked, undefined, 'later reads no longer flag it');
+});
+
+test('a page whose offers the backend holds for a confirming sighting is re-read like a held restock', async () => {
+  const bg = loadBackground({ fetchImpl: (_url, init) =>
+    jsonResponse({ seen: JSON.parse(init.body).items.length, confirming: 1 }) });
+  const reply = await bg.api.post([{ item_id: 'ip-10000001', value_usd: 120, available: true }], 2, undefined,
+    { lane: 'value80' });
+  assert.equal(reply.ok, true);
+  assert.equal(reply.held, 1);
+  assert.equal(reply.summary.confirming, 1);
 });

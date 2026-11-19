@@ -438,27 +438,30 @@ class SeenStore:
 
     def observed_value_stats(self) -> dict[str, int | float | None]:
         """Return aggregate value diagnostics without exposing item details."""
+        # Copy the references only: scanning ~90k records takes ~50 ms, and
+        # holding the lock that long stalled any /ingest arriving meanwhile.
         with self._lock:
-            values: list[float] = []
-            unknown = 0
-            for record in self._seen.values():
-                value = record.get("value_usd") if isinstance(record, dict) else None
-                if isinstance(value, bool) or not isinstance(value, (int, float)):
-                    unknown += 1
-                    continue
-                try:
-                    numeric = float(value)
-                except (TypeError, ValueError, OverflowError):
-                    unknown += 1
-                    continue
-                if not math.isfinite(numeric):
-                    unknown += 1
-                    continue
-                values.append(numeric)
+            records = list(self._seen.values())
+        values: list[float] = []
+        unknown = 0
+        for record in records:
+            value = record.get("value_usd") if isinstance(record, dict) else None
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                unknown += 1
+                continue
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError, OverflowError):
+                unknown += 1
+                continue
+            if not math.isfinite(numeric):
+                unknown += 1
+                continue
+            values.append(numeric)
 
-            return {
-                "value_known": len(values),
-                "value_unknown": unknown,
-                "min_value_usd": min(values) if values else None,
-                "max_value_usd": max(values) if values else None,
-            }
+        return {
+            "value_known": len(values),
+            "value_unknown": unknown,
+            "min_value_usd": min(values) if values else None,
+            "max_value_usd": max(values) if values else None,
+        }

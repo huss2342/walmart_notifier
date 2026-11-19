@@ -15,7 +15,7 @@ RUN python -m pip install --no-cache-dir --no-compile -r /tmp/requirements.txt \
 
 COPY --chown=notifier:notifier src/ /app/src/
 COPY --chown=notifier:notifier discord_bridge/ /app/discord_bridge/
-RUN mkdir /app/data && chown notifier:notifier /app/data
+RUN mkdir /app/data /app/db && chown notifier:notifier /app/data /app/db
 
 USER notifier:notifier
 

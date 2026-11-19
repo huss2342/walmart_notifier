@@ -28,6 +28,7 @@ ROUTES = frozenset(
         "/scanner-settings",
         "/scanner-commands",
         "/scanner-status",
+        "/request-searches",
         "/relay-status",
         "/test-notification",
         "/bot-check",
@@ -44,6 +45,8 @@ _EVENTS = frozenset(
         "service_error",
         "configuration_changed",
         "intake_result",
+        "intake_invalid_item",
+        "intake_back_again",
         "pipeline_item",
     }
 )
@@ -61,6 +64,9 @@ _NUMBERS = frozenset(
         "failed",
         "pending",
         "notified",
+        "invalid",
+        "confirming",
+        "seconds",
     }
 )
 _LABELS = {
@@ -78,12 +84,28 @@ _LABELS = {
     "outcome": frozenset({"responded", "rejected", "error", "saved", "removed"}),
     "provider": frozenset({"discord", "telegram", "ntfy", "pushover", "none", "other"}),
     "decision": frozenset({"pending", "duplicate", "seeded", "filtered", "sent", "failed"}),
+    # intake_invalid_item: which field of one observation could not be published.
+    "field": frozenset(
+        {"item", "item_id", "title", "value", "currency", "available", "product_url", "unknown"}
+    ),
+    "reason": frozenset(
+        {
+            "not_object", "missing_or_too_long", "not_walmart_id", "empty", "control_character",
+            "conflicting_fields", "not_numeric", "out_of_range", "fractional_cents", "not_usd",
+            "not_boolean", "foreign_host", "not_item_path", "different_item", "other",
+        }
+    ),
+    # intake_back_again: an $80+ offer back after an hour unseen (src/back_again.py):
+    # held for a second sighting, confirmed (announced as a restock), expired
+    # unconfirmed; or a coverage outage that does not count as absence.
+    "stage": frozenset({"held", "confirmed", "expired", "outage"}),
 }
 
 
 class OperationalLog:
     def __init__(
-        self, directory, *, clock=None, max_bytes=2 * 1024 * 1024, total_bytes=16 * 1024 * 1024
+        self, directory, *, clock=None, max_bytes=2 * 1024 * 1024, total_bytes=16 * 1024 * 1024,
+        background=False,
     ):
         self.clock = clock or time.time
         self.run_id = uuid.uuid4().hex
@@ -94,13 +116,29 @@ class OperationalLog:
         self._configured = directory is not None
         if directory is not None:
             try:
+                # Background: receipts are built here but written by one thread,
+                # so no request waits on the disk (see RollingLog).
                 self._writer = RollingLog(
                     Path(directory) / "operations.jsonl",
                     max_bytes=max_bytes,
                     total_bytes=total_bytes,
+                    background=background,
+                    on_write=self._background_written,
                 )
             except OSError:
                 self._last_error = "storage"
+
+    def _background_written(self, error, lines):
+        with self._lock:
+            if error is None:
+                self._written += lines
+                self._last_error = None
+            else:
+                self._dropped += lines
+                self._last_error = "storage"
+
+    def flush(self, timeout=5.0):
+        return self._writer.flush(timeout) if self._writer is not None else True
 
     def emit(self, event, *, entry_point="service", **fields):
         if self._writer is None:
@@ -152,16 +190,18 @@ class OperationalLog:
                 or event == "service_error"
                 or row.get("outcome") == "error"
                 else "warning"
-                if row.get("status", 0) >= 400
+                # A dropped observation is a data problem worth seeing, not routine.
+                if row.get("status", 0) >= 400 or event == "intake_invalid_item"
                 else "info"
             )
             self._writer.append(
                 (json.dumps(row, separators=(",", ":"), allow_nan=False) + "\n").encode()
             )
             with self._lock:
-                self._written += 1
                 self._last_event_at = now
-                self._last_error = None
+                if not self._writer.background:  # The writer thread counts its own writes.
+                    self._written += 1
+                    self._last_error = None
             return True
         except Exception as exc:
             with self._lock:

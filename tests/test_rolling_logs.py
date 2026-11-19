@@ -5,6 +5,8 @@ import logging
 import os
 import subprocess
 import sys
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -276,3 +278,49 @@ def test_server_archives_backend_logs_without_duplicating_delivery_events(tmp_pa
     assert "backend healthy" in output
     assert "delivery event" not in output
     assert logging.getLogger().handlers == before
+
+
+def test_background_writer_never_blocks_callers_and_keeps_order(tmp_path):
+    reports = []
+    writer = RollingLog(tmp_path / "events.log", background=True,
+                        on_write=lambda error, lines: reports.append((error, lines)))
+    gate = threading.Event()
+    write = writer._write
+    writer._write = lambda data: (gate.wait(5), write(data))
+    started = time.monotonic()
+    lines = [f"{index:04d}\n".encode() for index in range(300)]
+    for line in lines:
+        writer.append(line)  # Queued while the disk is stuck.
+    assert time.monotonic() - started < 0.5
+    gate.set()
+    assert writer.flush()
+    assert writer.path.read_bytes() == b"".join(lines)
+    assert all(error is None for error, _ in reports)
+    assert sum(count for _, count in reports) == 300
+    assert len(reports) < 300  # Lines waiting together went out together.
+
+
+def test_background_writer_retries_once_then_reports_and_keeps_running(tmp_path):
+    reports = []
+    writer = RollingLog(tmp_path / "events.log", background=True,
+                        on_write=lambda error, lines: reports.append((type(error), lines)))
+    write, failures = writer._write, [2]
+
+    def flaky(data):
+        if failures[0]:
+            failures[0] -= 1
+            raise OSError("disk busy")
+        write(data)
+
+    writer._write = flaky
+    writer.append(b"lost\n")
+    assert writer.flush()
+    writer.append(b"kept\n")
+    assert writer.flush()
+    assert reports == [(OSError, 1), (type(None), 1)]
+    assert writer.path.read_bytes() == b"kept\n"
+    failures[0] = 1  # A single hiccup is absorbed by the retry.
+    writer.append(b"retried\n")
+    assert writer.flush()
+    assert reports[-1] == (type(None), 1)
+    assert writer.path.read_bytes() == b"kept\nretried\n"

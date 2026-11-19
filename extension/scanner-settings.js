@@ -49,7 +49,7 @@ var ReviewerScannerSettings = (() => {
       auxiliaryKeywordQueries: queries, pathPattern: value.pathPattern };
     if (Object.hasOwn(value, 'auxiliaryPriorityQueries')) {
       const incoming = value.auxiliaryPriorityQueries;
-      if (incoming !== null && (!Array.isArray(incoming) || incoming.length > 24 || incoming.some(query =>
+      if (incoming !== null && (!Array.isArray(incoming) || incoming.length > 32 || incoming.some(query =>
         typeof query !== 'string' || !query.trim() || [...query.trim()].length > 80 ||
           /[\p{Cc}\p{Cs}]/u.test(query)))) throw new Error('Invalid scanner settings.');
       const seen = new Set();

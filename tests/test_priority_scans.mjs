@@ -68,7 +68,7 @@ function fixture({ settings: initial = {}, local = storage(), session = storage(
 
 test('shared lane registry is frozen and does not enable priority for legacy preferences', async () => {
   const f = fixture({ settings: { auxiliaryPriority: undefined } });
-  assert.deepEqual(Array.from(f.registry.lanes || []), ['departments', 'keywords', 'priority']);
+  assert.deepEqual(Array.from(f.registry.lanes || []), ['departments', 'keywords', 'priority', 'requests']);
   assert.equal(Object.isFrozen(f.registry.lanes), true);
   assert.equal(f.registry.enabled('priority', {}), false);
   assert.equal(f.registry.enabled('priority', { auxiliaryPriority: true }), true);
@@ -145,6 +145,98 @@ test('priority configuration and its query edits preserve existing queues and fi
   assert.deepEqual(f.saved('keywords'), before.keywords);
   assert.ok(f.saved().generation > oldPriority.generation);
   assert.deepEqual(f.saved().targets.map(target => target.key), ['priority:mattress', 'priority:desk']);
+});
+
+test('appending kitchen searches to default priority preserves active furniture receipts and deep progress', async () => {
+  const f = fixture({ settings: { auxiliaryPriorityQueries: null } });
+  const started = await f.startPriority();
+  const lane = f.local.data.reviewerAuxiliaryScans.lanes.priority;
+  const furniture = lane.targets.map(target => target.label);
+  lane.cursor = 2;
+  lane.pages = 8;
+  for (const target of lane.targets.slice(0, 2)) Object.assign(target,
+    { coverageStatus: 'complete', attemptedAt: f.now(), completedAt: f.now(), pages: 4 });
+  const checkpoint = { generation: lane.generation, targetKey: lane.targets[2].key,
+    mode: 'none', visited: [1, 2, 4], total: 8 };
+  Object.assign(lane.targets[2], { coverageStatus: 'unresolved', checkpoint });
+  lane.checkpoint = structuredClone(checkpoint);
+  lane.checkpointUrl = `${lane.targets[2].targetUrl}&page=3`;
+  f.tabs.get(started.tabId).url = lane.checkpointUrl;
+  await f.local.set({ [`sweep:${started.tabId}`]: checkpoint });
+  const before = f.saved();
+  const updates = f.updates.length;
+  f.configure({ auxiliaryPriorityQueries: [...furniture, 'Water Filter', 'Espresso Machine', 'Golf'] });
+  await f.api.tick();
+  const after = f.saved();
+  assert.equal(after.targets.length, 13);
+  assert.deepEqual(after.targets.slice(0, 10), before.targets);
+  for (const key of ['cursor', 'generation', 'round', 'pages', 'status', 'startedAt', 'lastActivityAt', 'checkpoint', 'checkpointUrl']) {
+    assert.deepEqual(after[key], before[key], key);
+  }
+  assert.deepEqual(after.targets.slice(10).map(target => target.label), ['Water Filter', 'Espresso Machine', 'Golf']);
+  assert.deepEqual(f.local.data[`sweep:${started.tabId}`], checkpoint);
+  assert.equal(f.updates.length, updates);
+});
+
+for (const status of ['complete', 'partial']) {
+  test(`appending kitchen searches continues a ${status} priority round without losing its receipts`, async () => {
+    const f = fixture();
+    const started = await f.startPriority();
+    await f.message(started.tabId, 'reviewer:sweep-complete', { generation: started.generation,
+      pages: 4, coverageLimited: status === 'partial' });
+    const before = f.saved();
+    f.configure({ auxiliaryPriorityQueries: ['Furniture', 'Water Filter'] });
+    await f.api.tick();
+    const after = f.saved();
+    assert.equal(after.generation, before.generation);
+    assert.equal(after.cursor, before.cursor);
+    assert.equal(after.pages, before.pages);
+    assert.deepEqual(after.targets[0], before.targets[0]);
+    assert.equal(after.status, 'waiting');
+    assert.equal(after.completedAt, 0);
+    assert.equal(after.nextAt, f.now() + 15_000);
+    f.advance(15_000); await f.api.tick();
+    assert.equal(new URL(f.tabs.get(started.tabId).url).searchParams.get('q'), 'Water Filter');
+  });
+}
+
+test('appended priority searches preserve existing unresolved duplicates', async () => {
+  const f = fixture();
+  await f.startPriority();
+  const lane = f.local.data.reviewerAuxiliaryScans.lanes.priority;
+  lane.targets.push({ key: 'priority:water filter', kind: 'keyword', label: 'Water Filter',
+    targetUrl: `${home}?q=Water+Filter&queryNups=Water+Filter`, selection: null, attempts: 1,
+    coverageStatus: 'unresolved', checkpoint: { visited: [1], targetKey: 'priority:water filter' } });
+  const before = structuredClone(lane.targets[1]);
+  f.configure({ auxiliaryPriorityQueries: ['Furniture', 'Water Filter', 'water filter', 'Golf'] });
+  await f.api.tick();
+  assert.deepEqual(f.saved().targets.map(target => target.key), ['priority:furniture', 'priority:water filter', 'priority:golf']);
+  assert.deepEqual(f.saved().targets[1], before);
+});
+
+test('nonappend priority edits and invalid old fingerprints reset scope rather than inheriting receipts', async () => {
+  for (const value of ['[" Furniture"]', '["Furniture","furniture"]', '{"query":"Furniture"}', 'invalid']) {
+    const f = fixture();
+    await f.startPriority();
+    const lane = f.local.data.reviewerAuxiliaryScans.lanes.priority;
+    lane.fingerprint = value;
+    const before = f.saved();
+    f.configure({ auxiliaryPriorityQueries: ['Furniture', 'Water Filter'] });
+    await f.api.tick();
+    assert.ok(f.saved().generation > before.generation);
+    assert.equal(f.saved().cursor, 0);
+    assert.deepEqual(f.saved().targets.map(target => target.label), ['Furniture', 'Water Filter']);
+  }
+  for (const queries of [['Desk', 'Furniture', 'Water Filter'], ['Furniture'], ['Furniture', 'Golf']]) {
+    const f = fixture({ settings: { auxiliaryPriorityQueries: ['Furniture', 'Desk'] } });
+    await f.startPriority();
+    const before = f.saved();
+    f.configure({ auxiliaryPriorityQueries: queries });
+    await f.api.tick();
+    assert.ok(f.saved().generation > before.generation);
+    assert.equal(f.saved().cursor, 0);
+    assert.deepEqual(f.saved().targets.map(target => target.label), queries);
+  }
 });
 
 test('priority round interval is independent, persistent and never resets work or changes old lane pacing', async () => {

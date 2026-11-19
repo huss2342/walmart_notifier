@@ -63,7 +63,7 @@ test('priority boundary rejects invalid values without changing legacy fields', 
     { auxiliaryPriorityRefreshMinutes: true }, { auxiliaryPriorityQueries: 'Sofa' },
     { auxiliaryPriorityQueries: [''] }, { auxiliaryPriorityQueries: ['Sofa', ' sofa '] },
     { auxiliaryPriorityQueries: ['bad\nquery'] },
-    { auxiliaryPriorityQueries: Array.from({ length: 25 }, (_, i) => `Term ${i}`) },
+    { auxiliaryPriorityQueries: Array.from({ length: 33 }, (_, i) => `Term ${i}`) },
     { auxiliaryPriorityQueries: ['x'.repeat(81)] }
   ];
   for (const fields of bad) assert.throws(() => settings.project(fields), JSON.stringify(fields));

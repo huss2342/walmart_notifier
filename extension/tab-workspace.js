@@ -10,6 +10,7 @@ const ReviewerTabWorkspace = (() => {
   const RETRY_MS = 5000;
   const ACTIVITY_MS = 30_000;
   const QUEUE_TTL_MS = 15_000;
+  const AWAY_SECONDS = 300;
   let instances = 0;
 
   function create(chrome, { config, paused, authorize, isManaged, requestTimeoutMs = 5000,
@@ -25,6 +26,7 @@ const ReviewerTabWorkspace = (() => {
     let acquisitionEpoch = 0;
     let lease = null;
     let leaseTimer = null;
+    let activityTimer = null;
     let expected = null;
     let focusInFlight = false;
     let lastNow = 0;
@@ -113,6 +115,12 @@ const ReviewerTabWorkspace = (() => {
       // Set before awaiting storage so an in-flight request cannot acquire a
       // new slot between trusted user input and its durable idle checkpoint.
       activityUntil = now() + ACTIVITY_MS;
+      // Lanes that asked during input stay queued in FIFO order; wake the head
+      // as soon as the quiet period ends instead of on its next 5s poll. The
+      // hint re-runs every guard, so it never selects a tab during input.
+      clearTimeout(activityTimer);
+      activityTimer = setTimeout(hintWaitingHead, Math.max(1, activityUntil - now() + 1));
+      activityTimer?.unref?.();
       await load();
       await persist();
       return { ok: true, until: activityUntil };
@@ -206,7 +214,7 @@ const ReviewerTabWorkspace = (() => {
         const tab = await chrome.tabs.get(member.id).catch(() => null);
         if (tab?.groupId === groupId && tab.windowId === windowId && safeTab(tab, true) && !tab.pinned) retired.push(tab);
       }
-      if (!retired.length) return;
+      if (!retired.length) return closeArchives(windowId, pass);
       let archive;
       for (const candidate of await chrome.tabGroups.query({ windowId })) {
         const found = await groupContents(candidate.id, windowId, OLD_TITLE, 'grey');
@@ -227,6 +235,33 @@ const ReviewerTabWorkspace = (() => {
       if ((await config()).groupScannerTabs === false) return;
       await chrome.tabGroups.update(archiveId, { title: OLD_TITLE, color: 'grey',
         collapsed: !members.some(tab => tab.active) });
+      await closeArchives(windowId, pass);
+    }
+
+    // The owner asked for retired scanner tabs to be closed, not kept: after an
+    // extension reload they are gathered into the grey group, then closed here.
+    // A tab the owner is looking at, a pinned tab, or any current scanner tab
+    // is never closed.
+    async function closeArchives(windowId, pass) {
+      if (!chrome.tabs?.remove || typeof isManaged !== 'function' || await paused() ||
+          (await config()).groupScannerTabs === false) return;
+      for (const candidate of await chrome.tabGroups.query({ windowId })) {
+        const found = await groupContents(candidate.id, windowId, OLD_TITLE, 'grey');
+        if (!found || (await chrome.tabGroups.get(found.group.id)).shared === true) continue;
+        const ids = found.members.filter(tab => !tab.active && !tab.pinned && !registered.has(tab.id) &&
+          !requestedIds.has(tab.id) && !removing.has(tab.id) && !pass?.attempted.has(tab.id) &&
+          safeTab(tab, true)).map(tab => tab.id);
+        for (const id of ids) {
+          pass?.attempted.add(id);
+          if (await isManaged(id) !== false) continue; // In use, or unknown: keep it.
+          removing.add(id);
+          try {
+            await chrome.tabs.remove(id);
+            delete owned[id];
+          } catch { /* Closed by the owner, or Chrome refused: keep it archived. */ }
+          finally { removing.delete(id); }
+        }
+      }
     }
 
     async function syncUnlocked(tabIds, version) {
@@ -366,10 +401,22 @@ const ReviewerTabWorkspace = (() => {
       const window = chrome.windows?.get ? await chrome.windows.get(tab.windowId) : null;
       const background = window?.focused === false || window?.state === 'minimized';
       const [selected] = await chrome.tabs.query({ windowId: tab.windowId, active: true });
-      if (!selected || (!background && (!registered.has(selected.id) || !safeTab(selected)))) {
+      if (!selected || (!background && (!registered.has(selected.id) || !safeTab(selected)) &&
+          !await userAway())) {
         return { error: 'manual-tab-active' };
       }
       return { tab, selected };
+    }
+
+    // Window focus alone is not manual browsing: Chrome stays focused all night
+    // after any launch, and an unattended selected tab must not starve every
+    // scanner. Without input for AWAY_SECONDS (or with the screen locked) no
+    // one is reading that tab. Missing API or errors keep the user present.
+    async function userAway() {
+      try {
+        const state = await chrome.idle?.queryState?.(AWAY_SECONDS);
+        return state === 'idle' || state === 'locked';
+      } catch { return false; }
     }
 
     function enqueue(tabId, generation, expiresAt) {
@@ -456,7 +503,12 @@ const ReviewerTabWorkspace = (() => {
       if (!queuedBehind) focusInFlight = flight;
       const token = epoch;
       const acquisition = acquisitionEpoch;
-      const requestGuard = () => guard(token, tabId, generation, expiresAt, true, acquisition);
+      const requestGuard = async () => {
+        const rejection = await guard(token, tabId, generation, expiresAt, true, acquisition);
+        // Keep the FIFO ticket while the user is active (see noteActivity).
+        if (rejection?.reason === 'user-active' && registered.has(tabId)) enqueue(tabId, generation, expiresAt);
+        return rejection;
+      };
       const work = (async () => {
       try {
         await load();
@@ -530,7 +582,14 @@ const ReviewerTabWorkspace = (() => {
       } catch {
         if (focusInFlight === flight) expected = null;
         return denied('activation-unavailable', false);
-      } finally { if (focusInFlight === flight) focusInFlight = false; }
+      } finally {
+        if (focusInFlight === flight) {
+          focusInFlight = false;
+          // Contenders that saw 'busy' only because this check was running
+          // would otherwise sleep a full retry interval after a failed attempt.
+          if (!lease || lease.until <= now()) hintWaitingHead();
+        }
+      }
       })();
       let timer;
       const duration = Math.max(1, Math.min(5000, Number(requestTimeoutMs) || 5000,

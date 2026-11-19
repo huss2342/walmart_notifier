@@ -1,7 +1,7 @@
 // Owns the one reviewer tab that is allowed to relay, posts its items to the
 // local notifier, and restarts its sweep on a Chrome alarm.
 
-importScripts('sweep-modes.js', 'runtime-policy.js', 'diagnostics.js', 'local-client.js', 'scanner-settings.js', 'relay-settings.js', 'scanner-control.js', 'challenge-evidence.js', 'verification-engine.js', 'verification-observation.js', 'verification-protocol.js', 'verification-driver.js', 'verification-native.js', 'verification-automation.js', 'department-data.js', 'auxiliary-scans.js', 'tab-workspace.js', 'facet-input.js');
+importScripts('sweep-modes.js', 'runtime-policy.js', 'diagnostics.js', 'local-client.js', 'scanner-settings.js', 'relay-settings.js', 'scanner-control.js', 'challenge-evidence.js', 'verification-engine.js', 'verification-observation.js', 'verification-protocol.js', 'verification-driver.js', 'verification-native.js', 'verification-automation.js', 'department-data.js', 'auxiliary-scans.js', 'fast-reads.js', 'restock-watch.js', 'tab-workspace.js', 'facet-input.js');
 
 const DEFAULTS = {
   ...Object.fromEntries(Object.entries(ReviewerScannerSettings.defaults)
@@ -32,6 +32,9 @@ const PROBE_LOADING_RETRY_MS = 500;
 const LOADING_LEASE_MS = 45_000;
 const FETCH_TIMEOUT_MS = 12_000;
 const STALE_SWEEP_MS = 2 * 60_000;
+const PRIMARY_PROGRESS_KEY = 'reviewerPrimaryProgress';
+const PRIMARY_PROGRESS_WAIT_MS = 5 * 60_000;
+const PRIMARY_RECOVERY_RETRY_MS = 30_000;
 // Keep this in sync with sources.webhook_source.MAX_ITEMS. The strict ingest
 // contract rejects larger arrays instead of silently truncating them.
 const MAX_INGEST_ITEMS = 200;
@@ -101,10 +104,61 @@ function recordVerificationChanges(changes) {
 
 const auxiliaryScans = ReviewerAuxiliaryScans.create(chrome, {
   home: REVIEWER_HOME, config, paused: pausedUntil, post: enqueuePost,
+  windowId: scannerWindowId,
   diagnostic: recordDiagnostic, probe: probeOnce, onBotCheck: handleBotCheck,
   initialStartDelay: (settings, name) => Math.max(5, Math.min(60, Number(settings.pageDelaySeconds) || 15)) * 1000 *
     (1 + ReviewerAuxiliaryScans.lanes.slice(0, ReviewerAuxiliaryScans.lanes.indexOf(name))
-      .filter(lane => ReviewerAuxiliaryScans.enabled(lane, settings)).length)
+      .filter(lane => ReviewerAuxiliaryScans.enabled(lane, settings)).length),
+  // One direct read settles whether a blank or unbindable target is simply
+  // empty, and lets the requests tab skip searches a direct read just found empty.
+  fastProbe: url => fastReads.probe(url),
+  recentlyEmpty: query => fastReads.recentlyEmpty(query)
+});
+
+// Local, not session, storage: the watch, blip history and unacknowledged
+// returns survive extension reloads and browser restarts (all bounded).
+const restockWatch = ReviewerRestockWatch.create(chrome.storage.local,
+  { diagnostic: (event, details) => recordDiagnostic(event, details) });
+const fastReads = ReviewerFastReads.create(chrome, {
+  tabIds: async () => [...new Set([(await readCoordinator()).tabId,
+    ...await auxiliaryScans.managedTabIds()])].filter(Number.isInteger),
+  send: (items, page, lane, targetIndex) => enqueuePost(items, page, async () => !(await pausedUntil()),
+    { lane, intakePhase: 'fast', ...(Number.isSafeInteger(targetIndex) ? { targetIndex } : {}) }),
+  // A page holding a restock that awaits confirmation is always re-sent.
+  mustSend: items => restockWatch.awaiting(items),
+  paused: async () => Boolean(await pausedUntil()),
+  diagnostic: details => recordDiagnostic('fast-read', details),
+  // A blocked direct read runs the normal bot-check path at once: pause, verification
+  // automation (the bypasser), evidence capture and the #collector-health alert.
+  onBlocked: (_minutes, tabId) => Number.isInteger(tabId) ? handleBotCheck(tabId, 'fast-read') : undefined,
+  // Member requests (personal DMs) and the owner's priority searches. A search
+  // in both lists counts as a member search.
+  queries: async () => {
+    const settings = await config();
+    let priority = [];
+    try { priority = priorityQueries(settings.auxiliaryPriorityQueries); } catch { priority = []; }
+    const members = Array.isArray(settings.requestSearchQueries) ? settings.requestSearchQueries : [];
+    const seen = new Set();
+    const clean = list => list.filter(query => typeof query === 'string' && query.trim() &&
+      query.trim().length <= 200 && !/:\/\//.test(query) && !/[\p{C}]/u.test(query))
+      .map(query => query.trim().replace(/\s+/g, ' '))
+      .filter(query => !seen.has(query.toLocaleLowerCase('en-US')) && seen.add(query.toLocaleLowerCase('en-US')));
+    const memberList = clean(members);
+    return { members: memberList, priority: clean(priority) };
+  },
+  // The departments the department tab discovered (read-only), for the
+  // spare-slot department reads. Off when that tab's departments are off.
+  departments: async () => {
+    if ((await config()).auxiliaryDepartments !== true) return [];
+    const stored = (await chrome.storage.local.get('reviewerAuxiliaryScans')).reviewerAuxiliaryScans;
+    const seen = new Set();
+    return (stored?.lanes?.departments?.targets || []).filter(target => target?.kind === 'department')
+      .map(target => {
+        try { return new URL(target.selection?.url || target.targetUrl).searchParams.get('catId'); } catch { return null; }
+      })
+      .filter(catId => /^\d{1,16}(?:_\d{1,16})*$/.test(catId || '') && !seen.has(catId) && seen.add(catId))
+      .map((catId, index) => ({ catId, index: index + 1 }));
+  }
 });
 
 const tabWorkspace = ReviewerTabWorkspace.create(chrome, {
@@ -140,8 +194,13 @@ const scannerControl = ReviewerScannerControl.create(chrome, {
     if (name === 'restartHome') return restartPrimary('backend');
     if (name === 'restartAdditional') return auxiliaryScans.restart();
     return { ok: false };
-  }
+  },
+  onResearch: url => fastReads.research(url)
 });
+
+async function syncScannerInputs() {
+  await Promise.all([scannerControl.syncSettings(), scannerControl.syncRequests()]);
+}
 
 function scannerSettingsForConfig(settings) {
   return ReviewerScannerSettings.project(settings, {
@@ -160,6 +219,7 @@ async function scannerStatusSnapshot() {
     config(), readCoordinator(), chrome.storage.local.get([
       'verificationAssistStatus', 'verificationAssistLastResult', 'verificationAssistRetry',
       'scannerSettingsSyncError', 'scannerSettingsSyncedAt', 'scannerCommandsSyncError',
+      'requestSearchSyncError',
       'scannerCommandReceipts'
     ]), auxiliaryScans.managedTabIds()
   ]);
@@ -208,13 +268,33 @@ async function scannerStatusSnapshot() {
   };
   if (saved.scannerSettingsSyncError) errors.push({ component: 'settings', code: 'settings-sync-failed' });
   if (saved.scannerCommandsSyncError) errors.push({ component: 'commands', code: 'commands-sync-failed' });
+  if (saved.requestSearchSyncError) errors.push({ component: 'requests', code: 'requests-sync-failed' });
+  // Persist bounded historical runtime observations, independent of the latest
+  // overwritten status file. Logging cannot hold up status or scanner work.
+  if (typeof recordScannerRuntime === 'function') {
+    const progressAt = sweep?.generation === state.generation
+      ? number(sweep.lastProgressAt || sweep.startedAt) : number(state.selectedAt);
+    recordScannerRuntime('home', { probe, progressAt, paused: check.pausedUntil > 0,
+      enabled: Number(settings.refreshMinutes) > 0, tabId: tabId ?? undefined,
+      generation: number(state.generation), documentId: number(probe?.documentId), page,
+      targetKey: 'home' });
+    for (const lane of lanes) {
+      recordScannerRuntime(lane.lane, { probe: laneProbes.get(lane.lane),
+        progressAt: number(lane.lastProgressAt), paused: check.pausedUntil > 0,
+        enabled: ReviewerAuxiliaryScans.enabled(lane.lane, settings),
+        tabId: lane.tabId ?? undefined, generation: number(lane.generation),
+        documentId: number(laneProbes.get(lane.lane)?.documentId),
+        round: number(lane.round), targetKey: lane.targetKey });
+    }
+  }
   return { schemaVersion: 1, extensionVersion: chrome.runtime.getManifest?.().version || 'unknown',
     exportedAt: Date.now(), settings: scannerSettings,
     primary: { tabId, generation: number(state.generation), phase, reachable: Boolean(probe?.ready),
       page, totalPages: Number.isSafeInteger(sweep?.total) && sweep.total >= 0 ? sweep.total : null,
       visitedPages: Array.isArray(sweep?.visited) ? sweep.visited.length : 0,
       lastActivityAt: number(probe?.lastActivityAt), nextActionAt: number(probe?.nextActionAt) },
-    lanes: ReviewerAuxiliaryScans.lanes.map(name => {
+    lanes: ReviewerAuxiliaryScans.lanes.filter(name => name !== 'requests' ||
+      lanes.some(lane => lane.lane === name)).map(name => {
       const lane = lanes.find(entry => entry.lane === name);
       const enabled = ReviewerAuxiliaryScans.enabled(name, settings);
       return { lane: name, enabled, owned: managed.includes(lane?.tabId),
@@ -260,8 +340,23 @@ async function syncScannerWorkspace() {
     ...await auxiliaryScans.managedTabIds()].filter(Number.isInteger));
 }
 
+async function scannerWindowId() {
+  const [state, managed, tabs, settings] = await Promise.all([
+    readCoordinator(), auxiliaryScans.managedTabIds(), chrome.tabs.query({}), config()
+  ]);
+  const ids = [state.tabId, state.interruptedTabId, ...managed];
+  const waitingUrl = chrome.runtime.getURL('scanner-wait.html');
+  const anchor = ids.map(id => tabs.find(tab => tab.id === id && Number.isInteger(tab.windowId) &&
+    (tab.url === waitingUrl || isBotCheckUrl(tab.url) ||
+      eligibleUrl(tab.url, /^\/reviews\/claim-product\/?$/i))))
+    .find(Boolean) || tabs.find(tab => Number.isInteger(tab.windowId) && tab.url &&
+      monitoringTab(tab, settings, state));
+  return anchor?.windowId;
+}
+
 async function config() {
-  return { ...DEFAULTS, ...(await chrome.storage.local.get(Object.keys(DEFAULTS))) };
+  return { ...DEFAULTS, requestSearchQueries: [],
+    ...(await chrome.storage.local.get([...Object.keys(DEFAULTS), 'requestSearchQueries'])) };
 }
 
 const delay = (ms) => new Promise((done) => setTimeout(done, ms));
@@ -714,9 +809,11 @@ async function postBatch(endpoint, headers, items, index, count, context = {}) {
   return { ok: true, summary };
 }
 
+// `confirming`: $80+ offers back after an hour unseen that the backend holds
+// until a second sighting 9+ s later; their page is re-read like a held restock.
 const SUMMARY_COUNTS = [
   'new', 'filtered', 'matched', 'notified', 'queued', 'failed', 'pending', 'seeded',
-  'value_known', 'value_unknown'
+  'value_known', 'value_unknown', 'confirming'
 ];
 
 function numericSummaryValue(summary, key, fallback = 0) {
@@ -756,7 +853,7 @@ function emptySummary() {
   return summary;
 }
 
-async function post(items, page, canSend = async () => !(await pausedUntil()), context = {}) {
+async function post(items, page, canSend = async () => !(await pausedUntil()), context = {}, options = {}) {
   const { endpoint: rawEndpoint, token } = await config();
   let endpoint;
   try {
@@ -775,8 +872,14 @@ async function post(items, page, canSend = async () => !(await pausedUntil()), c
 
   if (!await canSend()) return { ok: false, retryable: false, reason: 'inactive' };
   // The reviewer card owns availability. Never fetch individual product pages.
-  const availableItems = items.filter(item => item.available !== false)
-    .map(({ eligibility_url: _legacyOfferUrl, ...item }) => item);
+  // A restock retry re-sends confirmed returns as they were: not a new sighting.
+  if (!options.restockRetry) items = await restockWatch.mark(items, context);
+  // A held restock (first in-stock read after being out) is not sent until a
+  // later read confirms it; `held` tells the fast reader to re-read its page.
+  let held = items.filter(item => item.restockHold === true && item.available !== false).length;
+  // `stock` is evidence for the local diagnostics only; it never reaches the backend.
+  const availableItems = items.filter(item => item.available !== false && item.restockHold !== true)
+    .map(({ eligibility_url: _legacyOfferUrl, stock: _stockEvidence, restockHold: _hold, ...item }) => item);
   const filteredCount = items.length - availableItems.length;
   const summary = emptySummary();
   summary.seen = filteredCount;
@@ -791,10 +894,18 @@ async function post(items, page, canSend = async () => !(await pausedUntil()), c
     // batch. If a later request fails, the content script retries the complete
     // page; successful earlier batches are harmless duplicates on that retry.
     const result = await postBatch(endpoint, headers, batch, index, batchCount, context);
+    // A refused or failed upload (5xx, network, worker stopped mid-request)
+    // leaves its restock flags unacknowledged: they ride on the next read and
+    // are re-sent by retryRestockReturns() until a 2xx carries them.
     if (!result.ok) return { ...result, accepted };
     accepted = true;
+    const restocked = batch.filter(item => item.restocked === true).map(item => item.item_id);
+    if (restocked.length) await restockWatch.ack(restocked).catch(() => {});
     mergeSummary(summary, result.summary);
   }
+  // The backend holds $80+ offers back after an hour unseen until a second
+  // sighting: like a held restock, their page must be re-read and re-sent.
+  held += Math.max(0, Number(summary.confirming) || 0);
 
   if (!await canSend()) return { ok: false, retryable: false, reason: 'inactive', accepted };
 
@@ -839,15 +950,15 @@ async function post(items, page, canSend = async () => !(await pausedUntil()), c
     await showDeliveryBadge(summary.notified);
   }
   if (deliveryError) {
-    return { ok: false, retryable: true, error: deliveryError, summary };
+    return { ok: false, retryable: true, error: deliveryError, summary, held };
   }
-  return { ok: true, summary };
+  return { ok: true, summary, held };
 }
 
 // Mutation-heavy pages can produce another report before an earlier response
 // reaches the content script. Serializing makes status writes deterministic.
 let ingestTail = Promise.resolve();
-function enqueuePost(items, page, canSend, context = {}) {
+function enqueuePost(items, page, canSend, context = {}, options = {}) {
   const queuedAt = Date.now();
   context = { ...context, page, requestId: diagnosticIdentifier() };
   recordDiagnostic('ingest-stage', { ...context, stage: 'queued', outcome: 'waiting', items: items.length });
@@ -855,10 +966,12 @@ function enqueuePost(items, page, canSend, context = {}) {
     const startedAt = Date.now();
     const current = { ...context, queueMs: Math.max(0, startedAt - queuedAt) };
     try {
-      const value = await post(items, page, canSend, current);
+      const value = await post(items, page, canSend, current, options);
       if (!value.ok) recordDiagnostic('ingest-stage', { ...current, stage: 'complete',
         outcome: value.reason === 'inactive' && value.accepted ? 'accepted-stale' : value.reason === 'inactive' ? 'cancelled'
           : value.retryable ? 'retry' : 'rejected', durationMs: Date.now() - startedAt });
+      // The notifier answers again: re-send any restock a failed upload left behind.
+      else if (!options.restockRetry) retryRestockReturns();
       return { ...value, requestId: context.requestId };
     } catch (error) {
       recordDiagnostic('ingest-stage', { ...current, stage: 'complete', outcome: 'retry',
@@ -871,6 +984,26 @@ function enqueuePost(items, page, canSend, context = {}) {
   );
   ingestTail = result.catch(() => undefined);
   return result;
+}
+
+// Confirmed restocks whose upload was refused (backend restarting: 503 or no
+// answer) or never finished (worker stopped) are re-sent on their own, flagged,
+// until a 2xx acknowledges them (RETRY_MS at most). Runs after each accepted
+// upload, on the 30 s fast-read alarm and when the worker starts; the backend
+// alerts a restock only once however often it is re-sent.
+let restockRetrying = null;
+function retryRestockReturns() {
+  restockRetrying ||= (async () => {
+    try {
+      const items = await restockWatch.retryable();
+      if (items.length) {
+        await enqueuePost(items, 1, async () => !(await pausedUntil()), {}, { restockRetry: true });
+      }
+    } catch { /* Retried on the next accepted upload or alarm. */ } finally {
+      restockRetrying = null;
+    }
+  })();
+  return restockRetrying;
 }
 
 // --- reviewer-tab coordinator -----------------------------------------------
@@ -918,7 +1051,7 @@ function monitoringTab(tab, settings, state = {}, resume = null) {
   let re;
   try { re = new RegExp(settings.pathPattern || DEFAULTS.pathPattern, 'i'); }
   catch { re = new RegExp(DEFAULTS.pathPattern, 'i'); }
-  const fallback = ((state.paginationFallback && state.tabId === tab.id) ||
+  const fallback = ((state.paginationFallback && (state.tabId ?? state.interruptedTabId) === tab.id) ||
     (state.tabId == null && resume?.url === tab.url && resume.sweep?.paginationFallback)) &&
     normalizeSweepMode(settings.sweepMode) === 'none';
   return [tab.url, tab.pendingUrl].filter(Boolean).every(url =>
@@ -979,9 +1112,11 @@ function resumeExistingReviewerTab() {
     const [state, resume, tabs] = await Promise.all([
       readCoordinator(), readReviewerResume(settings), chrome.tabs.query({})
     ]);
+    const managed = await auxiliaryScans.managedTabIds();
     if (state.tabId != null || !resume || tabs.some(tab =>
       [tab.url, tab.pendingUrl].some(url => url === resume.url || isBotCheckUrl(url)))) return false;
-    const tab = tabs.find(tab => tab.url && (!tab.pendingUrl || tab.pendingUrl === tab.url) &&
+    if (tabs.some(tab => tab.id === state.interruptedTabId && monitoringTab(tab, settings, state))) return false;
+    const tab = tabs.find(tab => !managed.includes(tab.id) && tab.url && (!tab.pendingUrl || tab.pendingUrl === tab.url) &&
       monitoringTab(tab, settings));
     if (!tab) return false;
     const [live, latest, currentSettings, paused] = await Promise.all([
@@ -1061,7 +1196,10 @@ function ensureReviewerTab() {
     try {
       let opened;
       try {
-        opened = await chrome.tabs.create({ url: target, active: false });
+        const windowId = await scannerWindowId();
+        if (await pausedUntil() || !(Number((await config()).refreshMinutes) > 0)) return false;
+        opened = await chrome.tabs.create({ url: target, active: false,
+          ...(Number.isInteger(windowId) ? { windowId } : {}) });
       } catch {
         // Chrome can keep a background worker alive without an open window.
         if (await pausedUntil()) return false;
@@ -1141,6 +1279,13 @@ function selectPrimary(options = {}) {
   return run;
 }
 
+// Walmart's pager now changes pages in-document (href="#"): Chrome never
+// reports the tab as loading, yet its content script is briefly unreachable.
+// The current primary keeps its lease through such a gap, but only right
+// after it reported starting a page change; a dead tab still fails over.
+const primaryNavigatingAt = new Map();
+const IN_PAGE_NAVIGATION_GRACE_MS = 20_000;
+
 async function selectPrimaryUnlocked({ excludeTabId = null, keepCurrentOnNoMatch = false,
     requireReviewerReady = false } = {}) {
   const tabs = await reviewerTabs();
@@ -1186,6 +1331,11 @@ async function selectPrimaryUnlocked({ excludeTabId = null, keepCurrentOnNoMatch
       probe = reply;
       break;
     }
+    if (tab.id === currentTab?.id && !reply &&
+        Date.now() - (primaryNavigatingAt.get(tab.id) || 0) < IN_PAGE_NAVIGATION_GRACE_MS) {
+      chosen = tab;
+      break;
+    }
     if (tab.id === currentTab?.id && tab.status === 'loading' &&
         Date.now() - current.selectedAt < LOADING_LEASE_MS) {
       // Page-to-page navigation temporarily destroys the primary content
@@ -1216,13 +1366,25 @@ async function commitSelection(tabs, current, chosen, probe) {
   const changed = nextId !== current.tabId;
   if (changed) {
     const resume = await readReviewerResume();
-    const restore = (chosen?.url === resume?.url || (resume?.interruptedAt && chosen &&
-      monitoringTab(chosen, await config(), current, resume))) && resume?.sweep;
+    const settings = await config();
+    const reservedId = current.tabId ?? current.interruptedTabId;
+    const reserved = tabs.find(tab => tab.id === reservedId &&
+      monitoringTab(tab, settings, current, resume));
+    // Losing a content-script reply revokes authority, not ownership of the
+    // scanner slot. Keep that identity through pagination so grouping and
+    // auto-open do not strand this tab and create a replacement beside it.
+    const retained = chosen && chosen.id === current.interruptedTabId && reserved
+      ? resumeSweepForSettings((await chrome.storage.local.get([`${SWEEP_PREFIX}${chosen.id}`]))
+        [`${SWEEP_PREFIX}${chosen.id}`], settings) : null;
+    const restore = retained || ((chosen?.url === resume?.url || (resume?.interruptedAt && chosen &&
+      monitoringTab(chosen, settings, current, resume))) && resume?.sweep);
     state = await writeCoordinator({
       tabId: nextId,
       generation: current.generation + 1,
       selectedAt: nextId == null ? 0 : Date.now(),
-      paginationFallback: restore?.paginationFallback === true
+      ...(nextId == null && reserved ? { interruptedTabId: reserved.id } : {}),
+      paginationFallback: nextId == null && reserved
+        ? current.paginationFallback === true : restore?.paginationFallback === true
     });
     if (restore && Array.isArray(restore.visited)) {
       await chrome.storage.local.set({ [`${SWEEP_PREFIX}${nextId}`]: {
@@ -1233,7 +1395,8 @@ async function commitSelection(tabs, current, chosen, probe) {
     const managedSweepKeys = new Set((await auxiliaryScans.managedTabIds()).map(id => `${SWEEP_PREFIX}${id}`));
     const inactiveSweepKeys = Object.keys(stored).filter((key) =>
       (key === 'sweep' || key.startsWith(SWEEP_PREFIX)) &&
-      key !== `${SWEEP_PREFIX}${nextId}` && !managedSweepKeys.has(key)
+      key !== `${SWEEP_PREFIX}${nextId}` && key !== `${SWEEP_PREFIX}${state.interruptedTabId}` &&
+      !managedSweepKeys.has(key)
     );
     if (inactiveSweepKeys.length) await chrome.storage.local.remove(inactiveSweepKeys);
     if (chosen) await saveReviewerResume(chosen, state);
@@ -1637,16 +1800,23 @@ async function coordinatorStatus() {
 
 async function recordContentDiagnostic(msg, sender) {
   const details = { ...msg.details, tabId: sender.tab.id };
+  let targetKey = details.targetKey;
+  delete details.targetKey;
   // document_idle runs before its initial role reply. Resolve only this one
   // startup attribution from existing ownership; never call it a home page
   // solely because the document has not received its auxiliary lease yet.
   if (msg.event === 'page-loaded' && !(details.generation > 0) &&
       await auxiliaryScans.ownsTab(sender.tab.id)) {
     const assigned = await auxiliaryScans.handle({ type: 'reviewer:role' }, sender);
-    if (assigned?.auxiliary) Object.assign(details, { generation: assigned.generation,
-      lane: assigned.auxiliary.lane, round: assigned.auxiliary.round,
-      targetIndex: assigned.auxiliary.targetIndex, attempt: assigned.auxiliary.attempt });
+    if (assigned?.auxiliary) {
+      targetKey = assigned.auxiliary.targetKey;
+      Object.assign(details, { generation: assigned.generation,
+        lane: assigned.auxiliary.lane, round: assigned.auxiliary.round,
+        targetIndex: assigned.auxiliary.targetIndex, attempt: assigned.auxiliary.attempt });
+    }
   }
+  const targetId = typeof diagnosticTargetId === 'function' ? await diagnosticTargetId(targetKey) : null;
+  if (targetId) details.targetId = targetId;
   return recordDiagnostic(msg.event, details);
 }
 
@@ -1751,6 +1921,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           !(eligibleUrl(sender.tab.url, await pathRegex()) || isBotCheckUrl(sender.tab.url))) {
         return { ok: false };
       }
+      if (msg.event === 'navigation-native') {
+        primaryNavigatingAt.set(sender.tab.id, Date.now());
+        if (primaryNavigatingAt.size > 50) primaryNavigatingAt.delete(primaryNavigatingAt.keys().next().value);
+      }
       const recorded = await recordContentDiagnostic(msg, sender);
       return { ok: recorded.recorded, recorded: recorded.recorded };
     })(), sendResponse);
@@ -1840,6 +2014,43 @@ async function scheduleRefresh(busy = false) {
 }
 
 let refreshInFlight = false;
+
+async function primaryProgressState(selected, probe) {
+  const now = Date.now();
+  const stamp = value => Number.isFinite(value) && value > 0 && value <= now ? value : 0;
+  const [stored, sweeps] = await Promise.all([
+    chrome.storage.session.get([PRIMARY_PROGRESS_KEY]),
+    chrome.storage.local.get([`${SWEEP_PREFIX}${selected.tab.id}`])
+  ]);
+  const previous = stored[PRIMARY_PROGRESS_KEY];
+  const record = previous?.tabId === selected.tab.id && previous.generation === selected.state.generation
+    ? { tabId: previous.tabId, generation: previous.generation,
+      guardedAt: stamp(previous.guardedAt), recoveredAt: stamp(previous.recoveredAt),
+      attemptedAt: stamp(previous.attemptedAt) }
+    : { tabId: selected.tab.id, generation: selected.state.generation, guardedAt: 0, recoveredAt: 0, attemptedAt: 0 };
+  const sweep = sweeps[`${SWEEP_PREFIX}${selected.tab.id}`];
+  const checkpointProgressAt = sweep?.generation === selected.state.generation ? stamp(sweep.lastProgressAt) : 0;
+  const checkpointStartedAt = sweep?.generation === selected.state.generation ? stamp(sweep.startedAt) : 0;
+  // A content heartbeat or another lane's intake cannot prove home coverage.
+  const progressAt = Math.max(stamp(selected.state.selectedAt),
+    checkpointProgressAt, checkpointStartedAt) || now;
+  // focusReason is the last denial, which can outlive the activity that caused
+  // it. A soft relay retries the ordinary live workspace guards before input.
+  const guarded = probe.busy === true || probe.highTraffic === true || probe.phase === 'ingest-retry';
+  if (guarded) record.guardedAt = now;
+  if (JSON.stringify(previous) !== JSON.stringify(record)) {
+    await chrome.storage.session.set({ [PRIMARY_PROGRESS_KEY]: record });
+  }
+  return { record, guarded, progressAt, checkpointProgressAt, checkpointStartedAt,
+    readyForAttempt: !record.attemptedAt || now - record.attemptedAt >= PRIMARY_RECOVERY_RETRY_MS,
+    expired: now - Math.max(progressAt, record.guardedAt, record.recoveredAt) >= PRIMARY_PROGRESS_WAIT_MS };
+}
+
+async function suspendPrimaryProgress() {
+  const stored = (await chrome.storage.session.get([PRIMARY_PROGRESS_KEY]))[PRIMARY_PROGRESS_KEY];
+  if (stored) await chrome.storage.session.set({ [PRIMARY_PROGRESS_KEY]: { ...stored, guardedAt: Date.now() } });
+}
+
 async function refreshTick() {
   if (refreshInFlight) return;
   refreshInFlight = true;
@@ -1848,6 +2059,7 @@ async function refreshTick() {
     if (await pausedUntil()) {
       // No reloads, not even the repair reload below, while Walmart has asked
       // this traffic to stop.
+      await suspendPrimaryProgress();
       await scheduleRefresh();
       return;
     }
@@ -1906,19 +2118,53 @@ async function refreshTick() {
     }
 
     if (state.highTraffic === true) {
+      await primaryProgressState(selected, state);
       await scheduleRefresh(true);
       return;
     }
     if (state.sweeping) {
       const stale = state.lastActivityAt && Date.now() - state.lastActivityAt > STALE_SWEEP_MS;
-      if (stale && !(state.nextActionAt > Date.now()) &&
-          state.phase !== 'ingest-retry' && state.phase !== 'waiting-user' &&
-          state.highTraffic !== true) {
+      const progress = await primaryProgressState(selected, state);
+      if (!progress.guarded && progress.readyForAttempt && (progress.expired ||
+          (stale && !(state.nextActionAt > Date.now()) && state.phase !== 'waiting-user'))) {
+        const reason = progress.expired ? 'progress-timeout' : 'stale-document';
+        let recoveryContext;
         try {
-          await chrome.tabs.sendMessage(selected.tab.id, {
-            type: 'reviewer:recover', generation: selected.state.generation
-          });
+          const authorized = await authorizedRole({ tab: selected.tab }, selected.state.generation);
+          const latest = progress.expired ? await primaryProgressState(selected, state) : progress;
+          if (authorized.authorized && latest.readyForAttempt && (!progress.expired || latest.expired) &&
+              Number((await config()).refreshMinutes) > 0 && !await pausedUntil()) {
+            const attemptedAt = Date.now();
+            const documentId = Number.isSafeInteger(state.documentId) && state.documentId > 0 ? state.documentId : 0;
+            recoveryContext = { probe: state, progressAt: latest.progressAt, enabled: true, paused: false,
+              targetKey: 'home',
+              tabId: selected.tab.id, generation: selected.state.generation, documentId,
+              elapsedMs: Math.max(0, attemptedAt - latest.progressAt), delayMs: PRIMARY_RECOVERY_RETRY_MS };
+            // Reserve only a short retry floor. A missing/declining receiver has
+            // not performed a recovery and cannot earn the success cooldown.
+            await chrome.storage.session.set({ [PRIMARY_PROGRESS_KEY]: {
+              ...latest.record, attemptedAt
+            } });
+            if (typeof recordScannerRecovery === 'function') recordScannerRecovery('home', reason, 'requested', recoveryContext);
+            const reply = await chrome.tabs.sendMessage(selected.tab.id, {
+              type: 'reviewer:recover', generation: selected.state.generation,
+              reason, expectedDocumentId: documentId,
+              expectedProgressAt: latest.checkpointProgressAt,
+              expectedSweepStartedAt: latest.checkpointStartedAt
+            });
+            if (reply?.ok === true) {
+              if (typeof recordScannerRecovery === 'function') recordScannerRecovery('home', reason, 'accepted', recoveryContext);
+              await chrome.storage.session.set({ [PRIMARY_PROGRESS_KEY]: {
+                ...latest.record, attemptedAt, recoveredAt: Date.now()
+              } }).catch(() => undefined);
+            } else if (typeof recordScannerRecovery === 'function') {
+              recordScannerRecovery('home', reason, 'deferred', recoveryContext);
+            }
+          }
         } catch {
+          if (recoveryContext && typeof recordScannerRecovery === 'function') {
+            recordScannerRecovery('home', reason, 'unavailable', recoveryContext);
+          }
           // The next alarm will probe/fail over if the tab remains unreachable.
         }
       }
@@ -1945,9 +2191,18 @@ async function refreshTick() {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === auxiliaryScans.alarmName) {
-    scannerControl.syncSettings().then(() => auxiliaryScans.tick()).then(() => scannerControl.syncCommands())
-      .then(syncScannerWorkspace).then(() => scannerControl.syncStatus())
+    // The 1-minute status report runs this same sync chain. When it just did,
+    // only tick the scans instead of repeating four backend round trips.
+    const fresh = Date.now() - lastStatusReportAt < STATUS_SYNC_REUSE_MS;
+    (fresh ? auxiliaryScans.tick() : syncScannerInputs().then(() => auxiliaryScans.tick())
+      .then(() => scannerControl.syncCommands()).then(syncScannerWorkspace)
+      .then(() => scannerControl.syncStatus()))
       .catch(error => console.warn('Reviewer Item Relay: auxiliary scan tick failed', error));
+  }
+  if (alarm.name === fastReads.alarmName) {
+    fastReads.ensure();
+    scannerControl.syncResearch().catch(() => {});
+    retryRestockReturns();
   }
   if (alarm.name === 'verificationRetry') triggerVerificationAutomation();
   if (alarm.name === REFRESH_ALARM) {
@@ -1973,14 +2228,19 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 async function ensureAlarms() {
   await auxiliaryScans.ensureAlarm();
+  await fastReads.ensure();
   if (!await chrome.alarms.get(STATUS_ALARM)) {
     await chrome.alarms.create(STATUS_ALARM, { periodInMinutes: 1 });
   }
   if (!await chrome.alarms.get(REFRESH_ALARM)) await scheduleRefresh();
 }
 
+let lastStatusReportAt = 0;
+const STATUS_SYNC_REUSE_MS = 20_000;
+
 async function reportBrowserStatus() {
-  await scannerControl.syncSettings();
+  lastStatusReportAt = Date.now();
+  await syncScannerInputs();
   triggerVerificationAutomation();
   await syncRelaySettings();
   await auxiliaryScans.tick();
@@ -2024,11 +2284,13 @@ async function reportBrowserStatus() {
 // Chrome may lose alarms on an update/restart. Recreate missing alarms whenever
 // this service worker starts, without postponing an existing scheduled refresh.
 const initialization = ensureAlarms().then(() => syncVerificationBadge()).then(async () => {
-  await scannerControl.syncSettings();
+  await syncScannerInputs();
   // Stored pauses survive upgrades/restarts. Start even if an old document has
   // not emitted a new content-script event since the extension was enabled.
   triggerVerificationAutomation();
   auxiliaryScans.tick().then(syncScannerWorkspace).catch(browserFailure('coordinator'));
+  // A restart can interrupt a restock upload: re-send what no 2xx acknowledged.
+  retryRestockReturns();
 }).catch(browserFailure('initialization'));
 
 chrome.action.onClicked.addListener(async (tab) => {
@@ -2054,7 +2316,7 @@ chrome.runtime.onStartup.addListener(async () => {
     // reloads and worker restarts must preserve that conservative block.
     await chrome.storage.local.set({ reviewerFacetInputUnreleased: false });
     await syncRelaySettings();
-    await scannerControl.syncSettings();
+    await syncScannerInputs();
     await ensureAlarms();
     await scheduleRefresh();
     await ensureReviewerTab();
@@ -2073,7 +2335,7 @@ chrome.runtime.onInstalled.addListener(async () => {
   await chrome.storage.local.remove(['nativeNavigationPausedUntil', 'nativeNavigationFailures']);
   await migrateFromSync();
   await syncRelaySettings();
-  await scannerControl.syncSettings();
+  await syncScannerInputs();
   await ensureAlarms();
   await scheduleRefresh();
   if (!await ensureReviewerTab()) await repairReviewerTab();
@@ -2102,7 +2364,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if ('pathPattern' in changes || 'sweepMode' in changes) {
     selectPrimary().then(() => ensureReviewerTab()).catch(browserFailure('coordinator'));
   }
-  if (['auxiliaryDepartments', 'auxiliaryKeywords', 'auxiliaryBrands', 'auxiliaryKeywordQueries',
+  if (['requestSearchQueries', 'auxiliaryDepartments', 'auxiliaryKeywords', 'auxiliaryBrands', 'auxiliaryKeywordQueries',
     'auxiliaryPriority', 'auxiliaryPriorityQueries', 'auxiliaryPriorityRefreshMinutes']
       .some(key => key in changes)) auxiliaryScans.tick().catch(browserFailure('coordinator'));
   if ('groupScannerTabs' in changes) syncScannerWorkspace().catch(browserFailure('coordinator'));
@@ -2112,7 +2374,9 @@ chrome.storage.onChanged.addListener((changes, area) => {
 chrome.tabs.onActivated?.addListener(({ tabId }) => {
   if (!tabWorkspace.isExpectedActivation(tabId)) {
     tabWorkspace.revoke();
-    tabWorkspace.noteActivity(tabId).catch(() => undefined);
+    tabWorkspace.noteActivity(tabId).then(result => {
+      if (result?.ok) recordDiagnostic('user-activity', { reason: 'tab-activated', tabId });
+    }).catch(() => undefined);
   }
 });
 // Switching applications does not revoke a selected-tab turn. Actual tab

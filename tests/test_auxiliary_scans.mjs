@@ -6,6 +6,91 @@ import vm from 'node:vm';
 const home = 'https://www.walmart.com/reviews/claim-product';
 const file = new URL('../extension/auxiliary-scans.js', import.meta.url);
 
+test('personal requests get a dedicated lane without changing broad keyword or priority queues', async () => {
+  const f = fixture({ initialStartDelay: () => 0, settings: {
+    requestSearchQueries: ['ice cream maker', 'couch', 'Couch', '123456789'] } });
+  await f.api.tick();
+  const lane = (await f.api.status()).lanes.find(row => row.lane === 'requests');
+  assert.ok(lane);
+  assert.equal(lane.totalTargets, 3);
+  const role = await f.message(lane.tabId, 'reviewer:role');
+  assert.equal(role.active, true);
+  assert.equal(new URL(role.auxiliary.targetUrl).searchParams.get('q'), 'ice cream maker');
+  assert.equal(new URL(role.auxiliary.targetUrl).pathname, '/reviews/claim-product');
+  f.configure({ requestSearchQueries: [] });
+  await f.api.tick();
+  assert.equal((await f.message(lane.tabId, 'reviewer:role')).active, false);
+});
+
+test('requests tab skips searches the priority tab already runs', async () => {
+  const f = fixture({ initialStartDelay: () => 0, settings: {
+    auxiliaryPriority: true, auxiliaryPriorityQueries: ['Scooter', 'Sofa'],
+    requestSearchQueries: ['scooter', 'mens hat', 'SOFA'] } });
+  await f.api.tick();
+  assert.equal((await f.api.status()).lanes.find(row => row.lane === 'requests').totalTargets, 1);
+  f.configure({ auxiliaryPriority: false });
+  await f.api.tick();
+  assert.equal((await f.api.status()).lanes.find(row => row.lane === 'requests').totalTargets, 3);
+});
+
+test('new requests activate polling even with all broad auxiliary lanes disabled', async () => {
+  const f = fixture();
+  await f.api.ensureAlarm();
+  assert.ok(f.actions.some(action => action.type === 'alarm'));
+  assert.equal(f.actions.some(action => action.type === 'create'), false);
+  f.configure({ requestSearchQueries: ['garden bed'] });
+  await f.api.tick();
+  assert.equal((await f.api.status()).lanes.find(row => row.lane === 'requests').totalTargets, 1);
+});
+
+test('requested searches reuse scoped intake, pause guards and a one-minute round interval', async () => {
+  const f = fixture({ settings: { requestSearchQueries: ['couch'], refreshMinutes: 30 } });
+  await f.api.tick();
+  let lane = (await f.api.status()).lanes.find(row => row.lane === 'requests');
+  const accepted = await f.message(lane.tabId, 'reviewer:page', { generation: lane.generation,
+    page: 1, items: [{ item_id: '123456789' }] });
+  assert.equal(accepted.ok, true);
+  assert.equal(f.posts.length, 1);
+  f.setPaused(f.now() + 60_000);
+  await f.api.tick();
+  assert.equal((await f.message(lane.tabId, 'reviewer:page', { generation: lane.generation,
+    page: 2, items: [{ item_id: '222222222' }] })).ok, false);
+  assert.equal(f.posts.length, 1);
+  f.setPaused(0);
+  f.advance(30_000);
+  await f.api.tick();
+  lane = (await f.api.status()).lanes.find(row => row.lane === 'requests');
+  await f.message(lane.tabId, 'reviewer:sweep-complete', { generation: lane.generation, pages: 1 });
+  const saved = f.local.data.reviewerAuxiliaryScans.lanes.requests;
+  assert.equal(saved.status, 'complete');
+  assert.ok(saved.nextAt >= saved.completedAt + 60_000);
+  assert.ok(saved.nextAt <= saved.completedAt + 66_000);
+  f.advance(saved.nextAt - f.now()); await f.api.tick();
+  assert.equal(f.local.data.reviewerAuxiliaryScans.lanes.requests.round, saved.round + 1);
+});
+
+test('request additions preserve current deep progress and removals reject stale generations', async () => {
+  const f = fixture({ settings: { requestSearchQueries: ['couch'] } });
+  await f.api.tick();
+  const lane = (await f.api.status()).lanes.find(row => row.lane === 'requests');
+  const role = await f.message(lane.tabId, 'reviewer:role');
+  await f.local.set({ [`sweep:${lane.tabId}`]: { generation: lane.generation,
+    targetKey: role.auxiliary.targetKey, mode: 'none', visited: [1, 2, 3], total: 12 } });
+  await f.message(lane.tabId, 'reviewer:checkpoint', { generation: lane.generation });
+  f.configure({ requestSearchQueries: ['garden bed', 'couch'] });
+  await f.api.tick();
+  const appended = f.local.data.reviewerAuxiliaryScans.lanes.requests;
+  assert.equal(appended.generation, lane.generation);
+  assert.deepEqual(appended.checkpoint.visited, [1, 2, 3]);
+  assert.equal(appended.targets.length, 2);
+  f.configure({ requestSearchQueries: ['garden bed'] });
+  await f.api.tick();
+  const rejected = await f.message(lane.tabId, 'reviewer:page', { generation: lane.generation,
+    page: 4, items: [{ item_id: '123456789' }] });
+  assert.equal(rejected.ok, false);
+  assert.equal(f.posts.length, 0);
+});
+
 function storage(initial = {}) {
   const data = structuredClone(initial);
   return { data, async get(keys) {
@@ -17,7 +102,7 @@ function storage(initial = {}) {
 }
 
 function fixture({ settings: initial = {}, local = storage(), session = storage(), tabs: initialTabs = [],
-  initialStartDelay, intakeSummary = {} } = {}) {
+  initialStartDelay, intakeSummary = {}, fastProbe, recentlyEmpty } = {}) {
   let now = 100_000;
   let paused = 0;
   let settings = { refreshMinutes: 5, pageDelaySeconds: 15, ...initial };
@@ -57,7 +142,7 @@ function fixture({ settings: initial = {}, local = storage(), session = storage(
     '\n' + fs.readFileSync(file, 'utf8'), context);
   const api = vm.runInContext('ReviewerAuxiliaryScans', context).create(chrome, {
     home, config: async () => { await onConfigRead(); return settings; }, paused: async () => paused,
-    initialStartDelay,
+    initialStartDelay, fastProbe, recentlyEmpty,
     diagnostic: (...args) => onDiagnostic(...args), probe: async id => probes.get(id) || { ready: true, reviewerReady: true,
       phase: 'waiting-navigation', sweeping: true, active: true, lastActivityAt: now, nextActionAt: now + 15_000 },
     post: async (items, page, canSend) => {
@@ -196,7 +281,7 @@ for (const focusReason of ['manual-tab-active', 'user-active']) {
     for (let tick = 0; tick < 12; tick += 1) {
       f.advance(30_000);
       f.probes.set(lane.tabId, { ready: true, active: true, generation: lane.generation,
-        phase: 'waiting-focus', busy: false, focusReason, lastActivityAt: f.now(), nextActionAt: 0 });
+        phase: 'waiting-focus', busy: true, focusReason, lastActivityAt: f.now(), nextActionAt: 0 });
       await f.api.tick();
     }
     assert.equal(f.local.data.reviewerAuxiliaryScans.lanes.keywords.targets[0].attempts, 0);
@@ -208,6 +293,21 @@ for (const focusReason of ['manual-tab-active', 'user-active']) {
       'Guarded time cannot spend the resumed opportunity');
     f.advance(300_000);
     await f.api.tick();
+    assert.equal(f.local.data.reviewerAuxiliaryScans.lanes.keywords.targets[0].attempts, 1);
+  });
+}
+
+for (const focusReason of ['manual-tab-active', 'user-active']) {
+  test(`cached ${focusReason} cannot indefinitely renew the auxiliary progress budget`, async () => {
+    const f = fixture({ settings: { auxiliaryKeywords: true, auxiliaryKeywordQueries: ['Pet'] } });
+    await f.api.tick();
+    const lane = (await f.api.status()).lanes[0];
+    for (let tick = 0; tick < 11; tick += 1) {
+      f.advance(30_000);
+      f.probes.set(lane.tabId, { ready: true, active: true, generation: lane.generation,
+        phase: 'waiting-focus', busy: false, focusReason, lastActivityAt: f.now(), nextActionAt: f.now() + 5_000 });
+      await f.api.tick();
+    }
     assert.equal(f.local.data.reviewerAuxiliaryScans.lanes.keywords.targets[0].attempts, 1);
   });
 }
@@ -1525,4 +1625,204 @@ test('an alias of an unresolved department does not falsely satisfy its coverage
   assert.equal(status.completedTargets, 0);
   assert.equal(status.unresolvedTargets, 1);
   assert.deepEqual(f.local.data.reviewerAuxiliaryScans.lanes.departments.targets[1].checkpoint.visited, [1, 2]);
+});
+
+async function bindDepartment(f, label = 'Home', catId = '4044') {
+  await f.api.tick();
+  const lane = (await f.api.status()).lanes[0];
+  let role = await f.message(lane.tabId, 'reviewer:role');
+  await f.message(lane.tabId, 'reviewer:aux-discovered', { generation: role.generation,
+    candidates: [{ kind: 'department', label, parentUrl: home, url: `${home}?catId=${catId}` },
+      { kind: 'department', label: 'Toys', parentUrl: home, url: `${home}?catId=4171` }] });
+  await f.message(lane.tabId, 'reviewer:sweep-complete', { generation: role.generation, pages: 0 });
+  f.advance();
+  await f.api.tick();
+  role = await f.message(lane.tabId, 'reviewer:role');
+  return { lane, role };
+}
+
+test('an empty department settles with one direct read instead of repeated reloads', async () => {
+  const probes = [];
+  const f = fixture({ settings: { auxiliaryDepartments: true },
+    fastProbe: async url => { probes.push(url); return { ok: true, items: [], products: 0, totalPages: 0 }; } });
+  const { lane, role } = await bindDepartment(f);
+  f.tabs.get(lane.tabId).url = `${home}?catId=4044`;
+  const ack = await f.message(lane.tabId, 'reviewer:unusable', { generation: role.generation,
+    reason: 'The selected filter could not be authorized' });
+  assert.equal(ack.recover, 'empty');
+  assert.deepEqual(probes, [`${home}?catId=4044`]);
+  const saved = f.local.data.reviewerAuxiliaryScans.lanes.departments;
+  const target = saved.targets.find(entry => entry.label === 'Home');
+  assert.equal(target.coverageStatus, 'complete');
+  assert.equal(target.result, 'empty');
+  assert.equal(saved.failures, 0);
+  f.advance();
+  await f.api.tick();
+  assert.equal((await f.message(lane.tabId, 'reviewer:role')).auxiliary.selection.label, 'Toys',
+    'The next department starts instead of retrying the empty one');
+});
+
+test('a department with products keeps its ordinary retries after a direct read', async () => {
+  const f = fixture({ settings: { auxiliaryDepartments: true },
+    fastProbe: async () => ({ ok: true, items: [{ item_id: 'ip-1234567' }], products: 40, totalPages: 3 }) });
+  const { lane, role } = await bindDepartment(f);
+  const ack = await f.message(lane.tabId, 'reviewer:unusable', { generation: role.generation,
+    reason: 'The selected filter could not be authorized' });
+  assert.equal(ack.recover, 'waiting');
+  const target = f.local.data.reviewerAuxiliaryScans.lanes.departments.targets.find(entry => entry.label === 'Home');
+  assert.equal(target.coverageStatus, 'unresolved');
+  assert.equal(target.attempts, 1);
+});
+
+test('unavailable or failed direct reads never complete a target', async () => {
+  for (const fastProbe of [async () => null, async () => ({ ok: false, blocked: true }),
+    async () => { throw new Error('reader gone'); }, async () => ({ ok: true, items: [] })]) {
+    const f = fixture({ settings: { auxiliaryDepartments: true }, fastProbe });
+    const { lane, role } = await bindDepartment(f);
+    const ack = await f.message(lane.tabId, 'reviewer:unusable', { generation: role.generation,
+      reason: 'The selected filter could not be authorized' });
+    assert.equal(ack.recover, 'waiting');
+  }
+});
+
+test('a content message cannot claim an empty target by itself', async () => {
+  const f = fixture({ settings: { auxiliaryDepartments: true } });
+  const { lane, role } = await bindDepartment(f);
+  const ack = await f.message(lane.tabId, 'reviewer:unusable', { generation: role.generation,
+    reason: 'The selected filter could not be authorized',
+    emptyProbe: { key: role.auxiliary.targetKey, products: 0, totalPages: 0 } });
+  assert.equal(ack.recover, 'waiting');
+  const target = f.local.data.reviewerAuxiliaryScans.lanes.departments.targets.find(entry => entry.label === 'Home');
+  assert.equal(target.coverageStatus, 'unresolved');
+});
+
+test('a blank resume page past a shrunken target restarts from page one on the first retry', async () => {
+  const probes = [];
+  const f = fixture({ settings: { auxiliaryKeywords: true, auxiliaryKeywordQueries: ['Pet', 'Chair'] },
+    fastProbe: async url => { probes.push(url); return { ok: true, items: [], products: 40, totalPages: 2 }; } });
+  await f.api.tick();
+  const lane = (await f.api.status()).lanes[0];
+  const role = await f.message(lane.tabId, 'reviewer:role');
+  f.tabs.get(lane.tabId).url = `${home}?q=Pet&queryNups=Pet&page=3`;
+  await f.local.set({ [`sweep:${lane.tabId}`]: { generation: role.generation, mode: 'none',
+    targetKey: role.auxiliary.targetKey, visited: [1, 2], total: 3 } });
+  await f.message(lane.tabId, 'reviewer:checkpoint', { generation: role.generation });
+  const ack = await f.message(lane.tabId, 'reviewer:unusable', { generation: role.generation,
+    reason: 'The resumed page stayed blank', failureCode: 'render-timeout' });
+  assert.equal(ack.recover, 'waiting');
+  assert.deepEqual(probes, [`${home}?q=Pet&queryNups=Pet&sort=new`]);
+  const target = f.local.data.reviewerAuxiliaryScans.lanes.keywords.targets[0];
+  assert.equal(target.checkpoint, null);
+  assert.deepEqual(target.boundaryRevalidation.checkpoint.visited, [1, 2]);
+  f.advance(30_000);
+  await f.api.tick();
+  assert.equal(f.actions.filter(action => action.type === 'update').at(-1).url, `${home}?q=Pet&queryNups=Pet`);
+  assert.equal((await f.message(lane.tabId, 'reviewer:role')).active, true);
+});
+
+test('a blank resume page inside the known range keeps resuming it', async () => {
+  const f = fixture({ settings: { auxiliaryKeywords: true, auxiliaryKeywordQueries: ['Pet'] },
+    fastProbe: async () => ({ ok: true, items: [], products: 40, totalPages: 9 }) });
+  await f.api.tick();
+  const lane = (await f.api.status()).lanes[0];
+  const role = await f.message(lane.tabId, 'reviewer:role');
+  f.tabs.get(lane.tabId).url = `${home}?q=Pet&queryNups=Pet&page=3`;
+  await f.local.set({ [`sweep:${lane.tabId}`]: { generation: role.generation, mode: 'none',
+    targetKey: role.auxiliary.targetKey, visited: [1, 2], total: 9 } });
+  await f.message(lane.tabId, 'reviewer:checkpoint', { generation: role.generation });
+  await f.message(lane.tabId, 'reviewer:unusable', { generation: role.generation,
+    reason: 'Transient blank page', failureCode: 'render-timeout' });
+  f.advance(30_000);
+  await f.api.tick();
+  assert.equal(f.actions.filter(action => action.type === 'update').at(-1).url, `${home}?q=Pet&queryNups=Pet&page=3`);
+});
+
+test('without a direct read, a blank resume page gets its last retry from page one', async () => {
+  const f = fixture({ settings: { auxiliaryKeywords: true, auxiliaryKeywordQueries: ['Pet', 'Chair'] } });
+  await f.api.tick();
+  const lane = (await f.api.status()).lanes[0];
+  let role = await f.message(lane.tabId, 'reviewer:role');
+  f.tabs.get(lane.tabId).url = `${home}?q=Pet&queryNups=Pet&page=3`;
+  await f.local.set({ [`sweep:${lane.tabId}`]: { generation: role.generation, mode: 'none',
+    targetKey: role.auxiliary.targetKey, visited: [1, 2], total: 3 } });
+  await f.message(lane.tabId, 'reviewer:checkpoint', { generation: role.generation });
+  await f.message(lane.tabId, 'reviewer:unusable', { generation: role.generation,
+    reason: 'Blank page', failureCode: 'render-timeout' });
+  f.advance(30_000);
+  await f.api.tick();
+  assert.equal(f.actions.filter(action => action.type === 'update').at(-1).url,
+    `${home}?q=Pet&queryNups=Pet&page=3`, 'First retry still resumes');
+  role = await f.message(lane.tabId, 'reviewer:role');
+  await f.message(lane.tabId, 'reviewer:unusable', { generation: role.generation,
+    reason: 'Blank page', failureCode: 'render-timeout' });
+  f.advance(30_000);
+  await f.api.tick();
+  assert.equal(f.actions.filter(action => action.type === 'update').at(-1).url,
+    `${home}?q=Pet&queryNups=Pet`, 'Last retry reads from page one');
+  const target = f.local.data.reviewerAuxiliaryScans.lanes.keywords.targets[0];
+  assert.deepEqual(target.boundaryRevalidation.checkpoint.visited, [1, 2]);
+});
+
+test('member searches a direct read just proved empty are recorded without loading them', async () => {
+  const f = fixture({ initialStartDelay: () => 0, settings: { requestSearchQueries: ['air fryer', 'sofa', 'desk'] },
+    recentlyEmpty: query => query === 'sofa' });
+  await f.api.tick();
+  let lane = (await f.api.status()).lanes.find(row => row.lane === 'requests');
+  let role = await f.message(lane.tabId, 'reviewer:role');
+  assert.equal(new URL(role.auxiliary.targetUrl).searchParams.get('q'), 'air fryer');
+  await f.message(lane.tabId, 'reviewer:sweep-complete', { generation: role.generation, pages: 1 });
+  f.advance(15_000);
+  await f.api.tick();
+  role = await f.message(lane.tabId, 'reviewer:role');
+  assert.equal(new URL(role.auxiliary.targetUrl).searchParams.get('q'), 'desk');
+  assert.equal(f.actions.filter(action => action.type === 'update' && /q=sofa/.test(action.url)).length, 0);
+  const sofa = f.local.data.reviewerAuxiliaryScans.lanes.requests.targets.find(entry => entry.label === 'sofa');
+  assert.equal(sofa.coverageStatus, 'complete');
+  assert.equal(sofa.result, 'empty');
+  lane = (await f.api.status()).lanes.find(row => row.lane === 'requests');
+  assert.equal(lane.emptyTargets, 1);
+});
+
+test('empty proof only skips member searches, never broad keyword targets', async () => {
+  const f = fixture({ initialStartDelay: () => 0,
+    settings: { auxiliaryKeywords: true, auxiliaryKeywordQueries: ['Pet', 'Chair'] }, recentlyEmpty: () => true });
+  await f.api.tick();
+  const lane = (await f.api.status()).lanes[0];
+  const role = await f.message(lane.tabId, 'reviewer:role');
+  assert.equal(new URL(role.auxiliary.targetUrl).searchParams.get('q'), 'Pet');
+  assert.equal(role.active, true);
+});
+
+test('a department whose every page was delivered this round completes when the page after its end is blank', async () => {
+  const probes = [];
+  const f = fixture({ settings: { auxiliaryKeywords: true, auxiliaryKeywordQueries: ['Pet', 'Chair'] },
+    fastProbe: async url => { probes.push(url); return { ok: true, items: [], products: 40, totalPages: 2 }; } });
+  await f.api.tick();
+  const lane = (await f.api.status()).lanes[0];
+  const role = await f.message(lane.tabId, 'reviewer:role');
+  for (const page of [1, 2]) {
+    assert.equal((await f.message(lane.tabId, 'reviewer:page', { generation: role.generation, page,
+      items: [{ item_id: `ip-${1000000 + page}` }] })).ok, true);
+  }
+  f.tabs.get(lane.tabId).url = `${home}?q=Pet&queryNups=Pet&page=3`;
+  const ack = await f.message(lane.tabId, 'reviewer:unusable', { generation: role.generation,
+    reason: 'Page 3 is blank', failureCode: 'render-timeout' });
+  assert.equal(ack.recover, 'complete');
+  const saved = f.local.data.reviewerAuxiliaryScans.lanes.keywords;
+  assert.equal(saved.targets[0].coverageStatus, 'complete');
+  assert.equal(saved.targets[0].pages, 2);
+  assert.equal(saved.failures, 0);
+});
+
+test('a blank page after only some delivered pages keeps the ordinary retry', async () => {
+  const f = fixture({ settings: { auxiliaryKeywords: true, auxiliaryKeywordQueries: ['Pet'] },
+    fastProbe: async () => ({ ok: true, items: [], products: 40, totalPages: 3 }) });
+  await f.api.tick();
+  const lane = (await f.api.status()).lanes[0];
+  const role = await f.message(lane.tabId, 'reviewer:role');
+  await f.message(lane.tabId, 'reviewer:page', { generation: role.generation, page: 1, items: [{ item_id: 'ip-1000001' }] });
+  const ack = await f.message(lane.tabId, 'reviewer:unusable', { generation: role.generation,
+    reason: 'Page 2 is blank', failureCode: 'render-timeout' });
+  assert.equal(ack.recover, 'waiting');
+  assert.equal(f.local.data.reviewerAuxiliaryScans.lanes.keywords.targets[0].coverageStatus, 'unresolved');
 });

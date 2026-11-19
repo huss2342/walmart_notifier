@@ -21,6 +21,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -232,6 +233,7 @@ def _safe_summary(summary: object) -> dict[str, int | float | None]:
         "pending",
         "seeded",
         "queued",
+        "invalid",
         "value_known",
         "value_unknown",
         "min_value_usd",
@@ -409,6 +411,68 @@ def _telegram_status_text(runtime: RuntimeStatus, store: SeenStore) -> str:
     return "\n".join(lines)
 
 
+# Research reads: an owner-written list (data/research-reads.json) of reviewer
+# list pages the extension reads once through its normal rate limiter, never a
+# product page; the replies are appended to data/research-results.jsonl.
+MAX_RESEARCH_READS = 60
+MAX_RESEARCH_RESULT_BYTES = 8 * 1024 * 1024
+RESEARCH_ID = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+RESEARCH_URL = "https://www.walmart.com/reviews/claim-product"
+RESEARCH_LOCK = threading.Lock()
+
+
+def load_research_reads(path: Path) -> list[dict]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    reads = raw.get("reads") if isinstance(raw, dict) else None
+    if not isinstance(reads, list) or len(reads) > MAX_RESEARCH_READS:
+        raise ValueError("research reads must be a short list")
+    checked = []
+    for read in reads:
+        rid = read.get("id") if isinstance(read, dict) else None
+        url = read.get("url") if isinstance(read, dict) else None
+        listed = isinstance(url, str) and len(url) <= 800 and (
+            url == RESEARCH_URL or url.startswith(RESEARCH_URL + "?"))
+        if not (isinstance(rid, str) and RESEARCH_ID.fullmatch(rid) and listed):
+            raise ValueError("invalid research read")
+        checked.append({"id": rid, "url": url})
+    return checked
+
+
+class IntakeGate:
+    """Lets shutdown finish the /ingest requests already inside and refuse later ones.
+
+    Nov 19, 11:05 CST: an upload that reached the backend while it stopped got
+    a 503 from a half-stopped queue (OperationalError), and the restock it
+    confirmed was lost. Stopping now closes this gate before anything else.
+    """
+
+    def __init__(self):
+        self._changed = threading.Condition()
+        self._active = 0
+        self._closed = False
+
+    def enter(self) -> bool:
+        with self._changed:
+            if self._closed:
+                return False
+            self._active += 1
+            return True
+
+    def leave(self) -> None:
+        with self._changed:
+            self._active -= 1
+            self._changed.notify_all()
+
+    def close(self, timeout: float) -> bool:
+        """Refuse new uploads; True once every upload inside has finished."""
+        with self._changed:
+            self._closed = True
+            return self._changed.wait_for(lambda: self._active <= 0, timeout)
+
+
 class Handler(RequestLoggingMixin, BaseHTTPRequestHandler):
     server_version = "ReviewerNotifier/2.1"
 
@@ -425,6 +489,7 @@ class Handler(RequestLoggingMixin, BaseHTTPRequestHandler):
     scanner_commands: ScannerCommandsStore
     scanner_status: ScannerStatusStore
     telegram_commands: TelegramCommandPoller | None = None
+    intake_gate: IntakeGate = IntakeGate()  # serve() installs a fresh one
 
     # --- helpers ------------------------------------------------------------
 
@@ -456,6 +521,43 @@ class Handler(RequestLoggingMixin, BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
         self._http_response_bytes = len(body)
+
+    def _research_path(self, name: str) -> Path | None:
+        return self.store.path.with_name(name) if self.store.path else None
+
+    def _send_research_reads(self) -> None:
+        path = self._research_path("research-reads.json")
+        try:
+            reads = load_research_reads(path) if path else []
+        except (OSError, ValueError, TypeError, RecursionError):
+            self._reply(500, {"error": "Invalid research-reads.json."})
+            return
+        self._reply(200, {"schemaVersion": 1, "reads": reads})
+
+    def _receive_research_result(self) -> None:
+        path = self._research_path("research-results.jsonl")
+        if path is None:
+            self._reply(503, {"error": "Research results unavailable."})
+            return
+        body = self._read_body(MAX_RESEARCH_RESULT_BYTES)
+        if body is None:
+            return
+        try:
+            result = json.loads(body.decode("utf-8"))
+            if not (isinstance(result, dict) and isinstance(result.get("id"), str)
+                    and RESEARCH_ID.fullmatch(result["id"])):
+                raise ValueError
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            self._reply(400, {"error": "Invalid research result."})
+            return
+        line = json.dumps({"received_at": time.time(), **result}, separators=(",", ":"))
+        try:
+            with RESEARCH_LOCK, path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except OSError:
+            self._reply(500, {"error": "Could not save research result."})
+            return
+        self._reply(200, {"ok": True})
 
     def _authorized(self) -> bool:
         if not self.token:
@@ -491,15 +593,47 @@ class Handler(RequestLoggingMixin, BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         path = self.path.split("?")[0].rstrip("/") or "/"
-        scanner_paths = ("/scanner-settings", "/scanner-commands", "/scanner-status")
+        scanner_paths = (
+            "/scanner-settings", "/scanner-commands", "/scanner-status", "/request-searches"
+        )
         protected = ("/", "/health", "/rules", "/browser-diagnostics", "/relay-settings",
                      *scanner_paths)
         if path in protected and not self._authorized():
             self._reply(403, "forbidden")
             return
+        if path == "/research-reads":
+            if not self._authorized() or not self._trusted_origin():
+                self._reply(403, "forbidden")
+                return
+            self._send_research_reads()
+            return
         if path in scanner_paths:
             if not self._trusted_origin():
                 self._reply(403, "forbidden origin")
+                return
+            if path == "/request-searches":
+                try:
+                    runtime = getattr(self.notifier, "requests", None)
+                    queries = runtime.search_queries() if runtime is not None else []
+                    # Elite (auto-claim app) requests get the same dedicated searches.
+                    elite = getattr(self.notifier, "elite_signal", None)
+                    if elite is not None:
+                        seen = {query.casefold() for query in queries}
+                        queries = queries + [query for query in elite.search_queries()
+                                             if query.casefold() not in seen]
+                except Exception:
+                    # Never expose private query text, member IDs or database paths.
+                    self._reply(503, {"error": "Request searches unavailable."})
+                    return
+                self.send_response(200)
+                body = json.dumps({"schemaVersion": 1, "queries": queries}).encode("utf-8")
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self._cors()
+                self.end_headers()
+                self.wfile.write(body)
+                self._http_response_bytes = len(body)
                 return
             self._read_scanner_control(path)
             return
@@ -652,7 +786,7 @@ class Handler(RequestLoggingMixin, BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.split("?")[0].rstrip("/")
         if path not in ("/ingest", "/test-notification", "/bot-check", "/rescan", "/relay-status",
-                        "/browser-diagnostics", "/scanner-status"):
+                        "/browser-diagnostics", "/scanner-status", "/research-results"):
             self._reply(404, "not found")
             return
         if not self._authorized():
@@ -665,6 +799,11 @@ class Handler(RequestLoggingMixin, BaseHTTPRequestHandler):
         if path == "/scanner-status":
             if self._require_json():
                 self._save_scanner_control(path)
+            return
+
+        if path == "/research-results":
+            if self._require_json():
+                self._receive_research_result()
             return
 
         if path == "/relay-status":
@@ -693,6 +832,19 @@ class Handler(RequestLoggingMixin, BaseHTTPRequestHandler):
         if body is None:
             self.runtime_status.record_failure("InvalidIngestRequest")
             return
+        # Shutdown closes this gate first: an upload arriving then is refused
+        # whole (503, the extension retries it) instead of meeting a queue that
+        # is half stopped; uploads already inside finish before anything stops.
+        if not Handler.intake_gate.enter():
+            self._http_error = "ShuttingDown"
+            self._reply(503, {"error": "notifier restarting; retry"})
+            return
+        try:
+            self._ingest(body)
+        finally:
+            Handler.intake_gate.leave()
+
+    def _ingest(self, body: bytes) -> None:
         try:
             items = parse_json_ingest_payload(body, source="extension")
         except (TypeError, ValueError) as exc:
@@ -706,9 +858,26 @@ class Handler(RequestLoggingMixin, BaseHTTPRequestHandler):
         try:
             if isinstance(self.notifier, DiscordNotifier):
                 summary = self.notifier.ingest(items, seed_only=seed_mode())
+                # Each observation the public projection refused, by public item
+                # id and fixed field/reason labels (the request id is attached).
+                dropped = {position for position, *_ in summary.invalid}
+                if self.operations is not None:
+                    for _, item_id, name, reason in summary.invalid:
+                        self.operations.emit(
+                            'intake_invalid_item', entry_point='http', item_id=item_id,
+                            field=name, reason=reason,
+                        )
+                    # $80+ comebacks: held, confirmed (announced), expired, outages.
+                    for stage, item_id, seconds in summary.back_again:
+                        self.operations.emit(
+                            'intake_back_again', entry_point='http', stage=stage,
+                            item_id=item_id, seconds=round(seconds, 1),
+                        )
                 # Preserve local observation diagnostics without using personal
                 # dedupe as an admission gate for the independent Discord queue.
-                for item in items:
+                for position, item in enumerate(items):
+                    if position in dropped:
+                        continue
                     self.store.mark_seen(
                         item.item_id, item.title, item.value_usd,
                         category=item.category, url=item.url,
@@ -725,6 +894,9 @@ class Handler(RequestLoggingMixin, BaseHTTPRequestHandler):
             self.runtime_status.record_failure(type(exc).__name__)
             if isinstance(self.notifier, DiscordNotifier):
                 if isinstance(exc, ValueError):
+                    # Unpublishable observations are dropped one by one in
+                    # ingest(); this is a batch the queue itself refused.
+                    log.warning("Discord intake refused the whole batch (ValueError).")
                     self._reply(400, {"error": "invalid Discord product observation"})
                     return
                 log.error("Discord intake failed (%s); retry required.", type(exc).__name__)
@@ -742,7 +914,8 @@ class Handler(RequestLoggingMixin, BaseHTTPRequestHandler):
         # number of new records; the snapshot is rewritten only on compaction.
         self.store.flush()
         if self.operations is not None:
-            counts = {'new', 'duplicates', 'queued', 'filtered', 'failed', 'pending', 'notified'}
+            counts = {'new', 'duplicates', 'queued', 'filtered', 'failed', 'pending', 'notified',
+                      'invalid', 'confirming'}
             self.operations.emit('intake_result', entry_point='http', items=summary.seen,
                 **{key: value for key, value in summary.as_dict().items() if key in counts})
         if summary.notified or summary.failed:
@@ -1077,6 +1250,7 @@ def _log_service_errors(callback):
             sink = Handler.operations
             if sink is not None and sink is not previous:
                 sink.emit('service_error', component='backend', error_type=type(exc).__name__)
+                sink.flush()
             raise
     return logged
 
@@ -1098,8 +1272,13 @@ def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
     with contextlib.suppress(AttributeError, OSError):
         sys.stdout.reconfigure(line_buffering=True)
 
+    Handler.intake_gate = IntakeGate()
     Handler.store = SeenStore(state_path)
-    Handler.operations = OperationalLog(Handler.store.path.parent if Handler.store.path else None)
+    # Request receipts are written by a background thread: on the Windows bind
+    # mount each append costs 8-18 ms, and /ingest used to wait for 3 of them.
+    Handler.operations = OperationalLog(
+        Handler.store.path.parent if Handler.store.path else None, background=True
+    )
     Handler.operations.emit('service_starting', component='backend')
     Handler.token = token
     Handler.notifier = build_notifier()
@@ -1192,6 +1371,10 @@ def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
     except KeyboardInterrupt:
         print("\nStopping.")
     finally:
+        # Close the intake first (Docker allows 15 s): uploads already inside
+        # finish, later ones get a 503 and are retried by the extension.
+        if not Handler.intake_gate.close(timeout=5):
+            log.warning("Stopping with an ingest request still running.")
         watchdog.stop()
         if isinstance(notifier, DiscordNotifier):
             notifier.stop()
@@ -1200,6 +1383,7 @@ def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
         Handler.store.close()
         httpd.server_close()
         Handler.operations.emit('service_stopped', component='backend')
+        Handler.operations.flush()
 
 
 def main() -> None:

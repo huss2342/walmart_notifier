@@ -10,14 +10,19 @@ const DIAGNOSTIC_EVENTS = new Set([
   'results-page-ready', 'navigation-retry', 'card-extraction', 'coverage-unresolved',
   'auxiliary-target-start', 'auxiliary-page-delivered', 'auxiliary-target-skipped', 'auxiliary-target-retry', 'auxiliary-error',
   'navigation-outcome', 'ingest-stage', 'auxiliary-target-complete', 'browser-error', 'sync-state', 'verification-state',
-  'focus-granted', 'focus-denied', 'focus-released', 'pager-clamped', 'page-repeat', 'page-state'
+  'focus-granted', 'focus-denied', 'focus-released', 'pager-clamped', 'page-repeat', 'page-state',
+  'scanner-state', 'scanner-recovery', 'user-activity', 'fast-read', 'restock-watch'
 ]);
 const DIAGNOSTIC_REASONS = new Set([
   'redirect', 'dom-marker', 'text', 'probe', 'missing-control', 'native-stalled', 'native-backoff',
   'unusable', 'unreachable', 'scheduled', 'manual', 'installed', 'failover',
   'empty-results', 'blank-timeout', 'waiting-turn', 'busy', 'user-active', 'expired',
   'unavailable', 'disabled', 'paused', 'revoked', 'not-authorized', 'manual-tab-active',
-  'activation-unavailable', 'not-scanner', 'selection-changed'
+  'activation-unavailable', 'not-scanner', 'selection-changed',
+  'progress-timeout', 'stale-document', 'passive-rebind', 'interior-empty', 'fast-read',
+  // user-activity triggers: which input or tab change started a yield window.
+  'input-pointerdown', 'input-click', 'input-keydown', 'input-wheel', 'input-touchstart',
+  'input-scroll', 'tab-activated'
 ]);
 const DIAGNOSTIC_NUMBERS = [
   'tabId', 'generation', 'documentId', 'page', 'targetPage', 'totalPages', 'delayMs', 'count', 'pages',
@@ -29,16 +34,61 @@ const DIAGNOSTIC_NUMBERS = [
   'pagerNumericTextCount', 'pagerTargetTextCount', 'pagerTargetAriaCount',
   'pagerHiddenCount', 'pagerMarkerCount', 'pagerPlaceholderHrefCount',
   'pagerTargetPlaceholderCount', 'pagerPageHrefCount', 'pagerOtherHrefCount',
-  'acceptedCount', 'rejectedCount', 'variantCount', 'outOfStockCount', 'missingValueCount'
+  'acceptedCount', 'rejectedCount', 'variantCount', 'outOfStockCount', 'missingValueCount',
+  // fast-read: stock mix, response size, CDN age and product count of one read.
+  'stockIn', 'stockOut', 'stockOther', 'bytes', 'ageSeconds', 'products',
+  // restock-watch: offer value and the timings around a return to stock.
+  'valueCents', 'awayMs', 'sinceOutMs', 'sinceReturnMs', 'outReads', 'reads'
 ];
-const DIAGNOSTIC_LANES = new Set(['home', 'departments', 'keywords', 'brands', 'priority']);
+const RESTOCK_STAGES = ['returned', 'confirmed', 'rejected', 'followup'];
+const RESTOCK_STOCK_STATES = ['in-stock', 'out-of-stock', 'absent'];
+const RESTOCK_SIGNALS = ['in', 'out', 'other', 'none'];
+const DIAGNOSTIC_LANES = new Set(['home', 'departments', 'keywords', 'brands', 'priority', 'requests',
+  'newest', 'value', 'value80', 'research']);
+const FAST_READ_OUTCOMES = ['items', 'blocked', 'error', 'unavailable'];
 const CARD_DECISIONS = new Set([
   'accepted', 'out-of-stock', 'variant', 'card-unavailable', 'not-free', 'missing-title'
 ]);
 const CARD_COUNTS = ['acceptedCount', 'rejectedCount', 'variantCount', 'outOfStockCount', 'missingValueCount'];
 const CLASSIFIED_FAILURES = new Set(['controls-unavailable', 'discovery-save-failed',
   'content-unresponsive', 'progress-timeout', 'selection-render-timeout',
-  'selection-document-timeout', 'selection-bind-failed', 'selection-unconfirmed']);
+  'selection-document-timeout', 'selection-bind-failed', 'selection-unconfirmed', 'interior-empty', 'card-unreadable']);
+const SCANNER_STATE_LABELS = {
+  phase: ['unknown', 'passive', 'starting', 'collecting', 'ingesting', 'ingest-retry',
+    'relay-retry', 'complete', 'empty-timeout', 'extension-reloaded', 'manual-browsing', 'navigating',
+    'recovering', 'transient-end-retry', 'waiting-content', 'waiting-navigation', 'waiting-selection',
+    'waiting-page-change', 'waiting-target-change', 'waiting-user', 'waiting-verification',
+    'waiting-focus', 'reading-page', 'waiting-traffic'],
+  focusReason: ['unknown', 'none', 'busy', 'waiting-turn', 'manual-tab-active', 'window-unfocused',
+    'user-active', 'not-authorized', 'expired', 'paused', 'disabled', 'unavailable', 'short-lease',
+    'hidden', 'cancelled', 'revoked', 'selection-changed', 'not-scanner', 'activation-unavailable'],
+  visibility: ['visible', 'hidden', 'unknown']
+};
+const SCANNER_STATE_FLAGS = ['reachable', 'active', 'busy', 'highTraffic', 'paused', 'enabled'];
+const SCANNER_STATE_NUMBERS = ['progressAt', 'lastActivityAt', 'nextActionAt'];
+const SCANNER_RECOVERY_REASONS = ['progress-timeout', 'stale-document', 'passive-rebind', 'interior-empty'];
+const SCANNER_RECOVERY_OUTCOMES = ['requested', 'accepted', 'deferred', 'unavailable'];
+const SCANNER_RECOVERY_DECISIONS = ['none', 'stale-document', 'progress-advanced', 'user-input',
+  'verification', 'traffic', 'scope-changed', 'receipt-missing', 'boundary-unproven',
+  'receiver-unavailable', 'cooldown', 'disabled', 'storage-unavailable'];
+
+function cleanScannerState(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const clean = {};
+  for (const [field, choices] of Object.entries(SCANNER_STATE_LABELS)) {
+    if (!choices.includes(value[field])) return null;
+    clean[field] = value[field];
+  }
+  for (const field of SCANNER_STATE_FLAGS) {
+    if (typeof value[field] !== 'boolean') return null;
+    clean[field] = value[field];
+  }
+  for (const field of SCANNER_STATE_NUMBERS) {
+    if (!Number.isSafeInteger(value[field]) || value[field] < 0 || value[field] > 1e15) return null;
+    clean[field] = value[field];
+  }
+  return clean;
+}
 const PAGE_STATE_STAGES = new Set(['empty-observed', 'empty-confirmation', 'fallback',
   'unusable', 'zero-page-complete', 'recovered']);
 const PAGE_STATE_LABELS = {
@@ -240,13 +290,13 @@ function scanMetricReport(state, now) {
 function cleanDiagnostic(event, details, at = Date.now()) {
   if (!DIAGNOSTIC_EVENTS.has(event)) return null;
   const entry = { at, event };
-  for (const field of ['requestId', 'streamId']) {
+  for (const field of ['requestId', 'streamId', 'targetId']) {
     if (typeof details?.[field] === 'string' && DIAGNOSTIC_HEX.test(details[field])) entry[field] = details[field];
   }
   if (entry.streamId && Number.isSafeInteger(details?.eventSeq) && details.eventSeq > 0 && details.eventSeq <= 1e15) {
     entry.eventSeq = details.eventSeq;
   } else delete entry.streamId;
-  if (['initial', 'late', 'live'].includes(details?.intakePhase)) entry.intakePhase = details.intakePhase;
+  if (['initial', 'late', 'live', 'fast'].includes(details?.intakePhase)) entry.intakePhase = details.intakePhase;
   if (event === 'ingest-stage') {
     if (!['queued', 'batch', 'complete'].includes(details?.stage) ||
         !['waiting', 'accepted', 'accepted-stale', 'rejected', 'retry', 'timeout', 'network',
@@ -274,9 +324,43 @@ function cleanDiagnostic(event, details, at = Date.now()) {
     entry.component = details.component;
     entry.outcome = details.outcome;
   }
+  if (event === 'fast-read') {
+    if (!FAST_READ_OUTCOMES.includes(details?.outcome) ||
+        !['newest', 'value', 'value80', 'requests', 'priority', 'departments', 'research'].includes(details?.lane)) return null;
+    entry.outcome = details.outcome;
+  }
+  if (event === 'restock-watch') {
+    // Public item ids and fixed labels only; never titles, URLs or raw field values.
+    if (typeof details?.itemId !== 'string' || !/^ip-\d{6,20}$/.test(details.itemId) ||
+        !RESTOCK_STAGES.includes(details?.stage) || !RESTOCK_STOCK_STATES.includes(details?.stockState)) return null;
+    entry.itemId = details.itemId;
+    entry.stage = details.stage;
+    entry.stockState = details.stockState;
+    if (['data', 'card'].includes(details.stockSource)) entry.stockSource = details.stockSource;
+    for (const field of ['signalV2', 'signalStatus']) {
+      if (RESTOCK_SIGNALS.includes(details[field])) entry[field] = details[field];
+    }
+    for (const field of ['signalOos', 'variant', 'conflict']) {
+      if (typeof details[field] === 'boolean') entry[field] = details[field];
+    }
+  }
   if (event === 'navigation-outcome') {
     if (!['ready', 'interrupted', 'timeout', 'http-error'].includes(details?.outcome)) return null;
     entry.outcome = details.outcome;
+  }
+  if (event === 'scanner-state' || event === 'scanner-recovery') {
+    if (!DIAGNOSTIC_LANES.has(details?.lane)) return null;
+    const state = cleanScannerState(details?.state);
+    if (!state) return null;
+    entry.state = state;
+    if (event === 'scanner-recovery') {
+      if (!SCANNER_RECOVERY_REASONS.includes(details?.reason) ||
+          !SCANNER_RECOVERY_OUTCOMES.includes(details?.outcome) ||
+          details?.decision !== undefined && !SCANNER_RECOVERY_DECISIONS.includes(details.decision)) return null;
+      entry.reason = details.reason;
+      entry.outcome = details.outcome;
+      if (details.decision !== undefined) entry.decision = details.decision;
+    } else if (details?.decision !== undefined) return null;
   }
   if (details?.responseStatus !== undefined && (!Number.isInteger(details.responseStatus) ||
       details.responseStatus !== 0 && (details.responseStatus < 100 || details.responseStatus > 599))) return null;
@@ -364,6 +448,109 @@ function recordDiagnostic(event, details = {}) {
     return { recorded: false };
   }).finally(() => { diagnosticPending -= 1; });
   return diagnosticTail;
+}
+
+const diagnosticTargetIds = new Map();
+
+// Correlation only. A target can move to another ordinal after unresolved work
+// is carried forward; the digest preserves identity without recording its key.
+async function diagnosticTargetId(key) {
+  try {
+    if (typeof key !== 'string' || !key || key.length > 4096 ||
+        typeof crypto === 'undefined' || !crypto.subtle || typeof TextEncoder === 'undefined') return null;
+    if (diagnosticTargetIds.has(key)) return await diagnosticTargetIds.get(key);
+    const pending = crypto.subtle.digest('SHA-256', new TextEncoder().encode(key))
+      .then(bytes => [...new Uint8Array(bytes)].slice(0, 16).map(value => value.toString(16).padStart(2, '0')).join(''));
+    if (diagnosticTargetIds.size >= 2048) diagnosticTargetIds.delete(diagnosticTargetIds.keys().next().value);
+    diagnosticTargetIds.set(key, pending);
+    try { return await pending; }
+    catch { diagnosticTargetIds.delete(key); return null; }
+  } catch { return null; }
+}
+
+function scannerDiagnosticState(context) {
+  const probe = context.probe;
+  const number = value => Number.isSafeInteger(value) && value >= 0 && value <= 1e15 ? value : 0;
+  return {
+    ...Object.fromEntries(Object.entries(SCANNER_STATE_LABELS).map(([field, choices]) =>
+      [field, choices.includes(probe?.[field]) ? probe[field] : 'unknown'])),
+    reachable: typeof probe?.ready === 'boolean' ? probe.ready : probe?.reachable === true,
+    active: probe?.active === true, busy: probe?.busy === true, highTraffic: probe?.highTraffic === true,
+    paused: context.paused === true, enabled: context.enabled !== false,
+    progressAt: number(context.progressAt), lastActivityAt: number(probe?.lastActivityAt),
+    nextActionAt: number(probe?.nextActionAt)
+  };
+}
+
+async function scannerDiagnosticContext(lane, context) {
+  const details = { lane, state: scannerDiagnosticState(context),
+    ...Object.fromEntries(['tabId', 'generation', 'documentId', 'page', 'round', 'targetIndex',
+      'elapsedMs', 'delayMs', 'attempt'].filter(field => Number.isSafeInteger(context[field]) &&
+        context[field] >= 0 && context[field] <= 1e15).map(field => [field, context[field]])) };
+  const targetId = DIAGNOSTIC_HEX.test(context.targetId || '') ? context.targetId
+    : await diagnosticTargetId(context.targetKey);
+  return { ...details, ...(targetId ? { targetId } : {}) };
+}
+
+// These helpers never propagate diagnostic failures into scanner authority or
+// work scheduling. Callers may fire and forget their promise.
+async function recordScannerRecovery(lane, reason, outcome, context = {}) {
+  try {
+    const decision = context.decision === undefined ? 'none' : context.decision;
+    return await recordDiagnostic('scanner-recovery', {
+      ...await scannerDiagnosticContext(lane, context), reason, outcome,
+      decision
+    });
+  } catch { return { recorded: false }; }
+}
+
+const SCANNER_RUNTIME_LOG_KEY = 'reviewerScannerRuntimeTelemetry';
+let scannerRuntimeTail = Promise.resolve();
+let scannerRuntimePending = 0;
+
+function recordScannerRuntime(lane, context = {}) {
+  if (scannerRuntimePending >= 32) {
+    diagnosticRejected += 1;
+    return Promise.resolve({ recorded: false });
+  }
+  scannerRuntimePending += 1;
+  // Capture the observed probe before another caller can change its object
+  // while hashing or a preceding recorder operation is pending.
+  const prepared = scannerDiagnosticContext(lane, context).catch(() => null);
+  const run = scannerRuntimeTail.then(async () => {
+    try {
+      const details = await prepared;
+      if (!details) return { recorded: false };
+      if (!cleanDiagnostic('scanner-state', details)) return { recorded: false };
+      const now = Date.now();
+      const stored = (await chrome.storage.session.get([SCANNER_RUNTIME_LOG_KEY]).catch(error => {
+        diagnosticStorageErrors += 1;
+        throw error;
+      }))[SCANNER_RUNTIME_LOG_KEY];
+      const previous = stored?.[lane];
+      // Timestamps from repeated attempts are useful at the next observation,
+      // but do not make unchanged scheduler waits emit on every status poll.
+      const stableState = Object.fromEntries(Object.entries(details.state)
+        .filter(([field]) => !['lastActivityAt', 'nextActionAt'].includes(field)));
+      const signature = JSON.stringify({ state: stableState,
+        ...Object.fromEntries(['tabId', 'generation', 'documentId', 'page', 'round', 'targetId']
+          .filter(field => Object.hasOwn(details, field)).map(field => [field, details[field]])) });
+      if (previous?.signature === signature && Number.isSafeInteger(previous.at) &&
+          previous.at <= now && now - previous.at < 60_000) return { recorded: false, suppressed: true };
+      const result = await recordDiagnostic('scanner-state', details);
+      if (!result.recorded) return result;
+      const gate = Object.fromEntries([...DIAGNOSTIC_LANES].filter(name => stored?.[name] &&
+        Number.isSafeInteger(stored[name].at) && typeof stored[name].signature === 'string' &&
+        stored[name].signature.length <= 4096).map(name => [name,
+          { at: stored[name].at, signature: stored[name].signature }]));
+      gate[lane] = { at: now, signature };
+      try { await chrome.storage.session.set({ [SCANNER_RUNTIME_LOG_KEY]: gate }); }
+      catch { diagnosticStorageErrors += 1; }
+      return result;
+    } catch { return { recorded: false }; }
+  });
+  scannerRuntimeTail = run.catch(() => ({ recorded: false }));
+  return scannerRuntimeTail.finally(() => { scannerRuntimePending -= 1; });
 }
 
 async function diagnosticReport() {

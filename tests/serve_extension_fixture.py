@@ -37,8 +37,8 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 1,
             )
             body = body.replace(
-                "<h1>Reviewer Item Relay</h1>",
-                "<h1>Reviewer Item Relay</h1><p><strong>Local test preview:</strong> "
+                "</h1>",
+                "</h1><p><strong>Local test preview:</strong> "
                 "permissions, storage and notifier responses are simulated.</p>",
                 1,
             )

@@ -38,6 +38,12 @@ let programmaticScrollUntil = 0;
 let lastSharedInteraction = 0;
 let lastFacetFocusReason = 'none';
 let expectedFacetInput = null;
+// Chrome marks every scroll event trusted, including page-load scroll
+// restoration, lazy-load scroll anchoring and site scripts. Logs showed those
+// alone kept every scanner yielding ~30% of the day. A person's scroll always
+// follows wheel/touch/key/pointer input, so a scroll counts only shortly after it.
+let lastPhysicalInput = 0;
+const SCROLL_INPUT_MS = 1_500;
 const interactionListeners = [];
 for (const evt of ['pointerdown', 'click', 'keydown', 'wheel', 'touchstart', 'scroll']) {
   const listener = (event) => {
@@ -65,6 +71,8 @@ for (const evt of ['pointerdown', 'click', 'keydown', 'wheel', 'touchstart', 'sc
     if (evt === 'scroll' &&
         (programmaticScroll || Date.now() < programmaticScrollUntil ||
           (navigationPending && ['waiting-page-change', 'waiting-target-change'].includes(phase)))) return;
+    if (evt === 'scroll' && Date.now() - lastPhysicalInput > SCROLL_INPUT_MS) return;
+    if (evt !== 'scroll') lastPhysicalInput = Date.now();
     if (navigationPending && phase === 'waiting-target-change' &&
         Date.now() - lastInteraction >= INTERACTION_GRACE_MS) {
       console.debug('Reviewer Item Relay: facet interrupted by input ' + JSON.stringify({
@@ -90,6 +98,8 @@ for (const evt of ['pointerdown', 'click', 'keydown', 'wheel', 'touchstart', 'sc
     expectedFacetInput = null;
     lastInteraction = Date.now();
     if (Number.isInteger(role.tabId) && Date.now() - lastSharedInteraction >= 1_000) {
+      // One record per yield window names what made every scanner pause.
+      if (Date.now() - lastSharedInteraction >= 30_000) diagnostic('user-activity', { reason: `input-${evt}` });
       lastSharedInteraction = Date.now();
       sendToWorker({ type: 'reviewer:user-active', generation: role.generation }).catch(() => {});
     }
@@ -157,6 +167,9 @@ interactionListeners.push(['visibilitychange', onScrollVisibilityChange]);
 const reviewerOrigin = new URL(location.href).origin;
 const initialDocumentHref = location.href;
 let initialDocumentDataCurrent = true;
+const initialDocumentReadyAt = Date.now();
+// A server-confirmed empty page is reported only after hydration had this long.
+const SERVER_EMPTY_SETTLE_MS = 3_000;
 let reviewerPathPattern = DEFAULT_PATH_PATTERN;
 // Full loads have a browser navigation clock; native page changes update this
 // same anchor. Loading, settling and local delivery all count toward spacing.
@@ -262,6 +275,8 @@ function diagnostic(event, details = {}) {
   sendToWorker({ type: 'reviewer:diagnostic', event,
     details: { ...details, page: currentPage(), generation: role.generation, documentId: RESULTS_DOCUMENT_ID,
       lane: role.auxiliary?.lane || 'home',
+      ...(role.auxiliary?.targetKey ? { targetKey: role.auxiliary.targetKey }
+        : role.auxiliary ? {} : { targetKey: 'home' }),
       ...Object.fromEntries(['round', 'targetIndex', 'attempt'].filter(k => Number.isSafeInteger(role.auxiliary?.[k]))
         .map(k => [k, role.auxiliary[k]])) } }).catch(() => {});
 }
@@ -484,7 +499,250 @@ function sweepingNow() {
   return isCurrent() && phase !== 'idle' && phase !== 'complete' && phase !== 'passive';
 }
 
+// --- fast reads ---------------------------------------------------------------
+// Reads a sorted catalogue page, or one department in its default order, from
+// the page's embedded data with an ordinary same-origin request (no render, no
+// scroll). Only fields the card reader also uses.
+const FAST_READ_BLOCK_RE = /px-captcha|robot or human|press\s*&(?:amp;)?\s*hold|access denied/i;
+
+function fastReadUrl(raw) {
+  try {
+    const url = new URL(raw);
+    if (url.origin !== 'https://www.walmart.com' || url.pathname !== '/reviews/claim-product') return null;
+    for (const [key, value] of url.searchParams) {
+      if (key === 'sort' && ['new', 'price_high'].includes(value)) continue;
+      if (key === 'page' && /^[1-9]\d?$/.test(value)) continue;
+      // A search: q and queryNups carry the same plain text.
+      if (['q', 'queryNups'].includes(key) && value.trim() && value.length <= 200 &&
+          !/[\p{C}]/u.test(value) && value === url.searchParams.get('q')) continue;
+      // One department, exactly as the department tab loads it.
+      if (key === 'catId' && /^\d{1,16}(?:_\d{1,16})*$/.test(value)) continue;
+      // The $80+ list: highest value first, listings with a version at $79+.
+      if (key === 'min_price' && value === '79') continue;
+      return null;
+    }
+    if (url.searchParams.has('q') !== url.searchParams.has('queryNups')) return null;
+    if (url.searchParams.has('min_price') &&
+        (url.searchParams.get('sort') !== 'price_high' || url.searchParams.has('q'))) return null;
+    if (url.searchParams.has('catId')) {
+      return url.searchParams.getAll('catId').length === 1 && !url.searchParams.has('sort') &&
+        !url.searchParams.has('q') ? url : null;
+    }
+    return url.searchParams.get('sort') ? url : null;
+  } catch { return null; }
+}
+
+function fastReadImage(raw) {
+  if (typeof raw !== 'string' || raw.length > 2048) return null;
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== 'https:' || url.hostname !== 'i5.walmartimages.com' || url.username ||
+        url.password || url.port || !/^\/(asr|seo)\//.test(url.pathname) ||
+        !/\.(avif|jpe?g|png|webp)$/i.test(url.pathname)) return null;
+    url.search = '';
+    url.hash = '';
+    return url.toString();
+  } catch { return null; }
+}
+
+// What Walmart's list data said about stock, as fixed labels (never raw text):
+// every field must agree for a real change, so a disagreement or a lone flip
+// points at the data rather than the shelf. canAddToCart/showAtc are false for
+// every free offer, in or out of stock, so they carry no evidence.
+const stockLabel = value => value === 'IN_STOCK' ? 'in' : value === 'OUT_OF_STOCK' ? 'out'
+  : typeof value === 'string' && value ? 'other' : 'none';
+
+function stockSignals(product) {
+  return {
+    source: 'data',
+    v2: stockLabel(product.availabilityStatusV2?.value),
+    status: stockLabel(product.availabilityStatus),
+    oos: typeof product.isOutOfStock === 'boolean' ? product.isOutOfStock : null,
+    variant: product.type === 'VARIANT'
+  };
+}
+
+function fastReadItems(product, query = '') {
+  if (product?.__typename !== 'Product' || !/^\d{6,20}$/.test(String(product.usItemId || ''))) return null;
+  const lines = product.priceInfo?.priceDetails?.priceLines;
+  const free = Array.isArray(lines) ? lines.find(line => line?.lineType === 'FREE_PRICE') : null;
+  if (!free) return null; // Same rule as the card reader: only free review offers.
+  const title = cleanTitle(product.name);
+  if (title.length <= 3) return null;
+  const raw = free.values?.find?.(value => value?.key === 'PRICE')?.value;
+  const value = typeof raw === 'string' && /^\d[\d,]*(?:\.\d{1,2})?$/.test(raw) ? parseFloat(raw.replace(/,/g, '')) : null;
+  let url = `https://www.walmart.com/ip/${product.usItemId}`;
+  try {
+    const canonical = new URL(product.canonicalUrl, 'https://www.walmart.com');
+    if (canonical.origin === 'https://www.walmart.com' && canonical.pathname.startsWith('/ip/')) {
+      url = canonical.origin + canonical.pathname;
+    }
+  } catch { /* Keep the ID URL. */ }
+  return {
+    item_id: `ip-${product.usItemId}`,
+    title,
+    value_usd: value,
+    url,
+    category: '',
+    badge: '',
+    image_url: fastReadImage(product.imageInfo?.thumbnailUrl) || '',
+    available: product.availabilityStatusV2?.value === 'IN_STOCK',
+    source: 'extension',
+    claims_remaining: null,
+    query,
+    stock: stockSignals(product) // Removed before the item leaves the extension.
+  };
+}
+
+async function fastRead(raw) {
+  const url = fastReadUrl(raw);
+  if (!url) return { ok: false, reason: 'scope' };
+  let response;
+  try {
+    response = await fetch(url.toString(), { credentials: 'include', cache: 'no-store' });
+  } catch { return { ok: false, reason: 'network' }; }
+  const status = response.status;
+  const finalPath = (() => { try { return new URL(response.url).pathname; } catch { return ''; } })();
+  if ([403, 412, 429].includes(status) || /^\/blocked/.test(finalPath)) return { ok: false, blocked: true, status };
+  if (finalPath !== '/reviews/claim-product' || status !== 200) return { ok: false, status };
+  const html = await response.text();
+  const match = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+  if (!match) return FAST_READ_BLOCK_RE.test(html) ? { ok: false, blocked: true, status } : { ok: false, status };
+  let page;
+  try { page = JSON.parse(match[1]).props?.pageProps; } catch { return { ok: false, status }; }
+  const variables = page?.initialSearchQueryVariables;
+  const expectedPage = Number(url.searchParams.get('page') || 1);
+  // Walmart must have applied this exact sort, department and page; otherwise
+  // the read proves nothing and the scanning tabs remain the source.
+  const query = url.searchParams.get('q') || '';
+  const catId = url.searchParams.get('catId');
+  // A department's default order carries no sort value in the page data.
+  const sorted = catId ? [undefined, null, '', 'best_match'].includes(variables?.sort)
+    : variables?.sort === url.searchParams.get('sort');
+  if (!sorted || Number(variables?.page || 1) !== expectedPage || String(variables?.query || '') !== query ||
+      String(variables?.min_price ?? '') !== (url.searchParams.get('min_price') || '') ||
+      (catId && String(variables?.catId ?? '') !== catId)) return { ok: false, status };
+  const result = page.initialData?.searchResult;
+  const stacks = result?.itemStacks;
+  if (!Array.isArray(stacks)) return { ok: false, status };
+  const seen = new Set();
+  const items = [];
+  let products = 0; // Every product on the page, free offer or not: zero means truly empty.
+  for (const product of stacks.flatMap(stack => Array.isArray(stack?.items) ? stack.items : [])) {
+    if (product?.__typename === 'Product') products += 1;
+    const item = fastReadItems(product, query);
+    if (!item || seen.has(item.item_id)) continue;
+    seen.add(item.item_id);
+    items.push(item);
+  }
+  const maxPage = result?.paginationV2?.maxPage;
+  const total = stacks[0]?.meta?.totalItemCount;
+  // Page-wide stock counts and transport facts: one item flipping on an
+  // otherwise identical page is a different story from the whole page changing,
+  // and a cached (Age) or truncated (bytes) response is a load problem.
+  const stock = { in: 0, out: 0, other: 0 };
+  for (const item of items) stock[item.stock.v2 === 'in' ? 'in' : item.stock.v2 === 'out' ? 'out' : 'other'] += 1;
+  const age = Number.parseInt(response.headers?.get?.('age') || '', 10);
+  return { ok: true, status, items, products, stock, bytes: html.length,
+    ...(Number.isSafeInteger(age) && age >= 0 ? { age } : {}),
+    ...(Number.isInteger(maxPage) ? { totalPages: maxPage } : {}),
+    ...(Number.isSafeInteger(total) && total >= 0 ? { totalItems: total } : {}) };
+}
+
+// Research reads: one reviewer LIST page named by the owner (data/research-
+// reads.json), summarised with every price field and page variable so list
+// behaviour can be studied. Never a product page; never ingested.
+const RESEARCH_PRIVATE = /^(zip|zipcode|postalcode|lat|latitude|lng|lon|longitude|address\w*|email|phone)$/i;
+
+function researchReadUrl(raw) {
+  try {
+    const url = new URL(raw);
+    if (url.origin !== 'https://www.walmart.com' || url.pathname !== '/reviews/claim-product' ||
+        url.username || url.password || url.hash) return null;
+    for (const [key, value] of url.searchParams) {
+      if (!/^[A-Za-z_]{1,32}$/.test(key) || value.length > 300 || /[\p{C}]/u.test(value)) return null;
+    }
+    return url;
+  } catch { return null; }
+}
+
+function researchPrimitives(value, limit = 80) {
+  const out = {};
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return out;
+  for (const [key, entry] of Object.entries(value).slice(0, limit)) {
+    if (RESEARCH_PRIVATE.test(key)) continue;
+    if (entry === null || ['number', 'boolean'].includes(typeof entry)) out[key] = entry;
+    else if (typeof entry === 'string') out[key] = entry.slice(0, 160);
+  }
+  return out;
+}
+
+function researchProduct(product, stack, position) {
+  const info = product.priceInfo && typeof product.priceInfo === 'object' ? product.priceInfo : {};
+  const prices = researchPrimitives(info);
+  for (const [key, entry] of Object.entries(info)) {
+    if (key === 'priceDetails' || !entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    for (const [inner, value] of Object.entries(researchPrimitives(entry, 20))) prices[`${key}.${inner}`] = value;
+  }
+  const lines = Array.isArray(info.priceDetails?.priceLines) ? info.priceDetails.priceLines : [];
+  return { stack, position, ...researchPrimitives(product, 200), prices,
+    lines: lines.slice(0, 8).map(line => [String(line?.lineType || '').slice(0, 40),
+      (Array.isArray(line?.values) ? line.values : []).slice(0, 6)
+        .map(value => `${value?.key}=${value?.value}`).join(' ').slice(0, 200)]),
+    stock: product.availabilityStatusV2?.value ?? null,
+    variants: Array.isArray(product.variantCriteria)
+      ? product.variantCriteria.slice(0, 6).map(entry => String(entry?.name || '').slice(0, 40)) : [] };
+}
+
+async function researchRead(raw) {
+  const url = researchReadUrl(raw);
+  if (!url) return { ok: false, reason: 'scope' };
+  const started = Date.now();
+  let response;
+  try {
+    response = await fetch(url.toString(), { credentials: 'include', cache: 'no-store' });
+  } catch { return { ok: false, reason: 'network' }; }
+  const status = response.status;
+  const finalPath = (() => { try { return new URL(response.url).pathname; } catch { return ''; } })();
+  if ([403, 412, 429].includes(status) || /^\/blocked/.test(finalPath)) return { ok: false, blocked: true, status };
+  if (finalPath !== '/reviews/claim-product' || status !== 200) return { ok: false, status, finalPath };
+  const html = await response.text();
+  const match = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+  if (!match) {
+    return FAST_READ_BLOCK_RE.test(html) ? { ok: false, blocked: true, status } : { ok: false, status, bytes: html.length };
+  }
+  let props;
+  try { props = JSON.parse(match[1]).props?.pageProps || {}; } catch { return { ok: false, status }; }
+  const result = props.initialData?.searchResult || {};
+  const stacks = Array.isArray(result.itemStacks) ? result.itemStacks : [];
+  const products = [];
+  stacks.forEach((stack, index) => (Array.isArray(stack?.items) ? stack.items : []).forEach((product, position) => {
+    if (products.length < 1000 && product && typeof product === 'object') {
+      products.push(researchProduct(product, index, position));
+    }
+  }));
+  return { ok: true, status, bytes: html.length, ms: Date.now() - started,
+    variables: researchPrimitives(props.initialSearchQueryVariables, 150),
+    pageProps: researchPrimitives(props, 150), pagePropsKeys: Object.keys(props).slice(0, 100),
+    searchResult: researchPrimitives(result, 100), searchResultKeys: Object.keys(result).slice(0, 100),
+    pagination: researchPrimitives(result.paginationV2, 40),
+    stacks: stacks.map((stack, index) => ({ index, ...researchPrimitives(stack, 40),
+      meta: researchPrimitives(stack?.meta, 40), items: Array.isArray(stack?.items) ? stack.items.length : 0 })),
+    facets: (Array.isArray(result.facets) ? result.facets : []).slice(0, 40).map(facet => ({
+      ...researchPrimitives(facet, 30),
+      values: (Array.isArray(facet?.values) ? facet.values : []).slice(0, 40).map(value => researchPrimitives(value, 20)) })),
+    products };
+}
+
 function onReviewerMessage(msg, _sender, sendResponse) {
+  if (msg?.type === 'reviewer:research-read') {
+    researchRead(msg.url).then(sendResponse, () => sendResponse({ ok: false, reason: 'error' }));
+    return true;
+  }
+  if (msg?.type === 'reviewer:fast-read') {
+    fastRead(msg.url).then(sendResponse, () => sendResponse({ ok: false, reason: 'error' }));
+    return true;
+  }
   if (msg?.type === 'reviewer:selection-revoked') {
     if (isCurrent(msg.generation) && typeof msg.leaseId === 'string') {
       revokedSelectionLeases.add(msg.leaseId);
@@ -559,29 +817,26 @@ function onReviewerMessage(msg, _sender, sendResponse) {
     return true;
   }
   if (msg?.type === 'reviewer:recover') {
-    if (isCurrent(msg.generation) && !relaying) {
-      if (phase !== 'waiting-user') {
-        if (navigationPending) {
-          const target = navigationTarget || location.href;
-          cancelPageWork();
-          queueWhenIdle(() => {
-            navigationPending = true;
-            navigationTarget = target;
-            diagnostic('navigation-fallback', { reason: 'native-stalled' });
-            if (isCurrent(msg.generation)) return navigateWithFocus(() => location.assign(target), msg.generation);
-          }, 1_000, 'recovering');
-        } else {
-          clearTimeout(actionTimer);
-          actionTimer = null;
-          nextActionAt = 0;
-          scheduleRelay(0, true);
-        }
-      }
-      lastActivityAt = Date.now();
-      sendResponse({ ok: true });
-    } else {
-      sendResponse({ ok: false });
+    const fields = ['expectedDocumentId', 'expectedProgressAt', 'expectedSweepStartedAt'];
+    if (fields.some(key => Object.hasOwn(msg, key))) {
+      const token = documentSession.capture();
+      (async () => {
+        if (!fields.every(key => Number.isSafeInteger(msg[key]) && msg[key] >= 0 && msg[key] <= 1e15) ||
+            msg.expectedDocumentId !== RESULTS_DOCUMENT_ID) return { ok: false };
+        const key = sweepStorageKey();
+        const stored = key ? (await readLocal([key]))[key] : null;
+        const number = value => Number.isFinite(value) && value > 0 ? value : 0;
+        const sameGeneration = stored?.generation === msg.generation;
+        if (!documentSession.current(token) ||
+            msg.expectedProgressAt !== (sameGeneration ? number(stored.lastProgressAt) : 0) ||
+            msg.expectedSweepStartedAt !== (sameGeneration ? number(stored.startedAt) : 0)) return { ok: false };
+        // No asynchronous boundary separates this final receipt check from
+        // touching timers. A new page/ACK keeps its own queued navigation.
+        return recoverCurrentDocument(msg);
+      })().then(sendResponse).catch(() => sendResponse({ ok: false }));
+      return true;
     }
+    sendResponse(recoverCurrentDocument(msg));
     return undefined;
   }
   // Compatibility with the previous background worker during an unpacked
@@ -596,6 +851,30 @@ function onReviewerMessage(msg, _sender, sendResponse) {
   return undefined;
 }
 if (extensionAvailable()) chrome.runtime.onMessage.addListener(onReviewerMessage);
+
+function recoverCurrentDocument(message) {
+  const progressTimeout = message.reason === 'progress-timeout';
+  if (!isCurrent(message.generation) || relaying || phase === 'complete' || phase === 'ingest-retry' ||
+      Date.now() - lastInteraction < INTERACTION_GRACE_MS ||
+      (phase === 'waiting-user' && !progressTimeout) || checkVerification() || !keepMonitoringScope()) return { ok: false };
+  if (navigationPending) {
+    const target = navigationTarget || location.href;
+    cancelPageWork();
+    queueWhenIdle(() => {
+      navigationPending = true;
+      navigationTarget = target;
+      diagnostic('navigation-fallback', { reason: 'native-stalled' });
+      if (isCurrent(message.generation)) return navigateWithFocus(() => location.assign(target), message.generation);
+    }, 1_000, 'recovering');
+  } else {
+    clearTimeout(actionTimer);
+    actionTimer = null;
+    nextActionAt = 0;
+    scheduleRelay(0, true);
+  }
+  lastActivityAt = Date.now();
+  return { ok: true };
+}
 
 /** Force the lazy pager into the DOM, then restore the user's scroll position. */
 async function revealPager() {
@@ -652,7 +931,14 @@ function idFromHref(href) {
 /** The nearest unambiguous product ancestor holding one retail value. */
 function cardFor(anchor) {
   const ownId = idFromHref(anchor.getAttribute('href') || '');
-  const normalized = text => text.replace(/\s+/g, ' ').trim().toLowerCase();
+  const normalized = text => {
+    let title = text.replace(/\s+/g, ' ').trim();
+    // Accessibility headings can prefix the badge while swatch labels omit
+    // it. The comma identifies that decoration; ordinary product words stay.
+    const badge = title.match(BADGE_RE);
+    if (badge && title.slice(badge[0].length).startsWith(',')) title = title.slice(badge[0].length + 1).trim();
+    return title.toLowerCase();
+  };
   let node = anchor.parentElement;
   for (let depth = 0; node && depth < CARD_MAX_DEPTH; depth += 1) {
     const ids = new Set([ownId]);
@@ -710,7 +996,7 @@ function cardFor(anchor) {
 
 function cleanTitle(raw) {
   let title = (raw || '').replace(/\s+/g, ' ').trim();
-  title = title.replace(BADGE_RE, '').trim();
+  if (BADGE_RE.test(title)) title = title.replace(BADGE_RE, '').replace(/^\s*,\s*/, '').trim();
   title = title.replace(/^view item(?:\s+for)?\b/i, '').trim();
   title = title.replace(TRAILING_PRICE_RE, '').trim();
   return title.slice(0, 250);
@@ -790,7 +1076,7 @@ function recordCardExtraction(decisions, items) {
   const priority = sample => sample.decision === 'accepted' && sample.valueCents === null ? 0
     : sample.outOfStock === true ? 1 : sample.decision === 'variant' ? 2
       : sample.decision === 'card-unavailable' ? 3 : sample.decision !== 'accepted' ? 4 : 5;
-  const lane = ['departments', 'keywords', 'brands', 'priority'].includes(role.auxiliary?.lane)
+  const lane = ['departments', 'keywords', 'brands', 'priority', 'requests'].includes(role.auxiliary?.lane)
     ? role.auxiliary.lane : 'home';
   const acceptedCount = observations.filter(sample => sample.decision === 'accepted').length;
   const details = { documentId: RESULTS_DOCUMENT_ID, lane, items,
@@ -856,7 +1142,8 @@ function collect(excludedIds = null, withEvidence = false) {
       available: !outOfStock,
       source: 'extension',
       claims_remaining: claims,
-      query
+      query,
+      stock: { source: 'card', oos: outOfStock } // Removed before the item leaves the extension.
     });
   }
   if (decisions) recordCardExtraction(decisions, byId.size);
@@ -908,7 +1195,9 @@ function totalPages() {
   return numbers.length ? Math.max(...numbers) : auxiliarySinglePageHint();
 }
 
-function auxiliarySinglePageHint() {
+// The first document's server search result, only while it still describes
+// exactly this URL (a client-side page change leaves it stale).
+function freshAuxiliaryResult() {
   if (location.href !== initialDocumentHref) initialDocumentDataCurrent = false;
   if (!role.auxiliary || !initialDocumentDataCurrent) return null;
   try {
@@ -916,7 +1205,6 @@ function auxiliarySinglePageHint() {
     if (!script?.textContent) return null;
     const data = JSON.parse(script.textContent).props?.pageProps;
     const variables = data?.initialSearchQueryVariables;
-    const result = data?.initialData?.searchResult;
     const url = new URL(location.href);
     const query = url.searchParams.get('queryNups') || url.searchParams.get('q') || '';
     const category = value => !value || value === '0' ? '' : String(value);
@@ -924,8 +1212,23 @@ function auxiliarySinglePageHint() {
         category(variables.catId) !== category(url.searchParams.get('catId')) ||
         String(variables.facet || '') !== (url.searchParams.get('facet') || '') ||
         Number(variables.page || 1) !== currentPage()) return null;
-    return result?.paginationV2?.maxPage === 1 && result.hasMorePages === false ? 1 : null;
+    return data?.initialData?.searchResult || null;
   } catch { return null; }
+}
+
+function auxiliarySinglePageHint() {
+  const result = freshAuxiliaryResult();
+  return result?.paginationV2?.maxPage === 1 && result.hasMorePages === false ? 1 : null;
+}
+
+// That server result holds no product at all and hydration has had its moment:
+// nothing will render, so the full render budget would only delay the
+// coordinator's own direct empty check (which still makes the decision).
+function auxiliaryServerEmpty() {
+  if (Date.now() - initialDocumentReadyAt < SERVER_EMPTY_SETTLE_MS) return false;
+  const stacks = freshAuxiliaryResult()?.itemStacks;
+  return Array.isArray(stacks) && !stacks.some(stack =>
+    Array.isArray(stack?.items) && stack.items.some(item => item?.__typename === 'Product'));
 }
 
 function sweepStorageKey() {
@@ -1210,6 +1513,11 @@ function resetAuxiliaryRenderWait() {
 // deadline still bounds a document that never obtains a usable turn.
 async function waitForAuxiliaryRender(generation, reason) {
   if (!isCurrent(generation) || checkVerification()) return false;
+  if (auxiliaryServerEmpty()) {
+    resetAuxiliaryRenderWait();
+    await reportUnusable(reason, generation, false, { failureCode: 'render-timeout' });
+    return false;
+  }
   const now = Date.now();
   const key = `${generation}:${location.href}`;
   if (auxiliaryRenderWait?.key !== key) {
@@ -1235,7 +1543,10 @@ async function waitForAuxiliaryRender(generation, reason) {
     return false;
   }
   if (wait.workMs >= EMPTY_PAGE_TIMEOUT_MS || now - wait.startedAt >= 300_000) {
-    const failureCode = wait.workMs >= EMPTY_PAGE_TIMEOUT_MS ? 'render-timeout' : 'render-opportunity-timeout';
+    const evidence = pageStateEvidence();
+    const failureCode = wait.workMs >= EMPTY_PAGE_TIMEOUT_MS
+      ? evidence.productLinks > 0 && evidence.offerLines > 0 ? 'card-unreadable' : 'render-timeout'
+      : 'render-opportunity-timeout';
     resetAuxiliaryRenderWait();
     await reportUnusable(reason, generation, false, { failureCode });
     return false;
@@ -1294,7 +1605,7 @@ async function ensureAuxiliaryTarget(generation) {
       if (filterMatches) return waitForAuxiliaryRender(generation,
         'The selected filter document did not render within its active rendering budget');
       if (!emptySince) emptySince = Date.now();
-      if (Date.now() - emptySince >= EMPTY_PAGE_TIMEOUT_MS) {
+      if (Date.now() - emptySince >= EMPTY_PAGE_TIMEOUT_MS || auxiliaryServerEmpty()) {
         await reportUnusable('The selected filter could not be authorized', generation);
       } else {
         phase = 'waiting-content';
@@ -1595,7 +1906,9 @@ async function requestPreparationFocus(generation, expiresAt, purpose) {
   const startedAt = Date.now();
   const operation = purpose || 'pager';
   const waitKey = `${generation}:${location.href}:${operation}`;
-  if (focusWait?.key !== waitKey) focusWait = { key: waitKey, at: startedAt };
+  if (focusWait?.key !== waitKey) {
+    focusWait = { key: waitKey, at: startedAt, denials: 0, reason: null, loggedAt: 0 };
+  }
   const waitingSince = focusWait.at;
   try {
     const reply = await Promise.race([
@@ -1614,11 +1927,23 @@ async function requestPreparationFocus(generation, expiresAt, purpose) {
       if (Number.isFinite(reply.until)) lastSelectionUntil = reply.until;
       lastSelectionLeaseId = typeof reply.leaseId === 'string' ? reply.leaseId : null;
     }
-    diagnostic(reply?.granted ? 'focus-granted' : 'focus-denied', {
-      operation, reason: reply?.granted ? undefined : reply?.reason || 'unavailable',
-      durationMs: Date.now() - startedAt,
-      elapsedMs: Math.max(0, Date.now() - waitingSince),
-      delayMs: Math.max(0, (reply?.until || Date.now()) - Date.now()) });
+    // Denials repeat every few seconds while a lane waits. Persisting each one
+    // costs a storage read/write and evicts useful history from the bounded
+    // ring, so log the first denial, reason changes and a once-a-minute
+    // heartbeat; the grant carries the total denial count for the wait.
+    const reason = reply?.granted ? undefined : reply?.reason || 'unavailable';
+    const wait = focusWait?.key === waitKey ? focusWait : null;
+    if (!reply?.granted && wait) wait.denials += 1;
+    const now = Date.now();
+    if (reply?.granted || !wait || reason !== wait.reason || now - wait.loggedAt >= 60_000) {
+      diagnostic(reply?.granted ? 'focus-granted' : 'focus-denied', {
+        operation, reason,
+        durationMs: now - startedAt,
+        elapsedMs: Math.max(0, now - waitingSince),
+        delayMs: Math.max(0, (reply?.until || now) - now),
+        ...(reply?.granted && wait ? { count: wait.denials } : {}) });
+      if (wait) { wait.reason = reason; wait.loggedAt = now; }
+    }
     if (reply?.granted && focusWait?.key === waitKey) focusWait = null;
     return reply;
   } catch { return null; } // The caller keeps the current page until focus is available.
@@ -2477,7 +2802,8 @@ async function handleEndPage(generation) {
     await reportUnusable(
       `Reviewer page ${page} still showed no results after ${attempts} confirmations`,
       generation,
-      true
+      true,
+      { revalidateBoundary: true, failureCode: 'interior-empty' }
     );
     return;
   }
@@ -2698,7 +3024,9 @@ async function reportUnusable(reason, generation, restartSweep = false, details 
   try {
     reply = await sendDocumentMessage({
       type: 'reviewer:unusable', generation, reason, documentId: RESULTS_DOCUMENT_ID,
-      ...(['document-http-error', 'render-timeout', 'render-opportunity-timeout', 'navigation-timeout'].includes(details.failureCode)
+      ...(details.revalidateBoundary === true && restartSweep ? { revalidateBoundary: true } : {}),
+      ...(['document-http-error', 'render-timeout', 'render-opportunity-timeout', 'navigation-timeout',
+        'interior-empty', 'card-unreadable'].includes(details.failureCode)
         ? { failureCode: details.failureCode } : {}),
       ...(Number.isInteger(details.responseStatus) && details.responseStatus >= 400 && details.responseStatus <= 599
         ? { responseStatus: details.responseStatus } : {}),

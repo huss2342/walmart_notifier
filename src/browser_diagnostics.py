@@ -22,6 +22,7 @@ from discord_bridge.rolling_logs import RollingLog
 
 from atomic_json import write_atomic_json
 from scanner_control import _FAILURE_CODES as _SCANNER_FAILURE_CODES
+from scanner_control import _FOCUS_REASONS as _SCANNER_FOCUS_REASONS
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +46,7 @@ _EVENTS = frozenset({
     "auxiliary-error", "auxiliary-target-retry", "navigation-outcome", "ingest-stage",
     "auxiliary-target-complete", "browser-error", "sync-state", "verification-state",
     "focus-granted", "focus-denied", "focus-released", "pager-clamped", "page-repeat", "page-state",
+    "scanner-state", "scanner-recovery", "user-activity", "fast-read", "restock-watch",
 })
 _REASONS = frozenset({
     "redirect", "dom-marker", "text", "probe", "missing-control", "native-stalled",
@@ -52,7 +54,9 @@ _REASONS = frozenset({
     "empty-results", "blank-timeout",
     "waiting-turn", "busy", "user-active", "expired", "unavailable", "disabled", "paused",
     "revoked", "not-authorized", "manual-tab-active", "activation-unavailable", "not-scanner",
-    "selection-changed",
+    "selection-changed", "progress-timeout", "stale-document", "passive-rebind", "interior-empty",
+    "input-pointerdown", "input-click", "input-keydown", "input-wheel", "input-touchstart",
+    "input-scroll", "tab-activated",
 })
 _MODES = frozenset({"none", "sweep", "high-value"})
 _NUMERIC_FIELDS = frozenset({
@@ -69,14 +73,33 @@ _NUMERIC_FIELDS = frozenset({
     "pagerNumericTextCount", "pagerTargetTextCount", "pagerTargetAriaCount",
     "pagerHiddenCount", "pagerMarkerCount", "pagerPlaceholderHrefCount",
     "pagerTargetPlaceholderCount", "pagerPageHrefCount", "pagerOtherHrefCount",
+    # fast-read: stock mix, response size, CDN age and product count of one read.
+    "stockIn", "stockOut", "stockOther", "bytes", "ageSeconds", "products",
+    # restock-watch: offer value and the timings around a return to stock.
+    "valueCents", "awayMs", "sinceOutMs", "sinceReturnMs", "outReads", "reads",
 })
+_RESTOCK_STAGES = frozenset({"returned", "confirmed", "rejected", "followup"})
+_RESTOCK_STOCK_STATES = frozenset({"in-stock", "out-of-stock", "absent"})
+_RESTOCK_SOURCES = frozenset({"data", "card"})
+_RESTOCK_SIGNALS = frozenset({"in", "out", "other", "none"})
+_RESTOCK_BOOLEANS = frozenset({"signalOos", "variant", "conflict"})
+_RESTOCK_KEYS = (frozenset({"itemId", "stockState", "stockSource", "signalV2", "signalStatus"})
+                 | _RESTOCK_BOOLEANS)
 _REPORT_KEYS = frozenset({
     "schemaVersion", "extensionVersion", "exportedAt", "settings", "verification", "events",
 })
 _CARD_COUNTS = frozenset({
     "acceptedCount", "rejectedCount", "variantCount", "outOfStockCount", "missingValueCount",
 })
-_LANES = frozenset({"home", "departments", "keywords", "brands", "priority"})
+# A month of events at ~37 direct reads a minute, to compare coverage across
+# releases. 2 MiB segments rotated ~48 times a day, so the 256-archive limit
+# alone held only about five days; 16 MiB segments rotate ~6 times a day.
+ARCHIVE_SEGMENT_BYTES = 16 * 1024 * 1024
+ARCHIVE_TOTAL_BYTES = 512 * 1024 * 1024
+_LANES = frozenset({
+    "home", "departments", "keywords", "brands", "priority", "requests", "newest", "value",
+    "value80", "research",
+})
 _CARD_DECISIONS = frozenset({
     "accepted", "out-of-stock", "variant", "card-unavailable", "not-free", "missing-title",
 })
@@ -87,7 +110,34 @@ _EVENT_KEYS = _NUMERIC_FIELDS | _CARD_COUNTS | {
     "at", "event", "reason", "mode", "lane", "samples", "failureCode", "operation",
     "stage", "state", "outcome", "requestId", "streamId", "intakePhase", "component",
     "statusCode", "errorStage", "errorReason", "releaseReason", "cleanupConfirmed", "transport",
+    "targetId", "decision",
+} | _RESTOCK_KEYS
+_SCANNER_STATE_LABELS = {
+    "phase": frozenset({
+        "unknown", "passive", "starting", "collecting", "ingesting", "ingest-retry",
+        "relay-retry", "complete", "empty-timeout", "extension-reloaded", "manual-browsing",
+        "navigating", "recovering", "transient-end-retry", "waiting-content", "waiting-navigation",
+        "waiting-selection", "waiting-page-change", "waiting-target-change", "waiting-user",
+        "waiting-verification", "waiting-focus", "reading-page", "waiting-traffic",
+    }),
+    "focusReason": _SCANNER_FOCUS_REASONS,
+    "visibility": frozenset({"visible", "hidden", "unknown"}),
 }
+_SCANNER_STATE_FLAGS = frozenset({
+    "reachable", "active", "busy", "highTraffic", "paused", "enabled",
+})
+_SCANNER_STATE_NUMBERS = frozenset({"progressAt", "lastActivityAt", "nextActionAt"})
+_SCANNER_STATE_KEYS = (frozenset(_SCANNER_STATE_LABELS)
+                       | _SCANNER_STATE_FLAGS | _SCANNER_STATE_NUMBERS)
+_SCANNER_RECOVERY_REASONS = frozenset({
+    "progress-timeout", "stale-document", "passive-rebind", "interior-empty",
+})
+_SCANNER_RECOVERY_OUTCOMES = frozenset({"requested", "accepted", "deferred", "unavailable"})
+_SCANNER_RECOVERY_DECISIONS = frozenset({
+    "none", "stale-document", "progress-advanced", "user-input", "verification", "traffic",
+    "scope-changed", "receipt-missing", "boundary-unproven", "receiver-unavailable", "cooldown",
+    "disabled", "storage-unavailable",
+})
 _PAGE_STATE_STAGES = frozenset({
     "empty-observed", "empty-confirmation", "fallback", "unusable", "zero-page-complete",
     "recovered",
@@ -237,11 +287,23 @@ def _page_state(value: object) -> dict:
     return clean
 
 
+def _scanner_state(value: object) -> dict:
+    data = _object(value, _SCANNER_STATE_KEYS)
+    clean = {field: _label(data[field], choices)
+             for field, choices in _SCANNER_STATE_LABELS.items()}
+    for field in _SCANNER_STATE_FLAGS:
+        if type(data[field]) is not bool:
+            raise ValueError(INVALID_REPORT)
+        clean[field] = data[field]
+    clean.update({field: _integer(data[field]) for field in _SCANNER_STATE_NUMBERS})
+    return clean
+
+
 def _event(value: object) -> dict:
     data = _object(value, frozenset({"at", "event"}), _EVENT_KEYS)
     name = _label(data["event"], _EVENTS)
     clean = {"at": _integer(data["at"]), "event": name}
-    for field in ("requestId", "streamId"):
+    for field in ("requestId", "streamId", "targetId"):
         if field in data:
             clean[field] = _correlation_id(data[field])
     if ("streamId" in data) != ("eventSeq" in data):
@@ -249,7 +311,9 @@ def _event(value: object) -> dict:
     if "eventSeq" in data and _integer(data["eventSeq"]) < 1:
         raise ValueError(INVALID_REPORT)
     if "intakePhase" in data:
-        clean["intakePhase"] = _label(data["intakePhase"], frozenset({"initial", "late", "live"}))
+        clean["intakePhase"] = _label(
+            data["intakePhase"], frozenset({"initial", "late", "live", "fast"})
+        )
     if name.startswith("focus-"):
         clean["operation"] = _label(data.get("operation"), frozenset({
             "pager", "facet-controls", "page-scroll", "page-navigation",
@@ -289,11 +353,43 @@ def _event(value: object) -> dict:
             "settings", "commands", "status", "coordinator", "verification",
         }))
         clean["outcome"] = _label(data.get("outcome"), frozenset({"error", "recovered"}))
+    elif name == "fast-read":
+        clean["outcome"] = _label(
+            data.get("outcome"), frozenset({"items", "blocked", "error", "unavailable"})
+        )
+        if data.get("lane") not in {"newest", "value", "value80", "requests", "priority",
+                                    "departments", "research"}:
+            raise ValueError(INVALID_REPORT)
+    elif name == "restock-watch":
+        # Public item ids and fixed labels only: the evidence behind a "Back in stock".
+        if type(data.get("itemId")) is not str or _ITEM_ID.fullmatch(data["itemId"]) is None:
+            raise ValueError(INVALID_REPORT)
+        clean["itemId"] = data["itemId"]
+        clean["stage"] = _label(data.get("stage"), _RESTOCK_STAGES)
+        clean["stockState"] = _label(data.get("stockState"), _RESTOCK_STOCK_STATES)
+        if "stockSource" in data:
+            clean["stockSource"] = _label(data["stockSource"], _RESTOCK_SOURCES)
+        for field in ("signalV2", "signalStatus"):
+            if field in data:
+                clean[field] = _label(data[field], _RESTOCK_SIGNALS)
+        for field in _RESTOCK_BOOLEANS & data.keys():
+            if type(data[field]) is not bool:
+                raise ValueError(INVALID_REPORT)
+            clean[field] = data[field]
     elif name == "navigation-outcome":
         clean["outcome"] = _label(
             data.get("outcome"), frozenset({"ready", "interrupted", "timeout", "http-error"})
         )
+    elif name == "scanner-recovery":
+        clean["reason"] = _label(data.get("reason"), _SCANNER_RECOVERY_REASONS)
+        clean["outcome"] = _label(data.get("outcome"), _SCANNER_RECOVERY_OUTCOMES)
+        if "decision" in data:
+            clean["decision"] = _label(data["decision"], _SCANNER_RECOVERY_DECISIONS)
     elif "outcome" in data:
+        raise ValueError(INVALID_REPORT)
+    if "decision" in data and name != "scanner-recovery":
+        raise ValueError(INVALID_REPORT)
+    if name != "restock-watch" and _RESTOCK_KEYS & data.keys():
         raise ValueError(INVALID_REPORT)
     if "component" in data and name not in {"browser-error", "sync-state"}:
         raise ValueError(INVALID_REPORT)
@@ -312,11 +408,14 @@ def _event(value: object) -> dict:
         clean["failureCode"] = _label(data["failureCode"], _SCANNER_FAILURE_CODES)
     if name.startswith("auxiliary-") and "lane" not in clean:
         raise ValueError(INVALID_REPORT)
-    if name == "page-state":
+    if name in {"scanner-state", "scanner-recovery"}:
+        _object(data, frozenset({"at", "event", "lane", "state"}), _EVENT_KEYS)
+        clean["state"] = _scanner_state(data["state"])
+    elif name == "page-state":
         _object(data, frozenset({"at", "event", "lane", "stage", "state"}), _EVENT_KEYS)
         clean["stage"] = _label(data["stage"], _PAGE_STATE_STAGES)
         clean["state"] = _page_state(data["state"])
-    elif "state" in data or "stage" in data and name != "ingest-stage":
+    elif "state" in data or "stage" in data and name not in {"ingest-stage", "restock-watch"}:
         raise ValueError(INVALID_REPORT)
     if name == "card-extraction":
         _object(data, frozenset({"at", "event", "lane", "samples"}) | _CARD_COUNTS, _EVENT_KEYS)
@@ -456,7 +555,7 @@ class BrowserDiagnosticsStore:
             self._archive_was_present = False
         self._archive = archive if archive is not None else (
             RollingLog(archive_path,
-                       max_bytes=2 * 1024 * 1024, total_bytes=16 * 1024 * 1024)
+                       max_bytes=ARCHIVE_SEGMENT_BYTES, total_bytes=ARCHIVE_TOTAL_BYTES)
             if self.path is not None else None
         )
         self._load()
@@ -581,8 +680,8 @@ class BrowserDiagnosticsStore:
             report = self._snapshot.get("report") or {}
             return {"receivedAt": self._snapshot["receivedAt"],
                     "eventCount": len(report.get("events", [])), "maxEvents": MAX_EVENTS,
-                    "maxSnapshotBytes": MAX_FILE_BYTES, "archiveMaxBytes": 2 * 1024 * 1024,
-                    "archiveTotalBytes": 16 * 1024 * 1024,
+                    "maxSnapshotBytes": MAX_FILE_BYTES, "archiveMaxBytes": ARCHIVE_SEGMENT_BYTES,
+                    "archiveTotalBytes": ARCHIVE_TOTAL_BYTES,
                     "archiveFailures": self._archive_failures,
                     "snapshotFailures": self._snapshot_failures,
                     "lastFailureAt": self._last_failure_at,

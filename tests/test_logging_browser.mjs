@@ -15,7 +15,9 @@ function area(initial = {}) {
 }
 function fixture({ local = area(), session = area(), send } = {}) {
   const requests = [];
-  const context = vm.createContext({ URL, Date, Promise, AbortController, crypto: webcrypto, setTimeout, clearTimeout,
+  let now = Date.now();
+  class Clock extends Date { static now() { return now; } }
+  const context = vm.createContext({ URL, Date: Clock, Promise, AbortController, TextEncoder, crypto: webcrypto, setTimeout, clearTimeout,
     console: { warn() {} }, FETCH_TIMEOUT_MS: 500,
     chrome: { storage: { local, session }, runtime: { getManifest: () => ({ version: '2.26.11' }) } },
     config: async () => ({ endpoint: 'http://127.0.0.1:8787/ingest', token: 'private-token',
@@ -29,8 +31,10 @@ function fixture({ local = area(), session = area(), send } = {}) {
       return { ok: true, status: 200, async text() { return JSON.stringify(body); } };
     }
   });
-  vm.runInContext(source + '\nthis.api = {recordDiagnostic, diagnosticReport, syncBrowserDiagnostics, cleanDiagnostic};', context);
-  return { api: context.api, local, session, requests, context };
+  vm.runInContext(source + '\nthis.api = {recordDiagnostic, diagnosticReport, syncBrowserDiagnostics, cleanDiagnostic,' +
+    'diagnosticTargetId: (...a) => diagnosticTargetId(...a), recordScannerRuntime: (...a) => recordScannerRuntime(...a),' +
+    'recordScannerRecovery: (...a) => recordScannerRecovery(...a)};', context);
+  return { api: context.api, local, session, requests, context, setNow(value) { now = value; } };
 }
 
 test('recorded events retain a persisted stream and increasing identity across worker restart', async () => {
@@ -115,6 +119,88 @@ for (const mutation of [r => ({ ...r, streamId: 'f'.repeat(32) }), r => ({ ...r,
   });
 }
 
+const scannerState = () => ({ phase: 'waiting-focus', focusReason: 'waiting-turn', visibility: 'hidden',
+  reachable: true, active: true, busy: false, highTraffic: false, paused: false, enabled: true,
+  progressAt: 90_000, lastActivityAt: 99_000, nextActionAt: 105_000 });
+
+test('scanner runtime and recovery retain only fixed labels, timestamps and stable hashed target identity', async () => {
+  const f = fixture(); f.setNow(100_000);
+  const key = 'keyword:Water Filter';
+  const targetId = await f.api.diagnosticTargetId(key);
+  assert.match(targetId, /^[0-9a-f]{32}$/);
+  assert.equal(targetId, await f.api.diagnosticTargetId(key));
+  assert.equal(targetId, '4098ca189c4e094477345c14831a9496');
+  const state = scannerState();
+  assert.deepEqual(clone(f.api.cleanDiagnostic('scanner-state', { lane: 'home', state, targetId,
+    targetKey: 'private-query', url: 'private-url' })), { at: 100_000, event: 'scanner-state', lane: 'home', state, targetId });
+  assert.equal(f.api.cleanDiagnostic('scanner-state', { lane: 'home', state: { ...state, phase: 'private-error' } }), null);
+  assert.equal(f.api.cleanDiagnostic('scanner-state', { state }), null);
+  await f.api.recordScannerRecovery('home', 'progress-timeout', 'deferred', { probe: {
+    ready: true, active: true, busy: false, highTraffic: false, phase: 'waiting-focus',
+    focusReason: 'waiting-turn', visibility: 'hidden', lastActivityAt: 99_000, nextActionAt: 105_000,
+    private: 'never-record' }, progressAt: 90_000, targetKey: key, tabId: 7, generation: 2, url: 'never-record' });
+  const r = await f.api.diagnosticReport();
+  assert.equal(r.events[0].event, 'scanner-recovery');
+  assert.equal(r.events[0].outcome, 'deferred');
+  assert.equal(r.events[0].targetId, targetId);
+  assert.deepEqual(clone(r.events[0].state), state);
+  assert.equal(JSON.stringify(r).includes('never-record'), false);
+  assert.equal(JSON.stringify(r).includes(key), false);
+});
+
+test('unchanged runtime timestamps cannot defeat the persisted one-minute heartbeat gate', async () => {
+  const f = fixture(); f.setNow(100_000);
+  const context = { probe: { ready: true, active: true, phase: 'waiting-focus', focusReason: 'waiting-turn',
+    visibility: 'hidden', lastActivityAt: 99_000, nextActionAt: 105_000 }, progressAt: 90_000,
+  tabId: 7, generation: 2, page: 3, targetKey: 'keyword:water filter' };
+  const first = await f.api.recordScannerRuntime('keywords', context);
+  assert.equal(first.recorded, true);
+  f.setNow(130_000); context.probe.lastActivityAt = 130_000; context.probe.nextActionAt = 135_000;
+  assert.equal((await f.api.recordScannerRuntime('keywords', context)).suppressed, true);
+  const restarted = fixture({ local: f.local, session: f.session }); restarted.setNow(159_999);
+  assert.equal((await restarted.api.recordScannerRuntime('keywords', context)).suppressed, true);
+  restarted.setNow(160_000);
+  assert.equal((await restarted.api.recordScannerRuntime('keywords', context)).recorded, true);
+  const r = await restarted.api.diagnosticReport();
+  assert.equal(r.events.length, 2);
+  assert.equal(r.events[1].state.lastActivityAt, 130_000);
+  restarted.setNow(160_001); context.progressAt = 160_001;
+  assert.equal((await restarted.api.recordScannerRuntime('keywords', context)).recorded, true,
+    'Acknowledged useful progress is a state transition');
+});
+
+test('concurrent summaries coalesce and failed writes do not suppress the next usable observation', async () => {
+  const f = fixture(); f.setNow(100_000);
+  const context = { probe: { ready: true, phase: 'collecting' }, generation: 4, progressAt: 90_000 };
+  const results = await Promise.all(Array.from({ length: 10 }, () => f.api.recordScannerRuntime('home', context)));
+  assert.equal(results.filter(result => result.recorded).length, 1);
+  f.local.fail = true;
+  assert.equal((await f.api.recordScannerRecovery('home', 'stale-document', 'unavailable', context)).recorded, false);
+  context.probe.phase = 'waiting-focus';
+  assert.equal((await f.api.recordScannerRuntime('home', context)).recorded, false);
+  f.local.fail = false;
+  assert.equal((await f.api.recordScannerRuntime('home', context)).recorded, true);
+  f.session.fail = true;
+  assert.equal((await f.api.recordScannerRuntime('home', context)).recorded, false);
+  f.session.fail = false;
+  f.setNow(160_000);
+  assert.equal((await f.api.recordScannerRuntime('home', context)).recorded, true);
+});
+
+test('invalid scanner recovery reasons and malformed state numbers never reach history', async () => {
+  const f = fixture();
+  for (const change of [{ busy: 1 }, { progressAt: 1.5 }, { nextActionAt: Infinity }, { visibility: 'private' }]) {
+    assert.equal(f.api.cleanDiagnostic('scanner-state', { lane: 'home', state: { ...scannerState(), ...change } }), null);
+  }
+  for (const change of [{ reason: 'private-error', outcome: 'accepted' }, { reason: 'progress-timeout', outcome: 'private' }]) {
+    assert.equal(f.api.cleanDiagnostic('scanner-recovery', { lane: 'home', state: scannerState(), ...change }), null);
+  }
+  assert.equal(await f.api.diagnosticTargetId(null), null);
+  assert.equal(await f.api.diagnosticTargetId(''), null);
+  f.context.crypto = {};
+  assert.equal(await f.api.diagnosticTargetId('another target'), null);
+});
+
 test('legacy backend success remains compatible without claiming archive acknowledgement', async () => {
   const f = fixture({ send: () => ({ ok: true }) });
   await f.api.recordDiagnostic('page-loaded');
@@ -137,6 +223,55 @@ test('ingest telemetry keeps only fixed stages, outcomes and strict request IDs'
   assert.equal(f.api.cleanDiagnostic('ingest-stage', { stage: 'private', outcome: 'accepted' }), null);
 });
 
+test('direct reads keep their lane, page totals and fast intake phase, nothing private', () => {
+  const f = fixture();
+  for (const lane of ['newest', 'value', 'requests', 'priority', 'departments']) {
+    const e = f.api.cleanDiagnostic('fast-read', { lane, outcome: 'items', page: 2, items: 40, new: 1,
+      totalPages: 25, targetIndex: 7, count: 1840, durationMs: 900, query: 'private search',
+      url: 'https://www.walmart.com/reviews/claim-product?catId=4044' }, 123);
+    assert.ok(e, lane);
+    assert.deepEqual([e.lane, e.totalPages, e.targetIndex, e.count], [lane, 25, 7, 1840]);
+    assert.equal(e.query, undefined);
+    assert.equal(e.url, undefined);
+  }
+  assert.equal(f.api.cleanDiagnostic('fast-read', { lane: 'home', outcome: 'items' }), null);
+  assert.equal(f.api.cleanDiagnostic('ingest-stage', { stage: 'queued', outcome: 'waiting',
+    intakePhase: 'fast', lane: 'value' }, 1).intakePhase, 'fast');
+  assert.equal(f.api.cleanDiagnostic('ingest-stage', { stage: 'queued', outcome: 'waiting',
+    intakePhase: 'burst', lane: 'value' }, 1).intakePhase, undefined);
+});
+
+test('restock-watch keeps the evidence behind a "Back in stock": ids, fixed labels and timings only', () => {
+  const f = fixture();
+  const e = f.api.cleanDiagnostic('restock-watch', { itemId: 'ip-20755219869', stage: 'returned',
+    stockState: 'in-stock', stockSource: 'data', signalV2: 'in', signalStatus: 'out', signalOos: false,
+    variant: true, conflict: true, valueCents: 19999, awayMs: 240000, sinceOutMs: 60000, outReads: 2,
+    lane: 'value80', page: 2, requestId: 'a'.repeat(32), title: 'private title', url: 'https://private.example',
+    signalOther: 'IN_STOCK' }, 123);
+  assert.ok(e);
+  assert.deepEqual([e.itemId, e.stage, e.stockState, e.stockSource, e.signalV2, e.signalStatus, e.signalOos,
+    e.variant, e.conflict, e.valueCents, e.awayMs, e.sinceOutMs, e.outReads, e.lane, e.page],
+  ['ip-20755219869', 'returned', 'in-stock', 'data', 'in', 'out', false, true, true, 19999, 240000, 60000, 2,
+    'value80', 2]);
+  assert.equal(e.requestId, 'a'.repeat(32));
+  for (const field of ['title', 'url', 'signalOther']) assert.equal(e[field], undefined, field);
+  // Unknown labels are dropped, never copied through.
+  const odd = f.api.cleanDiagnostic('restock-watch', { itemId: 'ip-20755219869', stage: 'followup',
+    stockState: 'absent', signalV2: 'IN_STOCK', signalStatus: 'maybe', signalOos: 'no', stockSource: 'page' }, 1);
+  assert.deepEqual([odd.signalV2, odd.signalStatus, odd.signalOos, odd.stockSource], [undefined, undefined, undefined, undefined]);
+  for (const bad of [{ itemId: 'ip-1' }, { itemId: '20755219869' }, { stage: 'armed' }, { stockState: 'gone' }]) {
+    assert.equal(f.api.cleanDiagnostic('restock-watch', { itemId: 'ip-20755219869', stage: 'returned',
+      stockState: 'in-stock', ...bad }, 1), null, JSON.stringify(bad));
+  }
+});
+
+test('direct reads log their stock mix, size, CDN age and product count', () => {
+  const f = fixture();
+  const e = f.api.cleanDiagnostic('fast-read', { lane: 'value80', outcome: 'items', page: 2, items: 41,
+    stockIn: 31, stockOut: 10, stockOther: 0, bytes: 1203425, ageSeconds: 37, products: 41 }, 123);
+  assert.deepEqual([e.stockIn, e.stockOut, e.stockOther, e.bytes, e.ageSeconds, e.products], [31, 10, 0, 1203425, 37, 41]);
+});
+
 const background = fs.readFileSync(new URL('../extension/background.js', import.meta.url), 'utf8');
 function ingestFixture({ fetchImpl, authorization } = {}) {
   const events = [], calls = [];
@@ -155,6 +290,7 @@ function ingestFixture({ fetchImpl, authorization } = {}) {
       return { ok: true, status: 200, async text() { return JSON.stringify({ seen: JSON.parse(init.body).items.length }); } };
     },
     auxiliaryScans: { async ownsTab() { return false; } },
+    restockWatch: { mark: async items => items },
     authorizedRole: authorization || (async () => ({ authorized: true, tabId: 1, state: { tabId: 1 } })),
     roleFor: () => ({ generation: 7, active: true })
   });
@@ -220,15 +356,16 @@ test('a successful post followed by a stale page acknowledgement never authorize
   assert.ok(f.events.some(e => e.outcome === 'accepted-stale' && e.documentId === 90 && e.requestId === 'a'.repeat(32)));
 });
 
-test('content diagnostics always include document, lane and opaque target context', async () => {
+test('content diagnostics include internal target identity for hashing at the recorder boundary', async () => {
   const text = fs.readFileSync(new URL('../extension/content.js', import.meta.url), 'utf8');
   const fn = text.slice(text.indexOf('function diagnostic('), text.indexOf('// Local diagnostic evidence'));
   const messages = [];
   const context = vm.createContext({ sendToWorker: async value => messages.push(value), RESULTS_DOCUMENT_ID: 123,
-    currentPage: () => 4, role: { generation: 7, auxiliary: { lane: 'keywords', round: 8, targetIndex: 9, attempt: 2 } } });
+    currentPage: () => 4, role: { generation: 7, auxiliary: { lane: 'keywords', targetKey: 'keyword:water filter',
+      round: 8, targetIndex: 9, attempt: 2 } } });
   vm.runInContext(fn + "\ndiagnostic('navigation-native',{targetPage:5});", context);
   assert.deepEqual(clone(messages[0].details), { targetPage: 5, page: 4, generation: 7, documentId: 123,
-    lane: 'keywords', round: 8, targetIndex: 9, attempt: 2 });
+    lane: 'keywords', targetKey: 'keyword:water filter', round: 8, targetIndex: 9, attempt: 2 });
 });
 
 test('partial durable acknowledgement leaves its unarchived tail eligible for retry', async () => {
@@ -283,4 +420,39 @@ test('auxiliary startup attribution uses its existing assignment before the firs
     lane: 'home', documentId: 123, page: 1 } }, { tab: { id: 42 } });
   assert.deepEqual(clone(recorded[0]), { event: 'page-loaded', generation: 9, lane: 'keywords',
     documentId: 123, page: 1, tabId: 42, round: 2, targetIndex: 4, attempt: 1 });
+});
+
+test('the stock evidence reaches the restock watch with its lane and request, and never the backend', async () => {
+  const f = ingestFixture();
+  const seen = [];
+  f.context.restockWatch = { mark: async (items, context) => { seen.push(context); return items; } };
+  const result = await f.api.enqueuePost([{ item_id: 'ip-20755219869', value_usd: 199.99, available: true,
+    stock: { source: 'data', v2: 'in', status: 'in', oos: false, variant: true } }], 2, async () => true,
+  { lane: 'value80', intakePhase: 'fast' });
+  assert.equal(result.ok, true);
+  assert.deepEqual([seen[0].lane, seen[0].page, seen[0].requestId], ['value80', 2, result.requestId]);
+  const sent = JSON.parse(f.calls[0].body).items[0];
+  assert.equal(sent.item_id, 'ip-20755219869');
+  assert.equal('stock' in sent, false, 'evidence is for the local log only');
+});
+
+test('a held restock is not sent until confirmed, and the fast reader is told how many were held', async () => {
+  const f = ingestFixture();
+  f.context.restockWatch = { mark: async items => items.map(entry => entry.item_id === 'ip-20689613492'
+    ? { ...entry, restockHold: true } : entry) };
+  const result = await f.api.enqueuePost([
+    { item_id: 'ip-20689613492', value_usd: 269.99, available: true, stock: { source: 'data', v2: 'in' } },
+    { item_id: 'ip-1234567', value_usd: 99, available: true },
+    { item_id: 'ip-7654321', value_usd: 99, available: false }], 1, async () => true, { lane: 'value' });
+  assert.equal(result.ok, true);
+  assert.equal(result.held, 1);
+  const sent = JSON.parse(f.calls[0].body).items;
+  assert.deepEqual(sent.map(entry => entry.item_id), ['ip-1234567'], 'held and out-of-stock offers stay local');
+  assert.ok(sent.every(entry => !('restockHold' in entry) && !('stock' in entry)));
+  // A page whose only offer is held sends nothing at all, and still reports the hold.
+  const lone = ingestFixture();
+  lone.context.restockWatch = { mark: async items => items.map(entry => ({ ...entry, restockHold: true })) };
+  const only = await lone.api.enqueuePost([{ item_id: 'ip-20689613492', value_usd: 269.99, available: true }], 1,
+    async () => true, { lane: 'value' });
+  assert.deepEqual([only.ok, only.held, lone.calls.length], [true, 1, 0]);
 });

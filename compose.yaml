@@ -15,16 +15,29 @@ services:
       PORT: 8787
       STATE_PATH: /app/data/seen.json
       USER_RULES_PATH: /app/data/rules.json
+      # SQLite on the Windows bind mount is ~13x slower per query. Databases
+      # live on a named volume; logs/config stay in ./data/discord_bridge.
+      DISCORD_QUEUE_PATH: /app/db/collector.sqlite3
+      DISCORD_WELCOME_PATH: /app/db/welcome.sqlite3
+      DISCORD_MEMBERSHIP_PATH: /app/db/membership.sqlite3
+      # Referral + Pro-grant ledgers (copied over from ./data/discord_bridge on
+      # first start; the old files stay there as a backup).
+      DISCORD_BILLING_DB_DIR: /app/db
+      DISCORD_PRIVATE_DIR: /app/data/discord_bridge
     ports:
       - "127.0.0.1:8787:8787"
     volumes:
       - type: bind
         source: ./data
         target: /app/data
+      - type: volume
+        source: discord-db
+        target: /app/db
     init: true
     read_only: true
     tmpfs:
-      - /tmp:size=16m,mode=1777
+      # SQLite spills sorts/GROUP BY temp files here; 16m filled up on big queries.
+      - /tmp:size=256m,mode=1777
     cap_drop:
       - ALL
     security_opt:
@@ -53,3 +66,6 @@ services:
       retries: 3
       start_period: 5s
       start_interval: 2s
+
+volumes:
+  discord-db:

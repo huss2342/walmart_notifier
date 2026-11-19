@@ -283,3 +283,19 @@ def test_startup_failure_is_logged_before_the_server_loop(tmp_path, monkeypatch)
     assert rows[-1]["error_type"] == "ValueError"
     assert "private startup data" not in json.dumps(rows)
     server.Handler.store.close()
+
+
+def test_background_operational_log_keeps_request_context_and_counts_writes(tmp_path):
+    sink = OperationalLog(tmp_path, background=True)
+    with bind_request("d" * 32):
+        assert sink.emit("http_request_started", entry_point="http", method="POST", route="/ingest")
+    assert sink.emit("service_started")
+    assert sink.flush()
+    rows = [json.loads(line) for line in sink._writer.path.read_text().splitlines()]
+    assert [row["event"] for row in rows] == ["http_request_started", "service_started"]
+    assert rows[0]["request_id"] == "d" * 32 and "request_id" not in rows[1]
+    assert sink.status()["events_written"] == 2 and sink.status()["last_error"] is None
+    sink._writer._write = lambda data: (_ for _ in ()).throw(OSError("disk gone"))
+    assert sink.emit("service_error")
+    assert sink.flush()
+    assert sink.status()["dropped_events"] == 1 and sink.status()["last_error"] == "storage"

@@ -2,7 +2,7 @@
 <meta charset="utf-8">
 <title>Scanner coverage regression</title>
 <style>body {font:16px system-ui;max-width:980px;margin:28px auto;line-height:1.5}#result{font-weight:700}#cards{border:1px solid #bbb;padding:16px}nav{padding:16px}img{max-width:24px}</style>
-<h1>Scanner coverage regression · 2.26.5</h1>
+<h1>Scanner coverage regression · current source</h1>
 <p>Local replay of captured public cards and pagination controls. No Walmart requests or live scanner settings.</p>
 <p id="result" role="status">Running…</p><ul id="checks"></ul>
 <div id="cards"></div>
@@ -37,6 +37,16 @@
     const variants = ['20786920734','20844210988','20827667279','19385610574','19341061402'];
     check(!items.some(item => variants.includes(item.item_id.replace('ip-', ''))), 'All five image-labelled variants excluded');
     check(!items.some(item => item.item_id === 'ip-19698913226' && item.available), 'Out-of-stock captured product never becomes eligible');
+    const primaryCard = document.querySelector('#cards').lastElementChild;
+    const badgedCard = primaryCard.cloneNode(true);
+    const heading = badgedCard.querySelector('h3');
+    heading.textContent = 'Best seller, ' + heading.textContent;
+    primaryCard.replaceWith(badgedCard);
+    const badged = collect().find(item => item.item_id === 'ip-19698913226');
+    check(badged?.available === false && badged.value_usd === 29.89,
+      'Badged heading matches its bound variants while retaining its own out-of-stock evidence');
+    check(badged?.title.startsWith('HOMRELEXA') && !badged.title.startsWith(','),
+      'Badge decoration does not pollute the captured product title');
     check(paginationNextState(35) === 'disabled', 'Visible disabled Next with matching current page supplies terminal evidence');
     check(paginationNextState(34) === 'unknown', 'Stale current-page marker cannot certify completion');
     const receipts = Array.from({length:100},(_,i)=>i+1);

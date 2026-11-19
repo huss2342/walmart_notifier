@@ -98,7 +98,7 @@ def test_new_priority_trimming_does_not_change_legacy_keyword_whitespace():
             ["  "],
             [" \ufeff \u2000\ufeff "],
             ["a" * 81],
-            [f"term-{i}" for i in range(25)],
+            [f"term-{i}" for i in range(33)],
             ["Chair", " chair "],
             ["Chair\x00"],
             ["Chair\x85"],

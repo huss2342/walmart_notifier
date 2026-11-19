@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "minimum_chrome_version": "120",
   "name": "Reviewer Item Relay",
-  "version": "2.26.13",
+  "version": "2.32.5",
   "description": "Relays items from your own signed-in reviewer page to the notifier running on this machine.",
   "permissions": [
     "storage",
@@ -10,7 +10,8 @@
     "activeTab",
     "downloads",
     "debugger",
-    "tabGroups"
+    "tabGroups",
+    "idle"
   ],
   "optional_permissions": ["nativeMessaging", "scripting"],
   "host_permissions": [

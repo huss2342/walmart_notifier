@@ -50,8 +50,8 @@ function priorityQueries(value) {
   if (value == null) return [...PRIORITY_QUERIES];
   const fromText = typeof value === 'string';
   const values = fromText ? value.split(/\r?\n/).map(query => query.trim()).filter(Boolean) : value;
-  if (!Array.isArray(values) || values.length > 24) {
-    throw new Error('Use at most 24 priority searches.');
+  if (!Array.isArray(values) || values.length > 32) {
+    throw new Error('Use at most 32 priority searches.');
   }
   const seen = new Set();
   const queries = [];
@@ -83,7 +83,11 @@ function auxiliaryQueries(value) {
     const query = entry.trim().replace(/\s+/g, ' ');
     if (!query) continue;
     if (query.length > 80) throw new Error('Each keyword must be 80 characters or fewer.');
-    const key = query.toLocaleLowerCase('en-US');
+    // The notifier rejects control characters; fail here with a clear message.
+    if (/[\p{Cc}\p{Cs}]/u.test(query)) throw new Error('Keywords cannot contain control characters.');
+    // Upper-then-lower approximates the notifier's casefold() ("Straße" ==
+    // "STRASSE"), so the browser never saves a list the notifier rejects.
+    const key = query.toLocaleUpperCase('en-US').toLocaleLowerCase('en-US');
     if (seen.has(key)) continue;
     seen.add(key);
     queries.push(query);
