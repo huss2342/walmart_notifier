@@ -11,7 +11,79 @@ server's private channels and role rules remain in force. See
 
 Runs entirely on your own machine. **No cloud account, no hosting bill, $0/month.**
 
+## Direct reads, $80+ coverage and restock alerts (2.28 to 2.32.4)
+
+- **Direct reads** (`fast-reads.js`): catalogue pages are read from their
+  server-rendered page data inside an open reviewer tab, without rendering or
+  scrolling. One read at a time, starts 1.4-1.8 s apart (about 37 a minute),
+  2.5 s for a day after any bot-check sign; the scanning tabs keep running.
+- **Highest value first:** `sort=price_high` page 1 every 10 s, other pages
+  holding $80+ offers every 20 s. Lane `value80` reads the `min_price=79` list
+  (the only list holding every $80+ offer, variant listings included): pages with
+  an $80+ offer every 40 s, the rest every 3 minutes. Newest listings, member
+  request searches, priority searches and department pages share the rest.
+- **Restock alerts** (2.32.0): an $80+ offer seen out of stock and back after
+  15+ minutes away is re-sent to Pro as "Back in stock", at most once an hour
+  per item. 2.32.1 logs every return (`restock-watch` events) so a false one can
+  be traced; see [logging](docs/logging.md#investigating-a-false-back-in-stock).
+  2.32.2 keeps a return flagged for 5 minutes, so a page whose upload failed (for
+  example during a backend restart) still triggers the alert when read again.
+  2.32.3 announces a return only when a second in-stock read 9+ s later
+  confirms it (its page is re-read 10 s after the first): on November 12 both
+  restock alerts were one-read blips of offers out of stock for days.
+  2.32.4 accepts only a re-read of the same page as confirmation (an out-of-stock
+  read on any page rejects the hold) and makes offers that blipped 3+ times in a
+  day stay in stock on one page for 60 s first.
+- **Research reads** (2.31.0): list pages named in `data/research-reads.json`
+  are read once and summarised to `data/research-results.jsonl`, never ingested.
+- **Settings page:** status comes first, with an overall state badge, a
+  direct-read card (latest read per lane, $80+ offers on the page, bot-check
+  pauses), dark mode and collapsible help. All settings and actions are unchanged.
+- **Backend latency:** request and delivery logs are written by a background
+  thread instead of on each request (`/ingest` p50 65 -> 42 ms, settings reads
+  36 -> 3 ms on the Windows bind mount); see [logging](docs/logging.md).
+
+Measured coverage and plans: [discovery speed](tasks/discovery-speed-plan-20261112.md),
+[$80+ coverage](tasks/80-plus-coverage-plan-20261112.md). Deploy the backend first,
+then reload the unpacked extension.
+
+## Dedicated member request searches
+
+Extension **2.27.0** automatically loads current Discord item requests from the
+authenticated local backend every 30 seconds. When requests exist, it opens one
+dedicated **Member request scan** tab alongside the existing scanners. Equivalent
+watches share a search, with no new request quota or paid tier. Each round searches
+all requested keywords or item IDs, reads their result pages using the existing
+scanner, then waits about one minute before repeating. This is a round interval,
+not a guarantee that every keyword is revisited every minute.
+
+Additions are appended without interrupting an active search; edits and deletions
+replace obsolete work on the next successful synchronization. Minimum-value and
+whole-word matching remain in the existing private DM delivery path. Shared
+intake deduplicates products seen by both broad and requested searches. Existing
+verification/traffic waits, pacing and global refresh-off behavior still apply.
+If the backend cannot supply current requests, only the dedicated lane pauses;
+the next successful sync restores it. Install the compatible backend, then reload
+the unpacked Chrome extension. No new credentials, hosting or Discord bot needed.
+
+See [request-search implementation and rollout](tasks/request-searches-20261108.md).
+
 ## Diagnosing an empty or stalled scanner
+
+Extension **2.26.15** removes stale auxiliary input guards, protects newly
+acknowledged progress from late recovery messages, and recognizes badged primary
+card headings. Historical scanner-state and recovery receipts now distinguish
+actual progress from repeated waits, and stable hashed target IDs survive queue
+reordering. Backend error receipts also identify local versus Discord throttling.
+See [navigation hardening and telemetry](tasks/navigation-hardening-20261104.md).
+
+Extension **2.26.14** repairs idle managed-tab activation and bounds homepage
+waits by useful page progress. A fully confirmed empty interior page can request
+a fresh, scoped pagination pass while retaining its previous receipt for diagnosis;
+ordinary rendering failures still resume their acknowledged checkpoint. Appending
+priority searches also preserves the current round, so kitchen terms can follow
+existing furniture terms. See [coverage audit and repair](tasks/coverage-repair-20261104.md)
+for measured revisit times, rollout state and remaining limits.
 
 Extension **2.26.13** adds an optional fourth, furniture-focused priority tab.
 It reuses the same deep-page reader, durable checkpoints, intake deduplication,
@@ -184,7 +256,7 @@ Do not run `run.ps1` at the same time because both would need port 8787.
 
 1. `chrome://extensions` → Developer mode → **Load unpacked** → pick
    `extension/`. If it was already installed, click **Reload** on its card and
-   verify that the displayed version is **2.26.13**.
+   verify that the displayed version is **2.26.15**.
 2. Open its **Options**. The defaults are already correct for a local server —
    endpoint `http://127.0.0.1:8787/ingest`, path `^/reviews/claim-product`.
 3. With **reviewer-item-notifier** running, click **Check connection**. This
@@ -286,6 +358,10 @@ browser session. Additional tabs increase total browsing traffic; scrolling and
 timing variation do not establish that challenges will be prevented.
 
 **Scanner workspace (2.26.0):** grouping and tab rotation are enabled by default.
+As of 2.26.16, a temporarily unreachable home reader keeps its reserved tab and
+checkpoint in the workspace; reconnecting does not open another scanner tab.
+New scanner tabs use the existing scanner window, including replacements, so
+switching to another Chrome window does not split newly created scanner groups.
 Owned home, department, keyword and enabled priority tabs join a blue **Reviewer scans** group in
 their existing window. Each page gets a focused reading turn with a smooth
 downward scroll, varying steps and timing, and a settled bottom before advancing.
@@ -319,7 +395,7 @@ not a price filter. It reads every page before advancing and shares fair turns
 and normal target-start spacing with the other lanes. Set its completed-round
 break independently from 1–120 minutes; global auto-refresh zero also suppresses
 automatic priority rounds. Settings are `auxiliaryPriority`,
-`auxiliaryPriorityQueries` (null uses defaults; at most 24 terms), and
+`auxiliaryPriorityQueries` (null uses defaults; at most 32 terms), and
 `auxiliaryPriorityRefreshMinutes`. Existing settings without these fields keep
 the fourth tab off. A short queue improves revisit frequency; it cannot force
 Walmart to render an item or promise a fixed time through traffic/loading pauses.

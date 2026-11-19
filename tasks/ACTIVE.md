@@ -1,6 +1,282 @@
 # Active handoff: private Discord and Whop setup
 
-Updated November 2, 2026 (America/Chicago).
+Updated November 12, 2026 (America/Chicago).
+
+## Audit fixes batch 2 (November 19 12:36 CST; backend live, extension 2.32.5 reload pending)
+
+Second audit (4 fresh reviewers) + owner coverage request. Rollback image
+`reviewer-notifier:before-fixes-20261119b`; backups in `data/fixes-20261119b/`
+(before-billing/, before-requests/, before-scanner/, topics.before.json,
+rearm_review.before.json, item_requests_card.before.json). Coverage evidence:
+`data/coverage-audit-20261119/` (72h: 188 $80+ events; corrected 180 alerted,
+55% within 60s; replay of the new rules: 186 alerted, 57% on time). Main
+remaining gap: ~29% of new $80+ items show in searches minutes before the
+price_high/min79 lists (lists lag). Owner approved only a same-load read shift;
+untested idea: ~20-read test of a broad sort=price_high search as a fresher list.
+
+- Scanner (2.32.5): `src/back_again.py` alerts $80+ offers unseen >=60 min then
+  seen twice >=9s apart (6h cooldown, shared with restock; state in back-again.json;
+  `DISCORD_BACK_AGAIN_ENABLED=false` disables). Shutdown 503s whole uploads; restock
+  returns stay queued in the extension until 2xx. Blip history in storage.local;
+  variant offers get the 60s steady check from the first hold. Read shift (34.68
+  reads/min unchanged): sort=new p1 every 5 min, empty searches 30 min, non-empty
+  searches ~7.1 min (was 9.7). `src/collector_prune.py` deletes `dispatches` rows
+  >14 days every 6h (jobs/items kept: dedupe). tmpfs /tmp 16m -> 256m (SQLite
+  temp files filled it).
+- Requests: catch-up drops only sold-out items; one catch-up per add (60s quiet,
+  5 min cap); `/request listed` request/min_value filters, page max 1000
+  (re-registered); parked ambiguous sends auto-resolve via one bounded DM-history
+  read; 11 stuck alerts re-armed (`failed/reconciled_undelivered`, send on next
+  sighting); /request outside #item-requests gets a private pointer; card line added.
+- Billing: returning-member check covers every plan of the product
+  (`list_memberships(any_plan=True)`; found a canceled old $20-plan member);
+  shared sellout file `data/discord_bridge/founding-sold-out` (bot + counter.py);
+  counter at sellout sets founding plans hidden AND stock 0 (verified: stock 0
+  makes existing checkout links "Out of stock"; temp plan "TEMP stock test"
+  plan_fzpmhKUg7wIx6 left hidden/stock 0, key lacks plan:delete); counter retries a
+  failed docker restart; founders counted per person, partial refunds excluded;
+  per-member role errors no longer stall the grant poll; one click cooldown shared
+  by all buttons incl. referral link; referral worker sees no-trial plans
+  (`extra_plan_prices`, friend-code hash unchanged) and caches empty Whop-linked
+  lookups 10 min; prices say "+ tax". Billing DBs moved to /app/db
+  (`DISCORD_BILLING_DB_DIR`; originals kept in data/discord_bridge).
+- Not done (latent/suspected): release a referrer reward applied to a membership
+  that ends unpaid (none live); trial reuse via a 2nd Whop account on an old
+  personal link; malformed Whop rows still fail the whole poll on purpose (a
+  skipped row could remove a payer's role).
+- Channel topics (#💳-welcome, #🆓24h-delayed-alerts) now say Try Pro free · 3 days.
+- 12:50 CST follow-up (owner): sub-$80 offers unseen >=24h re-post as "Back in stock"
+  on first sighting (no hold: department rounds are hours apart), capped
+  LOW_MAX_PER_HOUR=10 in src/back_again.py; core `restock_any_value` lets those
+  bypass the $80 restock floor. Alerts no longer show "Last observed" (it was frozen
+  at send time); back-in-stock alerts say "First listed". Rollback image
+  `reviewer-notifier:before-under80-20261119`. Watch `intake_back_again` confirmed
+  counts for sub-$80 noise (departments beyond the 25-page cap are seen sporadically).
+
+## Audit fixes batch (November 19; backend live, extension 2.32.4 reload pending)
+
+Owner asked for an audit, then approved a fix batch. Rollback image
+`reviewer-notifier:before-fixes-20261119`; source backups in
+`data/fixes-20261119/before/` (bot) and `before-scanner/` (extension/src).
+
+- **Item-request catch-up DMs** (one member hit ~946 Discord 413/40005 retries on
+  Nov 18: 10 full cards per bundle exceeded Discord's 6000-char embed cap).
+  New `payload_limits.py` validator + `request_render.py` compact catch-up list;
+  top 10 by value packed into as few DMs as fit ("(2 of 2)"), rest marked
+  `skipped/catchup_overflow` and shown by new `/request listed [page]` (registered
+  Nov 19 with `python -m discord_bridge.request_setup register --apply`). 413 /
+  400-50035 halves a bundle; single item fails `payload_too_large`, never re-sent.
+- **Pro access** (`pro_access.py`): role re-PUT for granted members every 120s in
+  batches of 5 (rejoiners get Pro back; 429 pauses until next poll); past_due keeps
+  Pro only if the membership has a real paid charge; founding sellout sticky
+  (`pro_meta.founding_sold_out`), founding count cached 60s; one free trial per
+  Discord ID: any earlier membership -> hidden no-trial plan
+  (`data/discord_bridge/no-trial-plans.json`: plan_fy75dCpoVZRHc -> plan_G5LXwoGoGT0lM,
+  plan_ADOMT0v8UqKSh -> plan_Qjzb2CkYohyUQ; created by
+  `data/fixes-20261119/no_trial_plans.py`, owner added plan:create; checkout verified
+  $15 due today, no trial). No-trial plans are outside referral `plan_prices` (friend
+  codes hash it) and use a separate WhopClient. Returning member + friend code ->
+  "codes are for new members". Mistyped code checks the local store before Whop.
+  Checkout buttons: own error texts, 10s per-member cooldown.
+- `/mytrial`: no Discord-trial row -> points to My account (Pro) or Try Pro free.
+- counter.py: counts founding + its no-trial copy, sold-out sticky in
+  counter-state.json, re-hides founding plans on every sold-out run if visible.
+- **Scanner** (extension 2.32.4, owner must reload): restock confirm only by the same
+  lane+page >=9s later, any OOS read cancels; 3+ blips/24h need 60s continuous in
+  stock. Replay: blocks the Nov 19 03:29 ip-20755219869 leak, the 4 real restocks
+  confirm on the same read. `/ingest` drops only invalid observations
+  (`intake_invalid_item` event) instead of 400-ing the page.
+- #plans-and-help staff reference rewritten (before: plans-and-help.before.json).
+
+## Redeem-code button + "My account" menu (November 18; live)
+
+Member feedback: a referral whop.com link made them connect Discord inside Whop
+("people may think they got ripped off when things don't link up"). Audit then:
+all 4 memberships had Pro (2 via bot metadata, 2 via Whop's Discord connect).
+
+- New `pro:redeem:v1` button "Have a referral code?" opens a one-field modal
+  (`pro:redeem-code:v1`). Submit -> `RedeemHandler` checks the code locally
+  (`ReferralStore.owner_of_code`, rejects unknown/own) and replies with the
+  member's personal checkout link + `&promoCode=<code>`. Verified live in Whop:
+  the session URL honors promoCode (3 days free -> 30% off -> $10.50 -> $15).
+  Discord ID rides in checkout metadata, so Pro unlocks with no Whop connect.
+- New `account:menu:v1` "My account" -> private menu (Manage subscription,
+  Payment methods, Bought on Whop? Link Discord, Get my referral link). No I/O;
+  the view is stopped before sending so discord.py never stores it.
+- Referral reply no longer shows the raw whop.com link; share steps are invite
+  -> tap Have a referral code? in #💳-welcome -> enter code.
+- Cards (data/redeem-code-20261118/cards.py; backup before.json, `--restore`):
+  welcome = Try Pro free + Have a referral code? / My account (fields removed,
+  shorter pitch); free card = Try Pro + Have a code? + Get my referral link;
+  how-to-use = Try Pro + My account. counter.py regexes still match (dry run
+  clean); its SOLD_OUT_PRO pitch shortened to match.
+- Rollback image `reviewer-notifier:before-redeem-20261118`; source backups in
+  data/redeem-code-20261118/before/.
+
+## 3-day Whop trial replaces 24h Discord trial (November 18; live)
+
+Owner asked for a card-required Whop trial instead of the automatic 24h Discord
+trial; 3 days chosen. Whop $15 founding and $30 plans now have a 3-day free
+trial, initial fee $0 (dashboard edit). Live checkout with a friend code shows
+"3 days free, then $10.50, then $15", so the once-only 30% promo lands on the
+first post-trial charge. Referral credit now accepts `subscription_cycle` as well
+as `subscription_create` (post-trial first charge); a trialing referrer's reward
+attaches to their trial membership, so it discounts their first paid month.
+Copy updated: Get Pro reply, Pro-unlocked DM, greeting, referral reply, and the
+welcome/free/how-to-use cards (button now "Try Pro free · 3 days"; originals in
+`data/trial-3day-20261118/before.json`). Welcome auto-trial disabled through
+`TrialStore.configure` (interaction `owner-cli-3day-whop-trial-20261118`);
+existing Discord trials expire normally. Founding spots: trial signups count
+toward the 25 only once their first post-trial charge is paid (owner rule):
+`pro_access.paid_founders` drives Get Pro and counter.py; Whop $15 stock set to
+unlimited; at sellout counter.py hides the plan (owner added plan:update; verified;
+HIDE-FAILED in counter.log if it breaks). Counter backup: data/trial-3day-20261118/counter.before.py. Landing and
+terms copy updated (no "no card / no automatic charge"); deployed Nov 18 as
+https://8f54cf9f.reviewer-alerts.pages.dev and verified live.
+
+## Restock confirmation (November 12; backend live, 2.32.3 reload pending)
+
+Owner reported two "Back in stock" alerts for offers out of stock on click
+(ip-20755219869 at 17:03, ip-20689613492 at 17:32 CST). Intake history (3 days)
+showed each was posted in stock on exactly two isolated single reads, never a
+sustained period; the new `restock-watch`/`fast-read` evidence for the second
+showed every Walmart stock field saying IN_STOCK for one read (page otherwise
+unchanged, no CDN Age, HTTP 200) and OUT_OF_STOCK 10.6 s later. Both restock
+alerts since 2.32.0 were such blips. Fix (2.32.3): the first in-stock read of a
+watched offer is held (not sent), its page is re-read 10 s later and re-sent even
+if unchanged (`mustSend`/`held`), and only an in-stock read 9+ s later announces
+it; out of stock, gone from its page, or no confirmation within 2 min rejects it.
+New stages `confirmed`/`rejected` deployed in image `restock-confirm-20261112`
+(rollback `before-restock-confirm-20261112`). Tests: 1,172 JS, full Python pass.
+Not committed.
+
+## Settings page, log-write latency, restock retry (November 12; backend live, 2.32.2 reload pending)
+
+Owner asked whether the notifier is ready to publish and invited UI/performance
+work. Measured: each JSONL append on the Windows bind mount costs 8-18 ms
+(open/close; 0.04 ms on tmpfs), and `/ingest` waited for 3-13 of them
+(`operations.jsonl` start/result, `delivery.jsonl` request matches/routing/intake),
+Discord sends for 2 more each; `/health` also scanned all ~93k seen records
+(~48 ms) while holding the store lock `/ingest` needs. Fix: `RollingLog(background=True)`
+(one writer thread per file, caller-built rows, file order, batched appends, one
+retry, `dropped_events`/`last_error` via callback, flush on shutdown) used only by
+`serve()` and the live bot's `DeliveryMonitor`; `/health` copies record refs under
+the lock and computes outside. Tests/CLI keep synchronous writes.
+
+Shipped by the parallel 17:22 `full-rebuild-20261112` image (built from the shared
+tree; rollback tag `before-full-rebuild-20261112`). Verified live: healthy, 0
+dropped/unparseable log lines, order intact; `/ingest` p50 65 -> 42 ms, p90 93 -> 55;
+`/relay-settings` 36 -> 3 ms, `/scanner-settings` 22 -> 4 ms; Pro due->sent p50 0.4 s.
+
+Options page redesigned (status first, overall badge, direct-read card from the
+retained `fast-read` diagnostics and `reviewerFastReads` backoff, dark mode,
+narrow layout, collapsible help; every ID, setting and action kept).
+
+Restock fix (2.32.2, extension only): `restock-watch.js` removed a returned offer
+from the watch before its upload, so a failed upload (each backend restart) lost
+the "Back in stock" alert on retry. A return now stays flagged for 5 minutes;
+the backend still alerts once (15+ min since the last in-stock sighting, 1 h
+cooldown; new assertion in `test_discord_bridge_runtime.py`). Owner reload of
+2.32.2 activates this and the settings page. Tests: 2,906 Python pass (1 skip;
+`test_discord_bridge_service.py`'s 413 test is flaky under load) and 1,165 JavaScript.
+Not committed. Next perf candidate: the extension rewrites its whole 300-event
+diagnostics ring to `chrome.storage` on every event (about 5 per second).
+
+## Dedicated member request searches (November 8)
+
+Extension 2.27.0 adds an automatic `requests` lane, fed every 30 seconds by the
+authenticated local `/request-searches` endpoint. It searches saved keyword/ID
+watches independently of broad scans and reuses existing intake and private DM
+matching. Equivalent watches share searches; additions preserve active progress,
+edits/removals revoke stale scopes, and backend failure pauses only this lane.
+No new request quota, paid tier, hosting or Discord bot. One extra managed scan
+tab is allocated when watches exist, with a one-minute break after each full
+round, preserving ordinary pacing and verification pauses.
+
+All 1,098 JavaScript tests and 2,841 Python tests pass (one existing platform
+skip). Backend deployed healthy with exact environment, mounts and settings
+preserved; private endpoint supplies 13 searches across three owners. Offline
+candidate smoke verifies intake/deduplication. Rollout details are tracked in
+[request-searches-20261108.md](request-searches-20261108.md). Chrome controls are
+unavailable in this chat, but the owner reloaded the extension. **2.27.0 is now
+verified live**: request lane enabled/reachable, 13 targets, and its first real
+page delivered four items (one new, three duplicates) to intake with HTTP 200
+at 11:53:37 CST. Current reading honors the existing `user-active` foreground
+wait. Existing unrelated workspace changes remain intact.
+
+## Four-tab workspace fix (November 5; active, browser cleanup pending)
+
+Prepared extension 2.26.16 for the owner's four-tab requirement. A reproduced
+temporary home-reader loss dropped its workspace identity/checkpoint and could
+open duplicates during fallback pagination. Retain its reserved identity while
+revoking authority, restore its checkpoint under a fresh generation, and create
+new scanners in the existing scanner window. Regression and rollout details:
+[tab-workspace-20261105.md](tab-workspace-20261105.md). All 1,090 JavaScript tests
+pass. Fresh local status confirms 2.26.16 active and four assigned scanner IDs.
+Browser control is disabled in Work settings; live tab-count/group verification
+and old-duplicate cleanup remain pending. Preserve unrelated edits.
+
+## Further navigation hardening (November 4; live and verified)
+
+Owner requested investigation and repair of other navigation/general issues and
+missing diagnostic evidence. Fixed indefinite auxiliary waits from stale input
+labels, primary recovery racing newer progress and rejected attempts receiving a
+success cooldown, and comma-prefixed listing badges rejecting valid primary
+cards. Added bounded scanner-state/recovery history, stable hashed target IDs,
+distinct interior-empty/card-unreadable failures and local/server throttle
+provenance. Historical ordinal target labels were corrected in the earlier
+audit; exact past query identity cannot be inferred from carried-forward slots.
+
+Final verification: **2,833 Python / one existing platform skip**, **1,086
+JavaScript**, 20 real-browser checks, Ruff/protocol/syntax/startup and independent
+review approved. Backend eight-module overlay **0739cd99b981** activated at
+**13:35:11 CST**, healthy, preserving runtime/settings and saved business data.
+Owner reloaded **Reviewer Item Relay 2.26.15**; fresh status and diagnostics verify
+the version, all four scanners reachable, settings/commands synchronized and
+unchanged 118/17 queries. Department/general progress survived; homepage completed
+page 12. The previously failing badged Bed card **20321560444** was naturally
+extracted with correct $35/OOS evidence at **13:44:17 CST**, acknowledged and its
+target completed at **13:44:22 CST**. New state/target metadata reached durable
+logs for all four lanes with zero sequence gaps, rejected events, storage/sync
+failures or unacknowledged overwrites. Old unresolved work remains reported;
+complete-round coverage/revisit speed is not yet established. Chrome's browser
+security policy required the owner reload, without a workaround. Full details
+and exact receipts: [navigation-hardening-20261104.md](navigation-hardening-20261104.md).
+
+## Missed-offer coverage repair (November 4; live and verified)
+
+Owner reported the BLACK+DECKER countertop water filter and golf net misses and
+selected **keep furniture first; add kitchen coverage**. Retained-history audit
+also found four absent robe/blanket IDs, a 44h26m homepage-intake gap, roughly
+169-minute keyword / 204-minute department ordinal-slot intervals, and a
+persistent stale page-10 checkpoint. Later audit corrected the inferred query
+names: carried unresolved targets reorder each round, so ordinal indices do
+not prove a fixed historical query identity.
+Measured Pro delivery median 2.13s/p95 4.32s makes discovery the larger delay.
+Exact historical trigger of the homepage gap remains unproven.
+
+Live browser **2.26.14** repairs scoped passive-tab rebind, preserves priority-prefix
+appends, adds strict confirmed-interior pagination revalidation and bounds
+homepage waits by useful progress. Ordinary checkpoints, full pages, request
+pacing and verification/input/traffic safeguards remain. Review and final
+integration checks passed: **2,792 Python / one existing platform skip**, **1,065
+JavaScript**, Ruff/protocol/syntax/startup and 18 real-browser fixture checks.
+The owner reloaded; fresh 2.26.14 telemetry was verified before applying settings
+at **12:53:38 CST**. Both query prefixes remain, now 118 general and 17 priority.
+General round 63/generation 7390 kept 103 completed targets and 311 pages;
+priority round 371/generation 4536 kept four completions and the same current
+furniture target. Natural Water Filter intake/completion and homepage pages
+10–12/full completion are verified. The previously missed golf net
+**20661869063** was naturally captured at **12:59:40 CST** and confirmed sent to
+Pro-all at **12:59:43 CST** (2.886s); price/category routes also sent. Fresh
+telemetry confirms all four scanners reachable and synchronized. Old unresolved
+counts remain honest; later complete-round revisit speeds are not yet measured.
+
+Chrome's browser security policy rejected opening its internal extension manager;
+the owner performed the reload. No workaround, backend
+restart, new scanner tab, social monitor or synthetic provider notification was
+used. Exact repair/verification/resumption path:
+[coverage-repair-20261104.md](coverage-repair-20261104.md).
 
 ## Trial request permission parity (November 2; live and verified)
 
