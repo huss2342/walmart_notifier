@@ -46,14 +46,15 @@ def test_optional_trial_role_is_accepted_and_restricted_to_pro_feeds(tmp_path):
     assert not client.permissions(state["channels"]["audit"], [TRIAL]) & (1 << 10)
 
 
-@pytest.mark.parametrize("positions", [(2, 1, 3), (1, 3, 2)])
-def test_trial_bot_must_manage_trial_but_cannot_manage_paid_pro(tmp_path, positions):
+@pytest.mark.parametrize("positions,ok", [((2, 1, 3), False), ((1, 3, 2), True)])
+def test_trial_bot_must_outrank_trial_and_may_manage_paid_pro(tmp_path, positions, ok):
+    # Since 2026-11-16 the bot grants paid Pro itself (pro_access.py).
     client, _, state = trial_server(tmp_path)
     trial, bot, pro = positions
     for role in client.roles:
         role["position"] = {TRIAL: trial, BOT_ROLE: bot,
                             state["roles"]["pro"]: pro}.get(role["id"], 0)
-    assert not audit(client, GUILD, state)["ok"]
+    assert audit(client, GUILD, state)["ok"] is ok
 
 
 def test_unconfigured_delivery_bot_cannot_gain_role_management(tmp_path):

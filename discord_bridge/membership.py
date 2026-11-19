@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import uuid
 
-from .api import DiscordError
+from .api import DiscordError, retry_local_contention
 from .welcome import WelcomeWorker, _snowflake
 
 _PAGE_SIZE = 1000
@@ -67,8 +67,12 @@ class MembershipWorker(WelcomeWorker):
         if "member_complete" not in settings:
             self._available()
             try:
-                rows = self.client.guild_members(
-                    self.guild, limit=_PAGE_SIZE, after=settings.get("member_after")
+                rows = retry_local_contention(
+                    self.client.guild_members,
+                    self.guild,
+                    limit=_PAGE_SIZE,
+                    after=settings.get("member_after"),
+                    stop_event=self.stop_event,
                 )
             except DiscordError as exc:
                 if exc.status in {401, 403}:
@@ -183,7 +187,7 @@ class MembershipWorker(WelcomeWorker):
 
             payload["embeds"][0]["description"] += (
                 "\n\n**Refer a friend**\nGive a friend 30% off their first month. "
-                "When they subscribe, you get 30% off your next month. "
+                "Once they pay, you get 30% off your next month. "
                 "Use the button below to get your personal link."
             )
             payload["components"] = [{"type": 1, "components": [referral_button()]}]

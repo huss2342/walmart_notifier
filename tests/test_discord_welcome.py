@@ -184,6 +184,27 @@ def test_explicit_429_retries_with_same_nonce_after_cooldown(tmp_path):
     assert posts(client)[1][2]["nonce"] == nonce
 
 
+def test_welcome_worker_logs_provider_rate_limit_metadata_without_changing_retry(tmp_path):
+    from discord_bridge.monitoring import DeliveryMonitor
+
+    worker, client, clock = make(tmp_path)
+    monitor = DeliveryMonitor(tmp_path / "logs", entry_point="collector_worker", console=False)
+    worker.event_sink = monitor.emit
+    client.source = [{"id": EVENT, "type": 0}]
+    worker.tick()
+    client.source.append(join(event_id(2)))
+    client.error = DiscordError("Private provider body", status=429, retry_after=120,
+                               provider_code=20028, global_limit=True, rate_limit_source="server")
+    assert advance(worker, clock)["throttled"]
+    rows = [json.loads(line) for line in monitor.path.read_text().splitlines()]
+    error = next(row for row in rows if row["event"] == "welcome_error")
+    assert error["status"] == 429 and error["provider_code"] == 20028
+    assert error["retry_after_seconds"] == 120 and error["global_limit"] is True
+    assert error["rate_limit_source"] == "server"
+    assert advance(worker, clock)["sent"] == 0 and len(posts(client)) == 1
+    assert "Private" not in json.dumps(rows) and USER not in json.dumps(rows)
+
+
 def test_ambiguous_send_reconciles_but_never_blindly_repings(tmp_path):
     worker, client, clock = make(tmp_path)
     client.source = [{"id": EVENT, "type": 0}]
@@ -400,3 +421,25 @@ def test_notifier_stops_welcome_before_closing_the_shared_client(tmp_path):
     assert not notifier._thread.is_alive()
     assert not notifier.welcome._thread.is_alive()
     assert closed == [True]
+
+
+def test_idle_polls_skip_the_audit_but_every_send_gets_a_fresh_one(tmp_path):
+    audits = []
+    verdict = {"ok": True}
+    worker, client, clock = make(tmp_path, auditor=lambda *_: audits.append(clock[0]) or verdict)
+    client.source = [join()]
+    worker.tick()
+    assert len(audits) == 1
+    for _ in range(5):
+        advance(worker, clock)
+    assert len(audits) == 1, "idle polls only read history"
+    client.source.append(join(event_id(2)))
+    assert advance(worker, clock)["sent"] == 1
+    assert len(audits) == 2 and audits[-1] == clock[0], "the send tick audits first"
+    client.source.append(join(event_id(3), user="1700000000000000009"))
+    verdict = {"ok": False}
+    result = advance(worker, clock)
+    assert result["blocked"] and result["sent"] == 0 and len(posts(client)) == 1
+    clock[0] += 600
+    worker.tick()
+    assert len(audits) == 4, "a failed audit is retried, idle audits resume every 10 min"

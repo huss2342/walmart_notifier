@@ -22,7 +22,7 @@ class _Server(ThreadingHTTPServer):
 
 def make_server(
     store: JobStore, *, key: str, port=8788, live=False, on_queued=None, on_accepted=None,
-    on_observed=None, event_sink=None,
+    on_observed=None, event_sink=None, elite_signal=None,
 ) -> ThreadingHTTPServer:
     if not isinstance(key, str) or not 32 <= len(key) <= 256 or any(c.isspace() for c in key):
         raise ValueError(
@@ -101,12 +101,20 @@ def make_server(
             except (ValueError, TypeError, UnicodeError, OSError):
                 self.reply(400, {"error": "invalid observation batch"})
                 return
+            routed = None
+            sink = event_sink
+            if elite_signal is not None:
+                sink, routed = elite_signal.capture(event_sink)
             try:
-                result = (store.record(items, event_sink=event_sink, request_event_sink=event_sink)
-                          if event_sink is not None else store.record(items))
+                result = (store.record(items, event_sink=sink, request_event_sink=event_sink)
+                          if sink is not None else store.record(items))
             except Exception:
                 self.reply(503, {"error": "durable intake unavailable; retry"})
                 return
+            if routed:
+                # New/restocked in-stock items go to the auto-claim phone; never blocks intake.
+                with suppress(Exception):
+                    elite_signal.offer(items, routed)
             if on_queued is not None:
                 on_queued()
             if on_accepted is not None:

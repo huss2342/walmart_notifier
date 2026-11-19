@@ -490,3 +490,13 @@ def test_hostile_provider_values_and_reasons_are_rejected_without_credits(tmp_pa
     with pytest.raises(ValueError):
         store.flag_exception(reward["reward_id"], "https://attacker.example/private-token")
     assert store.summary(MEMBER)["pending"] == 1
+
+
+def test_owner_of_code_matches_the_current_friend_code_case_insensitively(tmp_path):
+    store = make(tmp_path)
+    store.ensure_profile(MEMBER)
+    assert store.owner_of_code("FRIEND30") is None
+    store.set_friend_promo(MEMBER, promo_id="promo_friend", promo_code="Friend30x")
+    assert store.owner_of_code("friend30X") == MEMBER
+    assert store.owner_of_code("nope1234") is None
+    assert store.owner_of_code("bad code!") is None and store.owner_of_code(None) is None

@@ -18,7 +18,7 @@ def test_referral_component_works_in_public_guide_without_request_channel_guard(
         worker._referral_handler = ReferralHandler(REFERRAL_STATE, service)
         await sdk.on_interaction(interaction)
         assert service.calls and interaction.acknowledged
-        assert "Your referral link" in interaction.messages[-1][0]
+        assert "Your referral code" in interaction.messages[-1][0]
         assert interaction.messages[-1][1]["ephemeral"] is True
         assert client.calls == []
 

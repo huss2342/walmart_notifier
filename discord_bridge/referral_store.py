@@ -182,6 +182,18 @@ class ReferralStore:
         with self._db() as db:
             return _one(db, "SELECT * FROM referral_profiles WHERE discord_id=?", (discord_id,))
 
+    def owner_of_code(self, code):
+        """Discord ID whose live friend code this is (case-insensitive), else None."""
+        if not isinstance(code, str) or not re.fullmatch(r"[A-Za-z0-9]{6,64}", code):
+            return None
+        with self._db() as db:
+            row = db.execute(
+                "SELECT discord_id FROM referral_profiles "
+                "WHERE friend_promo_code IS NOT NULL AND lower(friend_promo_code)=?",
+                (code.lower(),),
+            ).fetchone()
+        return row[0] if row else None
+
     def profiles(self):
         with self._db() as db:
             return [

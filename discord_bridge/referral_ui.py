@@ -7,6 +7,7 @@ import logging
 import math
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit
 
@@ -24,7 +25,12 @@ _REPEATED = (
 )
 _BUSY = "Referral links are busy right now. Please try again in a moment."
 _MAX_JOBS = 2
+INVITE_URL = "https://discord.gg/VzwNcSgWBk"
 log = logging.getLogger(__name__)
+
+
+class ReplyError(ValueError):
+    """A safe, member-facing answer that ends the click without provider work."""
 
 
 def _id(value):
@@ -84,9 +90,14 @@ def _member_text(view):
     if membership not in {"active", "none", "conflict"}:
         raise ValueError("Invalid referral membership state")
     text = (
-        f"**Your referral link**\n<{url}>\nCode: `{code}`\n\n"
-        "Your friend gets **30% off their first month**. When they subscribe, "
-        "you get **30% off your next month**. Both memberships then renew at their normal price."
+        f"**Your referral code:** `{code}`\n\n"
+        "**Send your friend:**\n"
+        f"1. Join <{INVITE_URL}>\n"
+        "2. In #💳-welcome, tap **Have a referral code?**\n"
+        f"3. Enter `{code}`\n\n"
+        "They get 3 days free, then **30% off their first paid month**. "
+        "Pro unlocks for them automatically.\n"
+        "Once they pay, you get **30% off your next month** (even your first)."
         f"\nStandard plan price: **{_money(normal)}/month**."
     )
     if friend_normal != normal:
@@ -96,7 +107,7 @@ def _member_text(view):
         saved = queued + applied
         if saved:
             text += f"{saved} discounted month{'s' if saved != 1 else ''} saved. "
-        text += "Your discount will apply after you link a paid membership through Whop."
+        text += "Your discount goes on your first paid month once you start Pro (tap Try Pro free)."
     elif membership == "conflict":
         text += "Another promotion is active. Your referral discounts remain queued."
     elif applied and next_payment is not None:
@@ -121,7 +132,15 @@ def _member_text(view):
 class ReferralHandler:
     """Handle only this bot's fixed referral buttons; no Pro role is required."""
 
-    def __init__(self, state, service, *, timeout=30):
+    # Member-facing texts; subclasses (Pro checkout buttons) override these.
+    unavailable_text = _UNAVAILABLE
+    repeated_text = _REPEATED
+    busy_text = _BUSY
+    scope_text = _SCOPE_HELP
+    cooldown_text = "Give it a few seconds, then tap again."
+
+    def __init__(self, state, service, *, timeout=30, cooldown=0, clicks=None,
+                 clock=time.monotonic):
         if not isinstance(state, dict):
             raise ValueError("Referrals require valid server configuration")
         self.guild, self.bot = state.get("guild_id"), state.get("bot_user_id")
@@ -137,9 +156,14 @@ class ReferralHandler:
             raise ValueError("Invalid referral reply timeout")
         self.service = service
         self._timeout = timeout
+        self._format = _member_text
         self._lock = threading.Lock()
         self._closed = False
         self._inflight = set()
+        # Per-member click cooldown. ``clicks`` can be shared by every button
+        # handler so switching buttons does not get around it.
+        self._cooldown, self._clock = cooldown, clock
+        self._clicks = {} if clicks is None else clicks
         # Referral provider I/O must not occupy Discord's shared executor.
         # Admission below keeps the executor's normally unbounded queue empty.
         self._executor = ThreadPoolExecutor(max_workers=_MAX_JOBS, thread_name_prefix="referral-ui")
@@ -171,33 +195,49 @@ class ReferralHandler:
             await interaction.response.send_message(content, **options)
 
     def _admit(self, owner):
+        now = self._clock()
         with self._lock:
             if self._closed:
-                return _UNAVAILABLE
+                return self.unavailable_text
             if owner in self._inflight:
-                return _REPEATED
+                return self.repeated_text
+            last = self._clicks.get(owner)
+            if self._cooldown and last is not None and now - last < self._cooldown:
+                return self.cooldown_text
             if len(self._inflight) >= _MAX_JOBS:
-                return _BUSY
+                return self.busy_text
             self._inflight.add(owner)
+            if self._cooldown:
+                self._clicks[owner] = now
+                if len(self._clicks) > 5000:
+                    cutoff = now - self._cooldown
+                    for key in [k for k, v in self._clicks.items() if v < cutoff]:
+                        del self._clicks[key]
         return None
 
     def _release(self, owner):
         with self._lock:
             self._inflight.discard(owner)
 
-    def _work(self, owner):
+    def _argument(self, interaction):
+        """Per-click input (e.g. a typed code). Raise ReplyError to answer instead."""
+
+    def _view(self, owner, argument):
+        return self.service.member_view(owner)
+
+    def _work(self, owner, argument=None):
         try:
-            return self.service.member_view(owner)
+            return self._view(owner, argument)
         finally:
             # A timed-out/canceled Discord waiter cannot cancel a running thread.
             # Keep its admission until provider work actually finishes.
             self._release(owner)
 
-    def _submit(self, owner):
+    def _submit(self, owner, argument=None):
         with self._lock:
             if self._closed:
                 return None
-            future = self._executor.submit(self._work, owner)
+            future = self._executor.submit(self._work, owner, argument)
             # close() can cancel a job before its wrapper starts. In that case
             # there is no running provider operation whose finally will release.
             future.add_done_callback(lambda row: self._release(owner) if row.cancelled() else None)
@@ -222,7 +262,15 @@ class ReferralHandler:
         owner = self._owner(interaction)
         if owner is None:
             try:
-                await self._send(interaction, _SCOPE_HELP)
+                await self._send(interaction, self.scope_text)
+            except Exception:
+                log.warning("Referral private acknowledgement failed")
+            return
+        try:
+            argument = self._argument(interaction)
+        except ReplyError as exc:
+            try:
+                await self._send(interaction, str(exc))
             except Exception:
                 log.warning("Referral private acknowledgement failed")
             return
@@ -236,15 +284,15 @@ class ReferralHandler:
         submitted = False
         try:
             await interaction.response.defer(ephemeral=True, thinking=True)
-            future = self._submit(owner)
+            future = self._submit(owner, argument)
             if future is None:
-                await self._send(interaction, _UNAVAILABLE)
+                await self._send(interaction, self.unavailable_text)
                 return
             submitted = True
             wrapped = asyncio.wrap_future(future)
             wrapped.add_done_callback(self._observe)
             view = await asyncio.wait_for(asyncio.shield(wrapped), timeout=self._timeout)
-            await self._send(interaction, _member_text(view))
+            await self._send(interaction, self._format(view))
         except Exception as exc:
             await self.error(interaction, exc)
         finally:
@@ -256,6 +304,6 @@ class ReferralHandler:
         if not self.accepts(interaction):
             return
         try:
-            await self._send(interaction, _UNAVAILABLE)
+            await self._send(interaction, self.unavailable_text)
         except Exception:
             log.warning("Referral private reply failed")

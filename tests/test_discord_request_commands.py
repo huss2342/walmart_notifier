@@ -37,6 +37,7 @@ class Interaction:
         self.channel_id = int(channel) if channel else None
         self.messages, self.acknowledged = [], False
         self.deleted = 0
+        self.edited = []
         self.choices = None
         self.type = SimpleNamespace(value=4 if autocomplete else 2)
         self.response = SimpleNamespace(
@@ -64,6 +65,10 @@ class Interaction:
 
     async def delete_original_response(self):
         self.deleted += 1
+
+    async def edit_original_response(self, **kwargs):
+        assert kwargs["allowed_mentions"].to_dict()["parse"] == []
+        self.edited.append(kwargs["content"])
 
     async def autocomplete(self, choices):
         self.acknowledged, self.choices = True, choices
@@ -137,6 +142,18 @@ def invoke(method, *args, **kwargs):
     return asyncio.run(method(*args, **kwargs))
 
 
+POINTER = f"Use /request in <#{CHANNEL}>."
+
+
+def pointed_only(interaction):
+    """Elsewhere in the server: one private pointer to #item-requests, nothing else."""
+    assert [text for text, _ in interaction.messages] == [POINTER]
+    _, options = interaction.messages[0]
+    assert options["ephemeral"] is True
+    assert options["allowed_mentions"].to_dict()["parse"] == []
+    assert set(interaction.edited) <= {POINTER} and interaction.deleted == 0
+
+
 def make(roles=(PRO,), **interaction_options):
     interaction = Interaction(**interaction_options)
     client, store = Client(roles, interaction), Store()
@@ -169,11 +186,12 @@ def test_bulk_add_accepts_inline_minimum_and_lists_each_persistent_watch(tmp_pat
 
 def test_bulk_add_preflights_entire_batch_before_testing_dms(tmp_path):
     commands, interaction, client, store = real_commands(tmp_path)
-    for index in range(9):
-        store.add(USER, f"item {index}")
+    store.add(USER, "chair $50+")
+    # A conflicting minimum for an existing phrase rejects the whole batch
+    # before any DM test is attempted.
     invoke(commands.add, interaction, "chair, recliner", min_value=100)
-    assert len(store.list(USER)) == 9
-    assert "10" in interaction.messages[-1][0]
+    assert len(store.list(USER)) == 1
+    assert "different minimum" in interaction.messages[-1][0]
     assert not any(c[0] == "POST" for c in client.calls)
 
 
@@ -249,7 +267,9 @@ def test_full_request_list_fits_discord_message_limit(tmp_path, monkeypatch, sta
     assert interaction.messages
     content, options = interaction.messages[-1]
     assert len(content) <= 2000
-    assert content.count("$100,000,000.00+") == 10
+    shown = content.count("$100,000,000.00+")
+    # Rows past the limit are summarized; all stay in the dropdowns.
+    assert shown == 10 or f"and {10 - shown} more" in content
     assert options["view"] is not None
 
 
@@ -268,8 +288,11 @@ def test_wrong_guild_channel_and_dm_fail_closed(options):
     commands, interaction, client, store = make(**options)
     invoke(commands.add, interaction, "air fryer")
     assert store.list(USER) == [] and client.calls == []
-    assert interaction.messages == []
-    assert interaction.acknowledged and interaction.deleted == 1
+    assert interaction.acknowledged
+    if "channel" in options:
+        pointed_only(interaction)
+    else:
+        assert interaction.messages == [] and interaction.deleted == 1
 
 
 def test_first_add_tests_dm_then_accepts_private_request_and_list_controls():
@@ -346,6 +369,7 @@ def test_command_definition_and_registration_only_upsert_request_command():
     assert {o["name"] for o in definition["options"]} == {
         "add",
         "list",
+        "listed",
         "edit",
         "delete",
         "test-dm",
@@ -454,6 +478,7 @@ def test_sdk_group_has_expected_autocomplete_and_errors_bound_privately():
     assert {command.name for command in group.commands} == {
         "add",
         "list",
+        "listed",
         "edit",
         "delete",
         "test-dm",
@@ -603,23 +628,44 @@ def test_command_lifecycle_uses_real_durable_store_and_survives_restart(tmp_path
     assert restarted.store.list(USER) == []
 
 
-@pytest.mark.parametrize("action", ["add", "list", "edit", "delete", "test_dm", "error"])
-@pytest.mark.parametrize("scope", [{"channel": OTHER}, {"guild": OTHER}, {"guild": None}])
-def test_all_command_and_error_paths_are_silent_outside_requests_channel(action, scope):
+@pytest.mark.parametrize(
+    "action", ["add", "list", "listed", "edit", "delete", "test_dm", "error"]
+)
+@pytest.mark.parametrize("scope", [{"guild": OTHER}, {"guild": None}])
+def test_all_command_and_error_paths_are_silent_outside_this_server(action, scope):
     commands, interaction, client, store = make(**scope)
     arguments = {"add": ("air fryer",), "edit": ("1", "coffee maker"), "delete": ("1",)}
     invoke(getattr(commands, action), interaction, *arguments.get(action, ()))
-    assert interaction.messages == []
+    assert interaction.messages == [] and interaction.edited == []
     assert interaction.acknowledged and interaction.deleted == 1
     assert client.calls == [] and store.list(USER) == []
 
 
-def test_wrong_channel_already_deferred_response_is_erased_without_followup():
+@pytest.mark.parametrize(
+    "action", ["add", "list", "listed", "edit", "delete", "test_dm", "error"]
+)
+def test_other_channels_in_this_server_get_only_a_private_pointer(action):
+    commands, interaction, client, store = make(channel=OTHER)
+    arguments = {"add": ("air fryer",), "edit": ("1", "coffee maker"), "delete": ("1",)}
+    invoke(getattr(commands, action), interaction, *arguments.get(action, ()))
+    pointed_only(interaction)
+    assert client.calls == [] and store.list(USER) == []
+
+
+def test_wrong_channel_already_deferred_response_becomes_the_pointer_without_followup():
     commands, interaction, client, _ = make(channel=OTHER)
     invoke(interaction.defer, ephemeral=True, thinking=True)
     invoke(commands.error, interaction, RuntimeError("secret-token"))
-    assert interaction.messages == [] and interaction.deleted == 1
-    assert client.calls == []
+    assert interaction.messages == [] and interaction.edited == [POINTER]
+    assert interaction.deleted == 0 and client.calls == []
+
+
+def test_other_guild_already_deferred_response_is_erased_without_followup():
+    commands, interaction, client, _ = make(guild=OTHER)
+    invoke(interaction.defer, ephemeral=True, thinking=True)
+    invoke(commands.error, interaction, RuntimeError("secret-token"))
+    assert interaction.messages == [] and interaction.edited == []
+    assert interaction.deleted == 1 and client.calls == []
 
 
 def test_wrong_channel_autocomplete_error_only_returns_empty_choices():
@@ -714,9 +760,12 @@ def test_tree_guards_and_errors_never_reply_outside_channel(monkeypatch, connect
         for options in ({"channel": OTHER}, {"guild": OTHER}, {"guild": None}):
             interaction = Interaction(**options)
             assert await tree.interaction_check(interaction) is False
-            assert interaction.messages == [] and interaction.deleted == 1
+            erased = interaction.deleted
             await tree.on_error(interaction, RuntimeError("secret-token"))
-            assert interaction.messages == []
+            if "channel" in options:
+                pointed_only(interaction)
+            else:
+                assert interaction.messages == [] and erased == 1
         automatic = Interaction(channel=OTHER, autocomplete=True)
         assert await tree.interaction_check(automatic) is False
         assert automatic.choices == [] and automatic.messages == []
@@ -756,7 +805,7 @@ def test_ui_modal_and_view_errors_are_silent_outside_requests_channel():
         own.opened_modal.item._value = "coffee maker"
         await own.opened_modal.on_submit(elsewhere)
         await own.opened_modal.on_error(elsewhere, RuntimeError("secret item"))
-        assert elsewhere.messages == []
+        pointed_only(elsewhere)
         assert client.calls == [] and store.list(USER)[0]["query"] == "air fryer"
 
     asyncio.run(scenario())
@@ -773,3 +822,36 @@ def test_command_failures_emit_fixed_operational_labels_without_request_data():
     ]
     assert any(fields.get("interaction_stage") == "acknowledged" for _, fields in events)
     assert "secret-token" not in str(events) and "secret item" not in str(events)
+
+
+def test_long_request_list_fits_discord_limit_and_autocomplete_finds_all(tmp_path):
+    commands, interaction, client, store = real_commands(tmp_path)
+    for index in range(40):
+        store.add(USER, f"a fairly long request name number {index:02d} " + "x" * 50)
+    store.add(USER, "drinks")
+    invoke(commands.list, interaction)
+    text = interaction.messages[-1][0]
+    assert len(text) <= 2000 and "more" in text
+    choices = invoke(commands.autocomplete, interaction, "")
+    assert len(choices) == 25
+    assert [label for label, _ in invoke(commands.autocomplete, interaction, "drink")] == ["drinks"]
+
+
+def test_delete_accepts_several_names_and_ids_and_reports_unknown_ones(tmp_path):
+    commands, interaction, client, store = real_commands(tmp_path)
+    rows = {query: store.add(USER, query) for query in ("drinks", "mens hat", "sofa", "chair")}
+    invoke(commands.delete, interaction, f"Drinks,  MENS  hat , {rows['sofa']['id']}, kayak")
+    text = interaction.messages[-1][0]
+    assert "Deleted 3 requests" in text and "`kayak`" in text
+    assert [row["query"] for row in store.list(USER)] == ["chair"]
+    invoke(commands.delete, interaction, str(rows["chair"]["id"]))
+    assert "Request deleted" in interaction.messages[-1][0] and store.list(USER) == []
+
+
+def test_delete_autocomplete_keeps_earlier_picks(tmp_path):
+    commands, interaction, client, store = real_commands(tmp_path)
+    first, second = store.add(USER, "drinks"), store.add(USER, "mens hat")
+    invoke(commands.list, interaction)  # The fixture requires an acknowledged interaction.
+    choices = invoke(commands.autocomplete, interaction, f"{first['id']}, men", multiple=True)
+    assert choices == [(f"{first['id']}, mens hat", f"{first['id']}, {second['id']}")]
+    assert invoke(commands.autocomplete, interaction, "men")[0][1] == str(second["id"])

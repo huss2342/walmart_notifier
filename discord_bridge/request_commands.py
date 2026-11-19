@@ -18,7 +18,9 @@ from contextlib import suppress
 
 from .api import DiscordError
 from .monitoring import emit_event, error_fields
-from .request_store import member_ref
+from .payload_limits import DESCRIPTION, text_length
+from .request_render import money, plain
+from .request_store import LISTED_FRESH_SECONDS, member_ref
 
 _SNOWFLAKE = re.compile(r"[0-9]{17,20}\Z")
 _DM_HELP = (
@@ -61,6 +63,36 @@ def _request_label(row, limit=120):
     value = row.get("min_value_cents")
     minimum = f" (${value // 100:,}.{value % 100:02d}+)" if value is not None else ""
     return _display(row["query"], limit) + minimum
+
+
+# One /request listed page: an embed description, well inside Discord's limit.
+_LISTED_PAGE_ITEMS = 15
+_LISTED_PAGE_CHARS = DESCRIPTION - 196
+_LISTED_MAX_PAGE = 1000
+_LISTED_REQUEST = "Optional: only matches for one of your requests"
+_LISTED_MINIMUM = "Optional: only items worth at least this many USD"
+
+
+def _listed_pages(rows):
+    """Number every match once, then cut pages that each fit one embed."""
+    pages, current, size = [], [], 0
+    for index, row in enumerate(rows, 1):
+        item = row["item"]
+        line = (
+            f"**{index}.** [{plain(item['title'], 80)}]({item['review_url']})"
+            f" · {money(item.get('value_cents'))} · seen <t:{int(row['seen'])}:R>\n"
+            f"Matched: {plain(', '.join(row['queries']), 60)}"
+        )
+        if current and (
+            len(current) >= _LISTED_PAGE_ITEMS or size + text_length(line) + 2 > _LISTED_PAGE_CHARS
+        ):
+            pages.append(current)
+            current, size = [], 0
+        current.append(line)
+        size += text_length(line) + 2
+    if current:
+        pages.append(current)
+    return pages
 
 
 class _SDKLogFilter(logging.Filter):
@@ -132,6 +164,7 @@ class RequestCommands:
                 if isinstance(option, dict) and option.get("name") in {
                     "add",
                     "list",
+                    "listed",
                     "edit",
                     "delete",
                     "test-dm",
@@ -191,13 +224,27 @@ class RequestCommands:
     async def channel_guard(self, interaction):
         if self.in_channel(interaction):
             return True
-        # An administrator can bypass command UI permissions. Acknowledge and
-        # erase the ephemeral thinking response without leaving a status reply
-        # or request data in another channel (including other guilds and DMs).
+        # Elsewhere in this server, a private one-line pointer to the request
+        # channel and nothing else: no request data, no command runs. In other
+        # guilds and DMs, acknowledge and erase the ephemeral thinking response
+        # without leaving any reply.
         try:
             if self.is_autocomplete(interaction):
                 if not interaction.response.is_done():
                     await interaction.response.autocomplete([])
+            elif str(getattr(interaction, "guild_id", None)) == self.guild:
+                pointer = f"Use /request in <#{self.channel}>."
+                quiet = _sdk().AllowedMentions.none()
+                if interaction.response.is_done():
+                    # Replaces a deferred "thinking" reply, or rewrites the
+                    # same pointer; never a second message.
+                    await interaction.edit_original_response(
+                        content=pointer, allowed_mentions=quiet
+                    )
+                else:
+                    await interaction.response.send_message(
+                        pointer, ephemeral=True, allowed_mentions=quiet
+                    )
             else:
                 if not interaction.response.is_done():
                     await interaction.response.defer(ephemeral=True, thinking=True)
@@ -398,7 +445,7 @@ class RequestCommands:
             rows = await asyncio.to_thread(self.store.list, user)
             status = await asyncio.to_thread(self.store.dm_status, user)
             header = (
-                "**Your personal item requests** (up to 10)\n"
+                "**Your personal item requests**\n"
                 "Controls expire after five minutes of inactivity; "
                 "run /request list for fresh controls.\n"
             )
@@ -412,17 +459,98 @@ class RequestCommands:
                     "Optionally set min_value in dollars or append $100+.",
                 )
                 return
-            text = header + "\n".join(
+            lines = [
                 f"{index}. `{_request_label(row, 80)}`"
                 + {
                     "needs_review": " — delivery needs review",
                     "failed": " — delivery failed; a future fresh match can retry",
                 }.get(row.get("delivery_status"), "")
                 for index, row in enumerate(rows, 1)
-            )
+            ]
+            # Discord rejects messages over 2000 characters; every request stays
+            # reachable through the dropdowns and /request edit|delete search.
+            text = header
+            for shown, line in enumerate(lines):
+                more = (
+                    f"\n…and {len(lines) - shown} more. Pick them from the dropdowns below, "
+                    "or type part of the name in /request edit or /request delete."
+                )
+                if len(text) + len(line) + 1 + len(more) > 1990:
+                    text += more
+                    break
+                text += ("" if shown == 0 else "\n") + line
             await self._send(interaction, text, view=build_request_view(self, user, rows))
 
         await self._execute(interaction, action, expected=expected)
+
+    async def listed(self, interaction, page=1, *, request=None, min_value=None):
+        """Private, paged list of older matches that are still listed.
+
+        Optionally only one of the member's own requests and/or listings showing
+        at least min_value dollars; always highest value first.
+        """
+
+        async def action(user):
+            chosen = None
+            if request is not None and str(request).strip():
+                key = " ".join(str(request).casefold().split())
+                own = await asyncio.to_thread(self.store.list, user)
+                picks = [row for row in own if str(row["id"]) == key] or [
+                    row for row in own if " ".join(row["query"].casefold().split()) == key
+                ]
+                if len(picks) != 1:
+                    raise _PrivateError(
+                        "Request not found. Pick one of your requests from the list, "
+                        "or leave request empty to see all."
+                    )
+                chosen = picks[0]
+            rows = await self._change(
+                self.store.listed, user,
+                request_id=chosen["id"] if chosen else None, min_value=min_value,
+            )
+            hours = f"{LISTED_FRESH_SECONDS / 3600:g}"
+            scope = f"`{_request_label(chosen, 60)}`" if chosen else "your requests"
+            floor = ""
+            if min_value:
+                floor = f" worth {money(round(float(min_value) * 100))}+"
+            filtered = bool(chosen or floor)
+            if not rows:
+                await self._send(
+                    interaction,
+                    (
+                        f"No already-listed matches for {scope}{floor} right now. "
+                        if filtered else "No already-listed matches right now. "
+                    )
+                    + "Items that were listed before you added a request show here while "
+                    f"Walmart still lists them (seen in the last {hours} hours).",
+                )
+                return
+            pages = _listed_pages(rows)
+            wanted = max(1, int(page or 1))
+            number = min(wanted, len(pages))
+            count = "1 item" if len(rows) == 1 else f"{len(rows)} items"
+            verb = "was" if len(rows) == 1 else "were"
+            content = (
+                f"{count} matching {scope}{floor} {verb} already listed when you added "
+                f"{'it' if chosen else 'them'} and seen in the last {hours} hours. "
+                "Highest value first."
+            )
+            if len(pages) > 1:
+                content += f" Page {number} of {len(pages)}."
+                if wanted > len(pages):
+                    content += f" There is no page {wanted}."
+                if number < len(pages):
+                    content += f" Next: `/request listed page:{number + 1}`" + (
+                        " with the same filters." if filtered else "."
+                    )
+                if not filtered:
+                    content += " Narrow it with `request` or `min_value`."
+            embed = _sdk().Embed(
+                title="Already-listed matches", description="\n\n".join(pages[number - 1])
+            )
+            await self._send(interaction, content, embed=embed)
+
+        await self._execute(interaction, action)
 
     async def edit(self, interaction, request, item, min_value=None, *, expected=None):
         async def action(user):
@@ -436,14 +564,38 @@ class RequestCommands:
         await self._execute(interaction, action, expected=expected)
 
     async def delete(self, interaction, request, *, expected=None):
+        # One request ID/name, a comma-separated list, or a list of dropdown IDs.
+        selectors = (
+            [str(value) for value in request] if isinstance(request, (list, tuple))
+            else [part for part in str(request).split(",") if part.strip()]
+        )
+
         async def action(user):
-            deleted = await asyncio.to_thread(self.store.delete, user, request)
-            await self._send(
-                interaction,
-                "Request deleted. Unsent alerts for it are canceled."
-                if deleted
-                else "Request not found. Use /request list to choose your own request.",
-            )
+            if len(selectors) == 1 and selectors[0].strip().isdigit():
+                deleted = await asyncio.to_thread(self.store.delete, user, selectors[0].strip())
+                await self._send(
+                    interaction,
+                    "Request deleted. Unsent alerts for it are canceled."
+                    if deleted
+                    else "Request not found. Use /request list to choose your own request.",
+                )
+                return
+            if not selectors or len(selectors) > 100:
+                raise _PrivateError("Name 1 to 100 of your requests, separated by commas.")
+            rows, missing = await asyncio.to_thread(self.store.delete_many, user, selectors)
+            lines = []
+            if rows:
+                lines.append(
+                    f"Deleted {len(rows)} request{'s' if len(rows) != 1 else ''}: "
+                    + ", ".join(f"`{_request_label(row, 60)}`" for row in rows)
+                    + ". Unsent alerts for them are canceled."
+                )
+            if missing:
+                lines.append(
+                    "Not found: " + ", ".join(f"`{_display(value, 60)}`" for value in missing)
+                    + ". Use /request list to see your requests."
+                )
+            await self._send(interaction, "\n".join(lines)[:1990])
 
         await self._execute(interaction, action, expected=expected)
 
@@ -459,8 +611,13 @@ class RequestCommands:
 
         await self._execute(interaction, action)
 
-    async def autocomplete(self, interaction, current):
+    async def autocomplete(self, interaction, current, *, multiple=False):
         """Autocomplete choices are private by protocol and cannot be deferred."""
+        prefix = ""
+        if multiple and "," in current:
+            prefix, current = current.rsplit(",", 1)
+            prefix = prefix.strip() + ", "
+            current = current.strip()
 
         def choices():
             user = self.authorize(interaction)
@@ -474,7 +631,12 @@ class RequestCommands:
         try:
             self.owner(interaction)
             rows = await asyncio.wait_for(asyncio.to_thread(choices), timeout=1.8)
-            return [(_request_label(row, 65)[:100], str(row["id"])) for row in rows[:10]]
+            # Discord allows 25 autocomplete choices; typing narrows the rest.
+            # For deletes, earlier picks stay in the value: "12, 15, <next>".
+            return [
+                ((prefix + _request_label(row, 65))[:100], (prefix + str(row["id"]))[:100])
+                for row in rows[:25]
+            ]
         except Exception:
             return []
 
@@ -515,15 +677,33 @@ def build_request_view(handler, owner, rows):
             self.key = uuid.uuid4().hex
             self.message = None
             self.selected = str(rows[0]["id"])
-            self.select = discord.ui.Select(
-                placeholder="Choose a request to edit or delete",
-                options=[
-                    discord.SelectOption(label=_request_label(row, 65)[:100], value=str(row["id"]))
-                    for row in rows[:10]
-                ],
-            )
-            self.select.callback = self.choose
-            self.add_item(self.select)
+            self.picked = []
+            # Discord: 25 options per dropdown, one dropdown per row, rows 0-3
+            # (buttons use row 4), so up to 100 requests are pickable here.
+            self.selects = []
+            for start in range(0, min(len(rows), 100), 25):
+                chunk = rows[start:start + 25]
+                select = discord.ui.Select(
+                    placeholder=(
+                        "Choose a request to edit or delete"
+                        if len(rows) <= 25
+                        else f"Choose a request ({start + 1}-{start + len(chunk)})"
+                    ),
+                    options=[
+                        discord.SelectOption(
+                            label=_request_label(row, 65)[:100], value=str(row["id"])
+                        )
+                        for row in chunk
+                    ],
+                    # Several picks are allowed: Delete removes them all.
+                    min_values=1,
+                    max_values=len(chunk),
+                    row=start // 25,
+                )
+                select.callback = self._chooser(select)
+                self.add_item(select)
+                self.selects.append(select)
+            self.select = self.selects[0]
             for index, child in enumerate(self.children):
                 child.custom_id = f"request-ui:{self.key}:{index}"
             handler._views[self.key] = self
@@ -550,25 +730,41 @@ def build_request_view(handler, owner, rows):
                 await handler._send(interaction, str(exc))
                 return False
 
-        async def choose(self, interaction):
+        def _chooser(self, select):
+            async def callback(interaction):
+                await self.choose(interaction, select)
+
+            return callback
+
+        async def choose(self, interaction, select=None):
+            select = select or self.select
+
             async def action(user):
-                own = await asyncio.to_thread(handler.store.list, user)
-                selected = self.select.values[0]
-                row = next((row for row in own if str(row["id"]) == selected), None)
-                if row is None:
+                own = {str(row["id"]): row for row in
+                       await asyncio.to_thread(handler.store.list, user)}
+                values = list(select.values)
+                rows = [own[value] for value in values if value in own]
+                if not rows:
                     raise _PrivateError(
                         "Request not found. Run /request list to refresh your controls."
                     )
-                self.selected = selected
-                await handler._send(
-                    interaction,
-                    f"Selected `{_request_label(row)}`. "
-                    "Use the Edit or Delete button on your request list.",
-                )
+                # Picks from the other dropdowns are kept; this one is replaced.
+                chunk = {option.value for option in select.options}
+                self.picked = [value for value in self.picked if value not in chunk] + [
+                    str(row["id"]) for row in rows
+                ]
+                self.selected = self.picked[-1]
+                if len(self.picked) == 1:
+                    text = (f"Selected `{_request_label(rows[0])}`. "
+                            "Use the Edit or Delete button on your request list.")
+                else:
+                    text = (f"Selected {len(self.picked)} requests. Delete removes all of "
+                            "them; Edit changes one request at a time.")
+                await handler._send(interaction, text)
 
             await handler._execute(interaction, action, expected=owner)
 
-        @discord.ui.button(label="Edit", style=discord.ButtonStyle.primary, row=1)
+        @discord.ui.button(label="Edit", style=discord.ButtonStyle.primary, row=4)
         async def edit_button(self, interaction, _button):
             # Opening a blank modal is the immediate acknowledgement. Saved request
             # data is not fetched or shown; the submission checks fresh Pro access.
@@ -579,13 +775,17 @@ def build_request_view(handler, owner, rows):
             except _PrivateError as exc:
                 await handler._send(interaction, str(exc))
                 return
+            if len(self.picked) > 1:
+                await handler._send(interaction, "Edit changes one request at a time. "
+                                    "Select just one request, then press Edit.")
+                return
             await interaction.response.send_modal(EditModal(self.selected))
 
-        @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger, row=1)
+        @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger, row=4)
         async def delete_button(self, interaction, _button):
-            await handler.delete(interaction, self.selected, expected=owner)
+            await handler.delete(interaction, self.picked or [self.selected], expected=owner)
 
-        @discord.ui.button(label="Refresh list", style=discord.ButtonStyle.secondary, row=1)
+        @discord.ui.button(label="Refresh list", style=discord.ButtonStyle.secondary, row=4)
         async def refresh_button(self, interaction, _button):
             await handler.list(interaction, expected=owner)
 
@@ -618,6 +818,22 @@ def build_request_command_group(handler):
     async def list_requests(interaction):
         await handler.list(interaction)
 
+    @group.command(
+        name="listed", description="See matches that were already listed when you added requests"
+    )
+    @app.describe(
+        request=_LISTED_REQUEST,
+        min_value=_LISTED_MINIMUM,
+        page="Page to show when there are more matches than one reply holds",
+    )
+    async def listed(
+        interaction,
+        request: str | None = None,
+        min_value: minimum_value = None,
+        page: app.Range[int, 1, _LISTED_MAX_PAGE] = 1,
+    ):
+        await handler.listed(interaction, page=page, request=request, min_value=min_value)
+
     @group.command(name="edit", description="Change one of your own item requests")
     @app.describe(
         request="Choose one of your own requests",
@@ -628,11 +844,34 @@ def build_request_command_group(handler):
         await handler.edit(interaction, request, item, min_value=min_value)
 
     @group.command(
-        name="delete", description="Delete one of your own requests and cancel its unsent alerts"
+        name="delete",
+        description=(
+            "Delete one or more of your requests (comma-separated) and cancel unsent alerts"
+        ),
     )
-    @app.describe(request="Choose one of your own requests")
-    async def delete(interaction, request: str):
-        await handler.delete(interaction, request)
+    @app.describe(
+        request="Choose your requests; separate several with commas",
+        request_2="Optional: another request to delete",
+        request_3="Optional: another request to delete",
+        request_4="Optional: another request to delete",
+        request_5="Optional: another request to delete",
+    )
+    async def delete(
+        interaction,
+        request: str,
+        request_2: str | None = None,
+        request_3: str | None = None,
+        request_4: str | None = None,
+        request_5: str | None = None,
+    ):
+        picks = [
+            part
+            for value in (request, request_2, request_3, request_4, request_5)
+            if value
+            for part in str(value).split(",")
+            if part.strip()
+        ]
+        await handler.delete(interaction, picks if len(picks) != 1 else picks[0])
 
     @group.command(name="test-dm", description="Check private DM delivery and resume your alerts")
     async def test_dm(interaction):
@@ -644,8 +883,17 @@ def build_request_command_group(handler):
             for name, value in await handler.autocomplete(interaction, current)
         ]
 
+    async def autocomplete_many(interaction, current: str):
+        return [
+            app.Choice(name=name, value=value)
+            for name, value in await handler.autocomplete(interaction, current, multiple=True)
+        ]
+
     edit.autocomplete("request")(autocomplete)
-    delete.autocomplete("request")(autocomplete)
+    listed.autocomplete("request")(autocomplete)
+    delete.autocomplete("request")(autocomplete_many)
+    for extra in ("request_2", "request_3", "request_4", "request_5"):
+        delete.autocomplete(extra)(autocomplete)
     group.on_error = handler.error
     return group
 
@@ -681,11 +929,15 @@ def request_command_definition():
             "max_value": 100_000_000,
         }
 
-    def request():
+    def request(*, many=False):
         return {
             "type": 3,
             "name": "request",
-            "description": "Choose one of your own requests",
+            "description": (
+                "Choose your requests; separate several with commas"
+                if many
+                else "Choose one of your own requests"
+            ),
             "required": True,
             "autocomplete": True,
         }
@@ -714,6 +966,31 @@ def request_command_definition():
             },
             {
                 "type": 1,
+                "name": "listed",
+                "description": "See matches that were already listed when you added requests",
+                "options": [
+                    {
+                        "type": 3,
+                        "name": "request",
+                        "description": _LISTED_REQUEST,
+                        "required": False,
+                        "autocomplete": True,
+                    },
+                    {**minimum(), "description": _LISTED_MINIMUM},
+                    {
+                        "type": 4,
+                        "name": "page",
+                        "description": (
+                            "Page to show when there are more matches than one reply holds"
+                        ),
+                        "required": False,
+                        "min_value": 1,
+                        "max_value": _LISTED_MAX_PAGE,
+                    }
+                ],
+            },
+            {
+                "type": 1,
                 "name": "edit",
                 "description": "Change one of your own item requests",
                 "options": [request(), item(), minimum(editing=True)],
@@ -721,8 +998,19 @@ def request_command_definition():
             {
                 "type": 1,
                 "name": "delete",
-                "description": "Delete one of your own requests and cancel its unsent alerts",
-                "options": [request()],
+                "description": (
+                    "Delete one or more of your requests (comma-separated) and cancel unsent alerts"
+                ),
+                "options": [request(many=True), *(
+                    {
+                        "type": 3,
+                        "name": f"request_{index}",
+                        "description": "Optional: another request to delete",
+                        "required": False,
+                        "autocomplete": True,
+                    }
+                    for index in range(2, 6)
+                )],
             },
             {
                 "type": 1,

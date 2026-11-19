@@ -220,3 +220,36 @@ def test_expired_edit_modal_returns_guidance_without_applying_input(monkeypatch)
         view.stop()
 
     _gateway_scenario(monkeypatch, scenario)
+
+
+def test_request_view_lists_every_request_beyond_ten(monkeypatch):
+    async def scenario(sdk, tree, worker, client, store):
+        from discord_bridge.request_commands import build_request_view
+
+        user = "1700000000000000005"
+        rows = [{"id": index + 1, "query": f"item {index}", "min_value_cents": None}
+                for index in range(60)]
+        view = build_request_view(sdk._request_handler, user, rows)
+        selects = [child for child in view.children if hasattr(child, "options")]
+        assert [len(select.options) for select in selects] == [25, 25, 10]
+        assert {option.value for s in selects for option in s.options} == {
+            str(row["id"]) for row in rows
+        }
+        assert len({child.custom_id for child in view.children}) == len(view.children)
+        view.stop()
+
+    _gateway_scenario(monkeypatch, scenario)
+
+
+def test_request_dropdowns_allow_several_picks(monkeypatch):
+    async def scenario(sdk, tree, worker, client, store):
+        from discord_bridge.request_commands import build_request_view
+
+        rows = [{"id": index + 1, "query": f"item {index}", "min_value_cents": None}
+                for index in range(30)]
+        view = build_request_view(sdk._request_handler, "1700000000000000005", rows)
+        selects = [child for child in view.children if hasattr(child, "options")]
+        assert [select.max_values for select in selects] == [25, 5]
+        view.stop()
+
+    _gateway_scenario(monkeypatch, scenario)

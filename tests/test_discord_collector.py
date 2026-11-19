@@ -14,6 +14,7 @@ import server
 from models import Item
 from notifiers import build_notifier
 from notifiers.discord import DiscordNotifier
+from operational_logging import OperationalLog
 from state import SeenStore
 
 
@@ -116,8 +117,7 @@ def test_http_image_survives_queue_restart_and_reaches_existing_alert(discord_se
     for _, _, payload in client.calls:
         assert payload["embeds"][0]["thumbnail"] == {"url": image}
         assert [button["label"] for button in payload["components"][0]["components"]] == [
-            "Open review item",
-            "View product",
+            "Claim item",
         ]
         assert "private" not in json.dumps(payload)
 
@@ -144,12 +144,76 @@ def test_failed_durable_intake_returns_failure_for_extension_retry(discord_serve
     assert error.value.code == 503 and client.calls == []
 
 
-def test_invalid_batch_does_not_accept_valid_prefix(discord_server):
+def test_unpublishable_observation_is_dropped_named_and_the_rest_of_the_page_queued(
+    discord_server, tmp_path, monkeypatch, caplog
+):
+    # Nov 17-19: five whole pages failed with a bare 400 because of one item each.
     base, notifier, _ = discord_server
-    with pytest.raises(urllib.error.HTTPError) as error:
-        post(base, [product(), product(1234568, url="https://evil.example/ip/1234568")])
-    assert error.value.code == 400
+    monkeypatch.setattr(server.Handler, "operations", OperationalLog(tmp_path / "ops"))
+    request = urllib.request.Request(
+        base + "/ingest",
+        json.dumps({"items": [
+            product(),
+            product(1234568, url="https://evil.example/ip/1234568", title="Secret title"),
+            product(1234569, url="https://www.walmart.com/ip/Lamp/7654321"),
+            product(1234570, value_usd=19.995),
+            product(1234571, title="Bad\x00title"),
+            {**product(1234572), "item_id": "not-an-ip-id"},
+        ]}).encode(),
+        {"Content-Type": "application/json", "X-Request-ID": "e" * 32},
+        method="POST",
+    )
+    with caplog.at_level("WARNING"), urllib.request.urlopen(request, timeout=5) as response:
+        summary = json.load(response)
+    assert summary["seen"] == 6, "every observation is acknowledged, so the page advances"
+    assert summary["queued"] == summary["new"] == 1 and summary["invalid"] == 5
+    with notifier.store._connect() as db:
+        stored = [row[0] for row in db.execute("SELECT item_id FROM items")]
+        payloads = " ".join(row[0] for row in db.execute("SELECT payload FROM items"))
+    assert stored == ["ip-1234567"]
+    assert "evil.example" not in payloads
+    assert server.Handler.store.is_new("ip-1234568"), "dropped items stay out of local history"
+    assert not server.Handler.store.is_new("ip-1234567")
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "ops" / "operations.jsonl").read_text().splitlines()
+    ]
+    dropped = [row for row in rows if row["event"] == "intake_invalid_item"]
+    assert [(row.get("item_id"), row["field"], row["reason"]) for row in dropped] == [
+        ("ip-1234568", "product_url", "foreign_host"),
+        ("ip-1234569", "product_url", "different_item"),
+        ("ip-1234570", "value", "fractional_cents"),
+        ("ip-1234571", "title", "control_character"),
+        (None, "item_id", "not_walmart_id"),
+    ]
+    assert {row["request_id"] for row in dropped} == {"e" * 32}
+    result = next(row for row in rows if row["event"] == "intake_result")
+    assert result["invalid"] == 5 and result["queued"] == 1
+    logged = caplog.text
+    assert "item_id=ip-1234569 field=product_url reason=different_item" in logged
+    assert "item_id=malformed field=item_id reason=not_walmart_id" in logged
+    for private in ("Secret title", "evil.example", "Lamp", "19.995", "not-an-ip-id"):
+        assert private not in logged and private not in json.dumps(rows)
+
+
+def test_a_page_of_only_unpublishable_observations_queues_nothing(discord_server):
+    base, notifier, _ = discord_server
+    summary = post(base, [product(1234568, url="https://evil.example/ip/1234568"),
+                          product(1234569, title=" ")])
+    assert summary["seen"] == 2 and summary["invalid"] == 2 and summary["queued"] == 0
     assert notifier.store.counts() == {}
+
+
+def test_a_batch_the_queue_itself_refuses_is_still_rejected_whole(discord_server, monkeypatch):
+    base, notifier, _ = discord_server
+
+    def refuse(*_, **__):
+        raise ValueError("expected 1 to 500 normalized items")
+
+    monkeypatch.setattr(notifier.store, "record", refuse)
+    with pytest.raises(urllib.error.HTTPError) as error:
+        post(base, [product()])
+    assert error.value.code == 400
 
 
 def test_seed_mode_suppresses_future_jobs_after_restart(tmp_path):

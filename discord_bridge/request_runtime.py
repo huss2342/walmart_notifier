@@ -24,8 +24,10 @@ class RequestRuntime:
         worker_factory=None,
         gateway_factory=None,
         referral_handler=None,
+        release_hook=None,
     ):
         self.client, self.state, self.path, self.token = client, state, path, token
+        self.release_hook = release_hook
         self.auditor, self.event_sink = auditor, event_sink
         self._worker_factory, self._gateway_factory = worker_factory, gateway_factory
         self.referral_handler = referral_handler
@@ -37,6 +39,12 @@ class RequestRuntime:
         self._ready = False
         self._error = None
         self._reported_error = None
+
+    def search_queries(self):
+        """Only an audited, running request service supplies scanner work."""
+        if not self._ready or self._stopped() or self.worker is None:
+            return []
+        return self.worker.store.search_queries()
 
     def _report_error(self, error, exc=None):
         if error != self._reported_error:
@@ -82,6 +90,7 @@ class RequestRuntime:
             store = RequestStore(
                 self.path, guild_id=self.state["guild_id"], event_sink=self.event_sink
             )
+            store.on_release = self.release_hook
             trial_args = {}
             gateway_trial_args = {}
             if self.state.get("roles", {}).get("trial"):
@@ -147,10 +156,17 @@ class RequestRuntime:
                     return
                 self._stop.wait(5)
 
-        self._thread = threading.Thread(target=supervise, name="discord-requests", daemon=True)
+        self._thread = threading.Thread(
+            target=supervise, name="discord-request-runtime", daemon=True
+        )
         self._thread.start()
         emit_event(self.event_sink, "worker_lifecycle", component="request-runtime",
                    transition="started")
+
+    def wake(self):
+        worker = self.worker
+        if worker is not None and hasattr(worker, "wake"):
+            worker.wake()
 
     def stop(self):
         already_stopped = self._stop.is_set()

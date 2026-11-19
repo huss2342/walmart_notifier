@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import queue
 import re
 import sqlite3
 import threading
@@ -13,7 +14,7 @@ import uuid
 from contextlib import suppress
 from pathlib import Path
 
-from .api import TRANSPORT_ERROR_TYPES, DiscordError
+from .api import TRANSPORT_ERROR_TYPES, DiscordError, RateLimitSource
 from .rolling_logs import RETENTION_DAYS, RollingLog
 from .telemetry_context import current_request_id
 
@@ -48,6 +49,14 @@ _EVENTS = {
     "referral_cycle",
     "referral_changed",
     "referral_error",
+    "pro_checkout_link",
+    "pro_access_granted",
+    "pro_access_removed",
+    "pro_access_error",
+    "free_role_error",
+    "pro_access_dm_failed",
+    "discord_api",
+    "elite_signal",
 }
 _STATES = {
     "pending",
@@ -95,9 +104,16 @@ _REASONS = {
     "worker_error",
     "no_current_match",
     "request_changed",
+    "payload_too_large",
+    "catchup_overflow",
+    "reconciled_sent",
+    "reconciled_undelivered",
+    "reconcile_unresolved",
 }
 _NUMBERS = {
     "items",
+    "watches",
+    "searches",
     "messages",
     "sent",
     "retried",
@@ -141,13 +157,21 @@ _NUMBERS = {
     "profiles",
     "exceptions",
     "changed",
+    "ratelimit_remaining",
+    "search_matched",
+    "below_minimum",
+    "unavailable",
+    "value_missing",
+    "searched",
 }
 _ENUMS = {
     "component": {"channel", "personal", "request-runtime", "gateway", "welcome", "membership",
                   "referrals", "trials"},
     "transition": {"started", "stopped", "ready", "disconnected", "error", "recovered", "queued",
-                   "rearmed"},
-    "outcome": {"not_submitted", "rejected", "accepted", "unknown"},
+                   "rearmed", "restocked"},
+    "outcome": {"not_submitted", "rejected", "accepted", "unknown", "watch_loaded",
+                "watch_unavailable"},
+    "rate_limit_source": {source.value for source in RateLimitSource},
     "reward_state": {"pending", "applying", "applied", "used", "void", "exception"},
     "provider_error": {"invalid_response", "closed", "operation_timeout", "network_failure",
                        "pagination_limit", "promo_conflict", "membership_ineligible",
@@ -155,7 +179,8 @@ _ENUMS = {
                        "provider_unavailable", "unauthorized", "forbidden", "conflict",
                        "redirect_rejected", "provider_rejected"},
     "interaction_stage": {"received", "acknowledged", "replied", "failed", "expired"},
-    "command": {"add", "list", "edit", "delete", "test-dm", "component", "modal", "unknown"},
+    "command": {"add", "list", "listed", "edit", "delete", "test-dm", "component", "modal",
+                "unknown"},
     "audience": {"personal"},
     "action": {"add", "edit", "delete"},
     "dm_status": {"ready", "needs_test", "blocked"},
@@ -185,7 +210,11 @@ _ENUMS = {
         "lookup",
     },
     "reason": _REASONS,
+    "caller": {"channel", "personal", "welcome", "membership", "trials", "gateway",
+               "request-runtime", "other"},
+    "method": {"GET", "POST", "PATCH", "PUT", "DELETE"},
 }
+_ENDPOINT = re.compile(r"(?:/(?:[a-z@-]{1,32}|\{[a-z_]{1,20}\}))+")
 
 # Derive result names from trusted numeric SQLite constants, never from an
 # exception's free-text attributes (which may include SQL or user input).
@@ -231,8 +260,12 @@ for _name in dir(sqlite3):
         _SQLITE_ERROR_NAMES[_code] = _name
 
 
-def error_fields(error):
-    """Bounded classification; never expose the exception body or SQL."""
+def error_fields(error, **overrides):
+    """Bounded classification, retaining a caller's chosen scheduling metadata.
+
+    Only HTTP metadata overrides are accepted, then validated like provider
+    fields. Exception bodies, paths and arbitrary keyword fields stay private.
+    """
     fields = {"error_type": type(error).__name__}
     if isinstance(error, DiscordError):
         outcome = getattr(error.outcome, "value", error.outcome)
@@ -245,6 +278,30 @@ def error_fields(error):
             value = getattr(error, key, None)
             if _number(value):
                 fields[key] = value
+        metadata = {
+            "status": error.status,
+            "provider_code": error.provider_code,
+            "retry_after_seconds": error.retry_after,
+            "global_limit": error.global_limit,
+            "rate_limit_source": error.rate_limit_source,
+        }
+        metadata.update({key: value for key, value in overrides.items() if key in metadata})
+        status = metadata["status"]
+        if type(status) is int and (status == 0 or 100 <= status <= 599):
+            fields["status"] = status
+        code = metadata["provider_code"]
+        if type(code) is int and 0 <= code <= 1_000_000_000:
+            fields["provider_code"] = code
+        delay = metadata["retry_after_seconds"]
+        if _number(delay):
+            fields["retry_after_seconds"] = delay
+        if fields.get("status") == 429:
+            if type(metadata["global_limit"]) is bool:
+                fields["global_limit"] = metadata["global_limit"]
+            source = metadata["rate_limit_source"]
+            fields["rate_limit_source"] = source if isinstance(source, str) and (
+                source in _ENUMS["rate_limit_source"]
+            ) else RateLimitSource.UNKNOWN.value
     code = getattr(error, "sqlite_errorcode", None)
     if isinstance(error, sqlite3.Error) and type(code) is int and 0 <= code <= 0x7FFFFFFF:
         fields.update(sqlite_error_code=code, sqlite_primary_code=code & 255)
@@ -288,7 +345,7 @@ _METRICS = {
 
 
 def _number(value):
-    return type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 1e15
+    return type(value) in (int, float) and 0 <= value <= 1e15 and math.isfinite(value)
 
 
 def _metrics(value):
@@ -325,6 +382,30 @@ def emit_event(sink, event, **fields):
             sink(event, **fields)
 
 
+class AsyncEventSink:
+    """Queue events for one writer thread so provider calls never wait on disk.
+
+    Bounded: if the writer falls far behind, events are counted and dropped
+    rather than growing memory or blocking delivery.
+    """
+
+    def __init__(self, emit, *, maxsize=10_000):
+        self._emit, self.dropped = emit, 0
+        self._queue = queue.Queue(maxsize)
+        threading.Thread(target=self._run, name="discord-log-writer", daemon=True).start()
+
+    def __call__(self, event, **fields):
+        try:
+            self._queue.put_nowait((event, fields))
+        except queue.Full:
+            self.dropped += 1
+
+    def _run(self):
+        while True:
+            event, fields = self._queue.get()
+            emit_event(self._emit, event, **fields)
+
+
 class DeliveryMonitor:
     """Private JSONL events; 60-day compressed history with a 64-MiB backstop."""
 
@@ -337,8 +418,12 @@ class DeliveryMonitor:
         max_bytes=10 * 1024 * 1024,
         backups=256,
         retention_days=RETENTION_DAYS,
-        total_bytes=64 * 1024 * 1024,
+        # A month or more of delivery records (about 3 MiB a day) for coverage reviews.
+        total_bytes=256 * 1024 * 1024,
         clock=None,
+        # Rows are still built (timestamp, request ID) by the caller; only the
+        # disk write moves to a writer thread. See RollingLog.
+        background=False,
     ):
         if entry_point not in {"collector_worker", "standalone_worker", "cli_enqueue"}:
             raise ValueError("invalid monitoring entry point")
@@ -359,7 +444,32 @@ class DeliveryMonitor:
             retention_days=retention_days,
             backups=backups,
             clock=self.clock,
+            background=background,
+            on_write=self._written,
         )
+
+    def _written(self, error, lines=1, correlation_id=None):
+        with self._lock:
+            if error is None:
+                self._last_error = None
+                return
+            self._last_error = "file_unavailable"
+            self._dropped += lines
+        if self.console:
+            log.error(
+                json.dumps(
+                    {
+                        "event": "monitor_error",
+                        "reason": "file_unavailable",
+                        "entry_point": self.entry_point,
+                        "run_id": self.run_id,
+                        "correlation_id": correlation_id or self.run_id,
+                    }
+                )
+            )
+
+    def flush(self, timeout=5.0):
+        return self._writer.flush(timeout)
 
     def emit(self, event, **fields):
         try:
@@ -396,6 +506,7 @@ class DeliveryMonitor:
                     "deferred",
                     "baseline",
                     "throttled",
+                    "global_limit",
                 }
                 and type(value) is bool
             ):
@@ -417,6 +528,9 @@ class DeliveryMonitor:
                     value,
                 ):
                     row[key] = value
+            elif key == "endpoint" and isinstance(value, str):
+                if len(value) <= 160 and _ENDPOINT.fullmatch(value):
+                    row[key] = value
             elif key in _ENUMS and isinstance(value, str) and value in _ENUMS[key]:
                 row[key] = value
             elif key == "error_type" and isinstance(value, str):
@@ -424,8 +538,8 @@ class DeliveryMonitor:
                     row[key] = value
             elif key == "sqlite_error_name" and value in _SQLITE_ERROR_NAMES.values():
                 row[key] = value
-            elif key in {"job_ids", "item_ids", "observation_item_ids", "observation_job_ids"} \
-                    and isinstance(value, list):
+            elif key in {"job_ids", "item_ids", "observation_item_ids", "observation_job_ids",
+                         "near_item_ids"} and isinstance(value, list):
                 pattern = r"[a-f0-9]{16,64}" if key in {"job_ids", "observation_job_ids"} \
                     else r"ip-\d{1,20}"
                 maximum = 500 if key.startswith("observation_") else 10
@@ -447,40 +561,32 @@ class DeliveryMonitor:
         encoded = (json.dumps(row, separators=(",", ":"), allow_nan=False) + "\n").encode()
         try:
             self._writer.append(encoded)
-            with self._lock:
-                self._last_error = None
-        except OSError:
-            with self._lock:
-                self._last_error = "file_unavailable"
-                self._dropped += 1
-            if self.console:
-                log.error(
-                    json.dumps(
-                        {
-                            "event": "monitor_error",
-                            "reason": "file_unavailable",
-                            "entry_point": self.entry_point,
-                            "run_id": self.run_id,
-                            "correlation_id": row["correlation_id"],
-                        }
-                    )
-                )
+        except OSError as exc:
+            self._written(exc, correlation_id=row["correlation_id"])
             return False
+        if not self._writer.background:  # The writer thread reports its own writes.
+            self._written(None)
         if self.console:
             level = logging.INFO
             if event in {"worker_error", "dispatch_failed", "privacy_blocked", "welcome_error",
-                         "referral_error"}:
+                         "referral_error", "pro_access_error", "free_role_error"}:
                 level = logging.ERROR
             elif event in {"dispatch_retry", "dispatch_throttled", "audit_throttled"}:
                 level = logging.WARNING
             log.log(level, encoded.decode().rstrip())
         return True
 
-    def intake(self, result, *, seed_only=False, items=None):
+    def intake(self, result, *, seed_only=False, items=None, searched=0):
+        items = items or []
         emit_event(
             self.emit,
             "intake",
             **{key: result.get(key, 0) for key in ("new", "duplicates", "queued")},
+            # Cards with no readable value, out-of-stock cards, and items whose
+            # Walmart search query was supplied (for request search matching).
+            value_missing=sum(1 for item in items if item.get("value_cents") is None),
+            unavailable=sum(1 for item in items if item.get("available") is not True),
+            searched=searched,
             observations=result.get("accepted", result.get("new", 0) + result.get("duplicates", 0)),
             seed_only=seed_only,
             observation_item_ids=[item.get("item_id") for item in (items or [])],

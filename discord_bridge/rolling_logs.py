@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import gzip
 import logging
 import os
@@ -10,6 +11,7 @@ import shutil
 import threading
 import time
 import uuid
+from collections import deque
 from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,6 +22,9 @@ _LOCKS_GUARD = threading.Lock()
 # append to or rotate the same path. Access is serialized by its existing lock.
 _ROLLBACKS: dict[str, int] = {}
 RETENTION_DAYS = 60
+# Lines a background writer may hold before appends are refused (callers count
+# them as dropped): minutes of peak traffic, a few MiB of memory at most.
+MAX_PENDING = 10_000
 
 
 class RollingLog:
@@ -32,7 +37,8 @@ class RollingLog:
 
     def __init__(
         self, path, *, max_bytes=10 * 1024 * 1024, total_bytes=64 * 1024 * 1024,
-        retention_days=RETENTION_DAYS, backups=256, clock=None,
+        retention_days=RETENTION_DAYS, backups=256, clock=None, background=False,
+        on_write=None,
     ):
         if max_bytes < 1 or total_bytes < max_bytes or retention_days < 1 or backups < 1:
             raise ValueError("invalid log retention bounds")
@@ -47,6 +53,21 @@ class RollingLog:
         self._path_key = str(self.path.resolve())
         with _LOCKS_GUARD:
             self._lock = _LOCKS.setdefault(self._path_key, threading.RLock())
+        # Background mode: append() only queues the line and one thread writes,
+        # so a slow disk never holds up a request or a Discord send (on the
+        # Windows bind mount each append's open/close costs 8-18 ms). Order is
+        # kept and lines waiting together go out in one write. on_write(error,
+        # lines) reports every background write, failed (error set) or not.
+        self.background = background
+        self._on_write = on_write
+        if background:
+            self._pending = deque()
+            self._ready = threading.Condition()
+            self._writing = False
+            threading.Thread(
+                target=self._drain, name=f"log-writer-{self.path.name}", daemon=True
+            ).start()
+            atexit.register(self.flush)
 
     @contextmanager
     def _process_lock(self):
@@ -118,6 +139,58 @@ class RollingLog:
             raise ValueError("log record exceeds segment size")
         if not encoded:
             return
+        if not self.background:
+            self._write(encoded)
+            return
+        with self._ready:
+            if len(self._pending) >= MAX_PENDING:
+                raise OSError("log writer is behind")
+            self._pending.append(encoded)
+            self._ready.notify_all()
+
+    def _drain(self):
+        while True:
+            with self._ready:
+                while not self._pending:
+                    self._ready.wait()
+                batch = [self._pending.popleft()]
+                size = len(batch[0])
+                while self._pending and size + len(self._pending[0]) <= self.max_bytes:
+                    size += len(self._pending[0])
+                    batch.append(self._pending.popleft())
+                self._writing = True
+            # One retry: a batch holds many lines, and a partial write is rolled
+            # back first, so a brief lock or disk hiccup costs nothing.
+            for attempt in range(2):
+                try:
+                    self._write(b"".join(batch))
+                    error = None
+                    break
+                except Exception as exc:  # Reported below; the writer itself never stops.
+                    error = exc
+                    if not attempt:
+                        time.sleep(0.05)
+            if self._on_write is not None:
+                with suppress(Exception):
+                    self._on_write(error, len(batch))
+            with self._ready:
+                self._writing = False
+                self._ready.notify_all()
+
+    def flush(self, timeout=5.0) -> bool:
+        """Wait for queued lines to be written; False if any remain at the deadline."""
+        if not self.background:
+            return True
+        deadline = time.monotonic() + timeout
+        with self._ready:
+            while self._pending or self._writing:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._ready.wait(remaining)
+        return True
+
+    def _write(self, encoded: bytes):
         with self._lock, self._process_lock():
             rollback = _ROLLBACKS.get(self._path_key)
             if rollback is not None:

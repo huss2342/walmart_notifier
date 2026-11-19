@@ -22,7 +22,9 @@ def product(value, number="123456789", title="Recliner chair"):
 
 @pytest.mark.parametrize("query", ["recliner", "123456789"])
 @pytest.mark.parametrize(
-    "value,eligible", [(None, False), (9999, False), (10000, True), (10001, True)]
+    # A listing that shows no value still alerts (the DM says so): about a
+    # third of reviewer cards omit it, and skipping them silently hid matches.
+    "value,eligible", [(None, True), (9999, False), (10000, True), (10001, True)]
 )
 def test_minimum_is_inclusive_for_keywords_and_exact_ids(tmp_path, query, value, eligible):
     store, jobs = setup_store(tmp_path)
@@ -87,16 +89,14 @@ def test_bulk_capacity_duplicate_and_preflight_are_atomic(tmp_path):
     store, _ = setup_store(tmp_path)
     for number in range(8):
         store.add(USER, f"keyword {number}", now=10)
-    with pytest.raises(ValueError, match="10"):
-        store.add_many(USER, "chair, recliner, sofa", now=11)
     store.validate_add(USER, "chair, recliner", min_value="100.25")
     assert len(store.list(USER)) == 8
     rows = store.add_many(USER, "chair, keyword 0", now=11)
     assert [row.get("already_saved", False) for row in rows] == [False, True]
     assert len(store.list(USER)) == 9
-    rows = store.add_many(USER, "chair, recliner, CHAIR", now=12)
-    assert len(rows) == 2 and rows[0]["already_saved"] is True
-    assert len(store.list(USER)) == 10
+    rows = store.add_many(USER, "chair, recliner, CHAIR, sofa, desk", now=12)
+    assert len(rows) == 4 and rows[0]["already_saved"] is True
+    assert len(store.list(USER)) == 12, "there is no per-member request cap"
 
 
 def test_overlapping_batches_reuse_existing_phrase_without_changing_it(tmp_path):
@@ -191,7 +191,7 @@ def test_unfiltered_watch_still_matches_when_overlapping_filtered_watch_does_not
     store, jobs = setup_store(tmp_path)
     store.add(USER, "recliner", min_value=100, now=10)
     store.add(USER, "chair", now=10)
-    jobs.record([product(None)], now=11)
+    jobs.record([product(9999)], now=11)
     assert store.claim(now=12)["queries"] == ["chair"]
 
 
@@ -230,7 +230,7 @@ def test_edit_rejects_bulk_without_changing_saved_request(tmp_path):
     assert store.list(USER) == [row]
 
 
-@pytest.mark.parametrize("latest_value", [None, 9999])
+@pytest.mark.parametrize("latest_value", [5000, 9999])
 def test_send_revalidates_latest_value_and_fresh_eligible_observation_rearms(
     tmp_path, latest_value
 ):
@@ -283,5 +283,180 @@ def test_concurrent_bulk_adds_cannot_overfill_member_capacity(tmp_path):
             return 0
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        assert sum(pool.map(add_batch, range(2))) == 2
-    assert len(store.list(USER)) == 10
+        assert sum(pool.map(add_batch, range(2))) == 4
+    assert len(store.list(USER)) == 12
+
+
+@pytest.mark.parametrize(
+    "query,title",
+    [
+        ("chairs", "Ergonomic Office Chair"),
+        ("chair", "Set of 2 Dining Chairs"),
+        ("e-bike", "Jasion EB5 eBike for Adults"),
+        ("ebike", "Folding E-Bike 500W"),
+        ("ride on", "Kids Ride-On Truck 12V"),
+        ("air fryer", "Ninja Airfryer 4qt"),
+        ("batteries", "AA Battery 24 Pack"),
+    ],
+)
+def test_keyword_matching_folds_plurals_and_joined_words(tmp_path, query, title):
+    store, jobs = setup_store(tmp_path)
+    store.add(USER, query, now=10)
+    jobs.record([product(5000, title=title)], now=11)
+    assert store.claim(now=12)["queries"] == [query]
+
+
+def test_walmart_search_results_match_the_requests_own_search(tmp_path):
+    store, jobs = setup_store(tmp_path)
+    store.add(USER, "electric bicycle", min_value=100, now=10)
+    bike = product(64999, number="111111111", title="Soonaway Electric Bike for Adults")
+    cheap = product(2999, number="222222222", title="Electric Bike Horn")
+    unknown = product(None, number="333333333", title="Electric Bike Seat")
+    other = product(64999, number="444444444", title="Soonaway Electric Bike for Adults 2")
+    jobs.record([bike, cheap, unknown], now=11, search_queries={
+        bike["item_id"]: "electric bicycle", cheap["item_id"]: "electric bicycle",
+        unknown["item_id"]: "Electric Bicycle"})
+    jobs.record([other], now=11, search_queries={other["item_id"]: "ebike"})
+    job = store.claim(now=12)
+    assert job["item_id"] == bike["item_id"] and job["search_queries"] == ["electric bicycle"]
+    from discord_bridge.request_delivery import render_request_message
+
+    text = render_request_message(job)["embeds"][0]["description"]
+    assert "Walmart's search results for: electric bicycle" in text
+    store.settle(job, "sent", now=13, message_id="1" * 18)
+    # Below the minimum, value not shown, or a different search: no alert.
+    assert store.claim(now=14) is None
+
+
+def test_item_seen_by_several_lanes_alerts_a_member_once(tmp_path):
+    store, jobs = setup_store(tmp_path)
+    store.add_many(USER, "recliner, chair", now=10)
+    item = product(15000)
+    jobs.record([item], now=11)  # home/departments lane: keyword match
+    jobs.record([item], now=12, search_queries={item["item_id"]: "recliner"})  # requests lane
+    job = store.claim(now=13)
+    assert job["queries"] == ["recliner", "chair"]
+    store.settle(job, "sent", now=14, message_id="1" * 18)
+    jobs.record([item], now=15, search_queries={item["item_id"]: "chair"})
+    assert store.claim(now=16) is None
+
+
+def test_unknown_value_is_flagged_in_the_dm(tmp_path):
+    from discord_bridge.request_delivery import render_request_message
+
+    store, jobs = setup_store(tmp_path)
+    store.add(USER, "recliner", min_value=100, now=10)
+    jobs.record([product(None)], now=11)
+    text = render_request_message(store.claim(now=12))["embeds"][0]["description"]
+    assert "Value: not shown" in text
+
+
+def test_valueless_variant_rows_do_not_satisfy_a_minimum(tmp_path):
+    store, jobs = setup_store(tmp_path)
+    store.add(USER, "bike", min_value=100, now=10)
+    jobs.record([product(None, title="Blue, variant on Mini Bike Horn")], now=11)
+    assert store.claim(now=12) is None
+    jobs.record([product(None, number="987654321", title="Electric Bike for Adults")], now=13)
+    assert store.claim(now=14)["item"]["title"] == "Electric Bike for Adults"
+
+
+def test_near_misses_are_logged_with_reasons_and_item_ids(tmp_path):
+    store, jobs = setup_store(tmp_path)
+    store.add(USER, "recliner", min_value=100, now=10)
+    events = []
+    sink = lambda name, **fields: events.append((name, fields))  # noqa: E731
+    cheap = product(5000, number="111111111")
+    gone = normalize_item({"item_id": "ip-222222222", "title": "Recliner chair",
+                           "value_cents": 20000, "available": False})
+    hit = product(20000, number="333333333")
+    jobs.record([cheap, gone, hit], now=11, request_event_sink=sink)
+    (name, row), = [event for event in events if event[0] == "request_match"]
+    assert row["matched"] == 1 and row["item_ids"] == [hit["item_id"]]
+    assert row["below_minimum"] == 1 and row["unavailable"] == 1
+    assert row["near_item_ids"] == [cheap["item_id"], gone["item_id"]]
+
+
+def test_search_results_without_any_shared_word_are_not_matches(tmp_path):
+    store, jobs = setup_store(tmp_path)
+    store.add(USER, "NAS", now=10)
+    store.add(USER, "filing cabinet", now=10)
+    cable = product(1399, number="111111111", title="Cat 6 Ethernet Cable 50 ft")
+    nas = product(29999, number="222222222", title="Synology 2-Bay Diskstation NAS")
+    cabinet = product(12999, number="333333333", title="Rolling File Cabinet with 3 Drawers")
+    jobs.record([cable, nas, cabinet], now=11, search_queries={
+        cable["item_id"]: "nas", nas["item_id"]: "nas", cabinet["item_id"]: "filing cabinet"})
+    found = set()
+    while (job := store.claim(now=12)) is not None:
+        found.add(job["item_id"])
+        store.settle(job, "sent", now=12, message_id="1" * 18)
+    assert found == {nas["item_id"], cabinet["item_id"]}
+
+
+def test_request_dm_goes_before_pro_post_and_releases_it(tmp_path):
+    import time
+
+    store, jobs = setup_store(tmp_path)
+    woke = []
+    store.on_release = lambda: woke.append(1)
+    store.add(USER, "recliner", now=1)
+    now = time.time()
+    jobs.record([product(10000), product(10000, "987654321", "Desk lamp")], now=now)
+
+    def holds():
+        with sqlite3.connect(store.path) as db:
+            return dict(db.execute(
+                "SELECT item_id,MAX(next_attempt)>? FROM jobs WHERE route!='yesterday-recap' "
+                "GROUP BY item_id", (now + 1,)))
+
+    # Requested item's Pro posts wait for the DM; unrelated items do not.
+    assert holds() == {"ip-123456789": 1, "ip-987654321": 0}
+    job = store.claim(now=now)
+    store.settle(job, "sent", message_id="444444444444444444")
+    assert holds() == {"ip-123456789": 0, "ip-987654321": 0} and woke == [1]
+
+
+def test_older_matches_wait_and_bundle_while_new_listings_alert_at_once(tmp_path):
+    from discord_bridge.request_delivery import render_request_message
+    from discord_bridge.request_store import BACKLOG_GATHER_SECONDS
+
+    store, jobs = setup_store(tmp_path)
+    old = [product(15000, str(100000000 + index)) for index in range(3)]
+    jobs.record(old, now=100)  # Listed before the member asked.
+    store.add(USER, "recliner", now=200)
+    jobs.record([*old, product(15000, "987654321")], now=300)
+    fresh = store.claim(now=301)
+    assert fresh["item_id"] == "ip-987654321" and not fresh.get("bundle")
+    assert store.settle(fresh, "sent", message_id="444444444444444444")
+    assert store.claim(now=300 + BACKLOG_GATHER_SECONDS - 1) is None, "older matches gather first"
+    job = store.claim(now=300 + BACKLOG_GATHER_SECONDS)
+    bundle = [job, *job["bundle"]]
+    assert sorted(row["item_id"] for row in bundle) == sorted(item["item_id"] for item in old)
+    payload = render_request_message(store.begin_send(store.validate(job, now=361), now=361,
+                                                      channel_id="555555555555555555"))
+    # One compact list, not a card per item; numbered Claim buttons.
+    assert len(payload["embeds"]) == 1 and "3 items" in payload["content"]
+    assert payload["embeds"][0]["description"].count("Matched: recliner") == 3
+    assert sum(len(row["components"]) for row in payload["components"]) == 3
+    buttons = [button for row in payload["components"] for button in row["components"]]
+    assert all("Claim item" in b["label"] and "sampling" in b["url"].lower() for b in buttons)
+    assert store.settle(job, "sent", message_id="666666666666666666")
+    with sqlite3.connect(store.path) as db:
+        states = db.execute(
+            "SELECT state,COUNT(*) FROM personal_request_alerts GROUP BY state").fetchall()
+    assert states == [("sent", 4)]
+    assert store.claim(now=400) is None
+
+
+def test_bundle_retry_returns_every_member_to_the_queue(tmp_path):
+    from discord_bridge.request_store import BACKLOG_GATHER_SECONDS
+
+    store, jobs = setup_store(tmp_path)
+    old = [product(15000, str(100000000 + index)) for index in range(2)]
+    jobs.record(old, now=100)
+    store.add(USER, "recliner", now=200)
+    jobs.record(old, now=300)
+    job = store.claim(now=300 + BACKLOG_GATHER_SECONDS)
+    assert len(job["bundle"]) == 1
+    assert store.retry(job, now=361, delay=5)
+    again = store.claim(now=367)
+    assert len([again, *again["bundle"]]) == 2

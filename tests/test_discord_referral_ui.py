@@ -179,9 +179,10 @@ def test_free_member_gets_a_private_link_after_deferring_and_off_event_loop():
     assert len(service.calls) == 1 and service.calls[0][0] == USER
     assert service.calls[0][1] != main_thread
     text = interaction.messages[-1][0]
-    assert VIEW["url"] in text and "`RR12345`" in text
-    assert "30% off their first month" in text and "30% off your next month" in text
-    assert "normal price" in text and "$30.00/month" in text
+    # Friends redeem in Discord so Pro links automatically; no raw Whop link.
+    assert VIEW["url"] not in text and "`RR12345`" in text and "Have a referral code?" in text
+    assert "30% off their first paid month" in text and "30% off your next month" in text
+    assert "3 days free" in text and "$30.00/month" in text
     assert "No paid referrals yet" in text
     assert_private(interaction)
 
@@ -251,7 +252,7 @@ def test_manual_tester_keeps_rewards_until_a_paid_membership_is_linked():
     run(handler, interaction)
     text = interaction.messages[-1][0]
     assert "2 discounted months saved" in text
-    assert "link a paid membership through Whop" in text
+    assert "first paid month once you start Pro" in text
     assert "Next payment:" not in text
 
 
@@ -454,7 +455,7 @@ def test_timeout_does_not_readmit_a_member_while_the_underlying_thread_is_alive(
                 break
             await asyncio.sleep(0.001)
         assert len(service.calls) == 2
-        assert VIEW["url"] in retry.messages[-1][0]
+        assert "`RR12345`" in retry.messages[-1][0]
 
     asyncio.run(scenario())
 

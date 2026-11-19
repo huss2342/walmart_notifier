@@ -940,3 +940,22 @@ def test_bind_membership_failure_preserves_exact_existing_state(tmp_path, failur
     assert result["assessment"]["ok"] is False
     assert path.read_bytes() == original
     assert client.writes == writes_before
+
+
+def test_everyone_may_hold_add_reactions_only(tmp_path):
+    reactions = 1 << 6
+    client, path, state = apply_server(tmp_path)
+    client.roles[0]["permissions"] = str(reactions)
+    assert audit(client, GUILD, state)["ok"]
+    channel = state["channels"]["price-under-10"]
+    assert client.permissions(channel, [state["roles"]["pro"]]) & reactions
+    # Paid roles still need zero guild permissions.
+    next(r for r in client.roles if r["id"] == state["roles"]["pro"])["permissions"] = str(
+        reactions
+    )
+    assert not audit(client, GUILD, state)["ok"]
+    # Re-provision strips anything extra on @everyone but keeps reactions.
+    client = FakeDiscord()
+    client.roles[0]["permissions"] = str(reactions | CREATE_INVITE)
+    provision(client, GUILD, BOT, tmp_path / "fresh.json", apply=True)
+    assert client.roles[0]["permissions"] == str(reactions)

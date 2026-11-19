@@ -18,7 +18,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from .api import DiscordError
+from .api import DiscordError, retry_local_contention
 from .monitoring import emit_event, error_fields
 from .request_store import member_ref
 
@@ -27,6 +27,7 @@ _POLL_SECONDS = 30
 _REJOIN_SECONDS = 86400
 _RETENTION_SECONDS = 7 * 86400
 _MAX_PENDING = 1000
+_IDLE_AUDIT_SECONDS = 600
 
 
 class _Deferred(Exception):
@@ -66,6 +67,7 @@ class WelcomeWorker:
         self._lock = threading.RLock()
         self._cycle_lock = threading.Lock()
         self._next_poll = 0
+        self._next_audit = 0
         self._last_success = None
         self._last_error = None
         self._configured = False
@@ -155,11 +157,15 @@ class WelcomeWorker:
     def request(self, *args, **kwargs):
         """Audit proxy rechecks product priority before every provider request."""
         self._available()
-        return self.client.request(*args, **kwargs)
+        return retry_local_contention(
+            self.client.request, *args, stop_event=self.stop_event, **kwargs
+        )
 
     def _history(self, channel, **kwargs):
         self._available()
-        rows = self.client.channel_messages(channel, **kwargs)
+        rows = retry_local_contention(
+            self.client.channel_messages, channel, stop_event=self.stop_event, **kwargs
+        )
         if not isinstance(rows, list) or len(rows) > kwargs.get("limit", 100):
             raise DiscordError("Invalid welcome history response")
         for row in rows:
@@ -261,8 +267,9 @@ class WelcomeWorker:
     def _payload(self, row):
         return {
             "content": (
-                f"Welcome <@{row['user_id']}>! Choose your plan in <#{self.plan_guide}>, "
-                f"then visit <#{self.notification_guide}> to pick your notifications. "
+                f"Welcome <@{row['user_id']}>! ⚡ Pro alerts hit Discord within ~6 seconds. "
+                f"Tap **Try Pro free** in <#{self.plan_guide}> for 3 free days ($0 today), "
+                f"then pick your feeds and notifications in <#{self.notification_guide}>. "
                 "Glad you're here!"
             ),
             "allowed_mentions": {
@@ -344,8 +351,7 @@ class WelcomeWorker:
                 self._settle(row["event_id"], "pending")
                 raise
             except DiscordError as exc:
-                self._delivery_event("welcome_error", row, status=exc.status,
-                                     provider_code=exc.provider_code, **error_fields(exc))
+                self._delivery_event("welcome_error", row, **error_fields(exc))
                 if exc.status == 429:
                     delay = exc.retry_after
                     delay = (
@@ -376,6 +382,22 @@ class WelcomeWorker:
                    correlation_id=self._correlation_id, dispatch_id=dispatch,
                    member_ref=member_ref(row["user_id"]), **fields)
 
+    def _audit(self, now):
+        self._configured = False
+        if not self._ready():
+            self._next_audit = 0
+            return False
+        self._next_audit = now + _IDLE_AUDIT_SECONDS
+        return True
+
+    def _sendable(self, now):
+        with self._db() as db:
+            return db.execute(
+                "SELECT 1 FROM welcomes WHERE state IN ('pending','sending') "
+                "AND next_attempt<=? LIMIT 1",
+                (now,),
+            ).fetchone() is not None
+
     def tick(self):
         result = {
             "sent": 0,
@@ -395,8 +417,12 @@ class WelcomeWorker:
             previous_error = self._last_error
             try:
                 self._available()
-                self._configured = False
-                if not self._ready():
+                # The audit gates sending, not reading. Polling only reads one
+                # page, so a full multi-request audit runs before any send and
+                # otherwise at most every _IDLE_AUDIT_SECONDS to keep health
+                # current. Every send still gets a fresh, uncached audit.
+                audited = now >= self._next_audit
+                if audited and not self._audit(now):
                     result["blocked"] = True
                     return result
                 self._last_error = None
@@ -415,7 +441,11 @@ class WelcomeWorker:
                 if not ingested:
                     self._last_error = "backlog_full"
                     result["deferred"] = True
-                self._send_pending(result, now)
+                if self._sendable(now) and not result["blocked"]:
+                    if not audited and not self._audit(now):
+                        result["blocked"] = True
+                        return result
+                    self._send_pending(result, now)
                 self._last_success = now
             except _Deferred:
                 result["deferred"] = True
@@ -425,7 +455,6 @@ class WelcomeWorker:
                 if self._last_error != previous_error:
                     emit_event(self.event_sink, "welcome_error", component=self.component,
                                phase="welcome", correlation_id=self._correlation_id,
-                               status=exc.status, provider_code=exc.provider_code,
                                **error_fields(exc))
                 if (
                     exc.status == 429
@@ -485,7 +514,7 @@ class WelcomeWorker:
             emit_event(self.event_sink, "worker_lifecycle", component=self.component,
                        transition="stopped")
 
-        self._thread = threading.Thread(target=work, name="discord-welcome", daemon=True)
+        self._thread = threading.Thread(target=work, name=f"discord-{self.component}", daemon=True)
         self._thread.start()
 
     def stop(self):

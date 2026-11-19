@@ -59,7 +59,7 @@ def test_own_status_is_private_and_read_only(tmp_path, status):
         "active": "ends",
         "expired": "expired",
         "revoked": "ended early",
-        "none": "no recorded",
+        "none": "no pro right now",
     }[status] in content.lower()
     assert options["ephemeral"] and not options["allowed_mentions"].users
     assert calls and store.get(USER) == before
@@ -81,8 +81,15 @@ def test_separate_pro_does_not_invent_paid_expiry(tmp_path):
     roles.append(TRIAL_STATE["roles"]["pro"])
     asyncio.run(handler.show(target))
     content = target.messages[-1][0]
-    assert "separate Pro access" in content and "no recorded" in content
-    assert "subscription" not in content and "<t:" not in content
+    assert "You have Pro" in content and "My account" in content
+    assert "<t:" not in content
+
+
+def test_no_trial_points_to_whop_trial(tmp_path):
+    handler, target, _store, _roles, _calls, _clock = setup(tmp_path)
+    asyncio.run(handler.show(target))
+    content = target.messages[-1][0]
+    assert "3-day free trial" in content and "Try Pro free" in content
 
 
 def test_public_schema_has_no_member_or_mutation_options(tmp_path):

@@ -22,6 +22,7 @@ from .layout import (
     CATEGORIES,
     CHANNELS,
     CREATE_INVITE,
+    EVERYONE_PERMISSIONS,
     MANAGE_ROLES,
     OPTIONAL_CHANNELS,
     OPTIONAL_ROLE_NAMES,
@@ -255,7 +256,8 @@ def _role_findings(
         if ignore_everyone and role_id == state["guild_id"]:
             continue
         if role_id == state["guild_id"] or role_id in paid_roles:
-            if permissions:
+            extra = EVERYONE_PERMISSIONS if role_id == state["guild_id"] else 0
+            if permissions & ~extra:
                 findings.append(
                     f"Role {role_id}: expected zero guild permissions; "
                     "access belongs in channel overwrites."
@@ -299,9 +301,11 @@ def _role_findings(
             not positions or any(type(p) is not int for p in positions)
             or type(trial.get("position")) is not int
             or type(pro.get("position")) is not int
-            or not trial["position"] < max(positions) < pro["position"]
+            # Since 2026-11-16 the bot grants paid Pro itself (Discord-first checkout,
+            # pro_access.py), so it may sit above Pro; it must still outrank Pro Trial.
+            or not trial["position"] < max(positions)
         ):
-            findings.append("Trial bot must be above Pro Trial and strictly below paid Pro.")
+            findings.append("Trial bot must be above Pro Trial.")
         if not any(
             int(roles.get(role_id, {}).get("permissions", "0")) & MANAGE_ROLES
             for role_id in bot_roles
@@ -619,8 +623,10 @@ def provision(
     if widget["enabled"] or widget.get("channel_id") is not None:
         actions.append({"action": "disable-widget"})
     everyone = next(role for role in snapshot["roles"] if role["id"] == guild_id)
-    if int(everyone.get("permissions", "0")) or everyone.get("mentionable"):
-        actions.append({"action": "restrict-everyone", "permissions": "0", "mentionable": False})
+    everyone_permissions = int(everyone.get("permissions", "0"))
+    if everyone_permissions & ~EVERYONE_PERMISSIONS or everyone.get("mentionable"):
+        kept = str(everyone_permissions & EVERYONE_PERMISSIONS)
+        actions.append({"action": "restrict-everyone", "permissions": kept, "mentionable": False})
     for key, name in ROLE_NAMES.items():
         if key not in state["roles"]:
             actions.append({"action": "create-role", "key": key, "name": name, "permissions": "0"})
@@ -668,7 +674,7 @@ def provision(
             client.request(
                 "PATCH",
                 f"/guilds/{guild_id}/roles/{guild_id}",
-                {"permissions": "0", "mentionable": False},
+                {"permissions": action["permissions"], "mentionable": False},
             )
         elif kind == "create-role":
             role = client.request(

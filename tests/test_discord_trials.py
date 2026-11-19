@@ -109,6 +109,26 @@ def grant(service, user=USER, *, seconds=100):
     return service.grant(user, seconds=seconds, actor_id=OWNER, interaction_id="grant:" + user)
 
 
+def test_trial_worker_logs_rate_limit_provenance_without_private_provider_text(tmp_path):
+    import json
+
+    from discord_bridge.api import DeliveryOutcome
+    from discord_bridge.monitoring import DeliveryMonitor
+
+    service, discord, _, _ = setup(tmp_path, requests=Requests())
+    monitor = DeliveryMonitor(tmp_path / "logs", entry_point="collector_worker", console=False)
+    service.event_sink = monitor.emit
+    discord.member_failure = DiscordError("Private member body", status=429, retry_after=7,
+        global_limit=True, rate_limit_source="local", outcome=DeliveryOutcome.NOT_SUBMITTED)
+    service.step()
+    rows = [json.loads(line) for line in monitor.path.read_text().splitlines()]
+    error = next(row for row in rows if row.get("phase") == "member")
+    assert error["status"] == 429 and error["retry_after_seconds"] == 7
+    assert error["rate_limit_source"] == "local" and error["global_limit"] is True
+    assert error["outcome"] == "not_submitted" and error["error_type"] == "DiscordError"
+    assert USER not in json.dumps(rows) and "Private" not in json.dumps(rows)
+
+
 def test_grant_is_durable_and_expiration_removes_only_trial_role(tmp_path):
     service, discord, now, state = setup(tmp_path)
     discord.members[USER]["roles"] = [PRO]
@@ -187,18 +207,25 @@ def test_expiry_deletes_requests_but_retains_those_of_a_paid_member(tmp_path):
 
 def test_paid_access_loss_is_cleaned_up_and_provider_failure_is_not_loss(tmp_path):
     requests = Requests()
-    service, discord, _, _ = setup(tmp_path, requests=requests)
+    service, discord, now, _ = setup(tmp_path, requests=requests)
     discord.members[USER]["roles"] = [PRO]
     discord.members[OTHER] = member(OTHER, roles=[PRO])
     service.step()
     assert not requests.revoked
+    now[0] += 300
     discord.member_failure = DiscordError(status=503)
     service.step()
     assert not requests.revoked
     discord.member_failure = None
     discord.members[USER]["roles"] = []
     service.step()
-    assert requests.revoked == [USER]
+    assert requests.revoked == [USER], "a failed sweep retries on the next step"
+    discord.members[OTHER]["roles"] = []
+    service.step()
+    assert requests.revoked == [USER], "a completed sweep rests for five minutes"
+    now[0] += 300
+    service.step()
+    assert requests.revoked == [USER, OTHER]
 
 
 def test_welcome_off_does_not_stop_expiry_or_cleanup(tmp_path):
@@ -217,6 +244,7 @@ def test_welcome_only_new_joins_once_without_retroactive_or_rejoin_extension(tmp
     assert not service.store.active(USER)
     now[0] = 1001
     discord.members[OTHER] = member(OTHER, joined=1001)
+    service._next_scan = 0  # the 60s member-scan interval has elapsed
     service.step()
     assert service.store.active(OTHER)
     expiry = service.list()[0]["expires_at"]
@@ -310,6 +338,9 @@ def test_role_reassigned_after_confirmed_expiry_is_removed_again(tmp_path):
     now[0] = 1100
     service.step()
     discord.members[USER]["roles"] = [TRIAL]
+    service.step()
+    assert TRIAL in discord.members[USER]["roles"], "found by the next member scan"
+    now[0] += 60
     service.step()
     assert TRIAL not in discord.members[USER]["roles"]
 

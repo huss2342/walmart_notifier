@@ -13,11 +13,18 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
-from .api import DiscordError
+from .api import DiscordError, retry_local_contention
 from .monitoring import emit_event, error_fields
 
 _MAX_DURATION = 366 * 86400
 _PAGE_SIZE = 1000
+# Personal-alert delivery re-verifies Pro/trial access before every DM, so
+# this saved-watch cleanup sweep (one member GET per owner) is housekeeping.
+_CLEANUP_SECONDS = 300
+# Join-trial discovery tolerates a short delay; expiry/revocation runs every
+# step from local state. A passing role-safety check is reused for grants.
+_MEMBER_SCAN_SECONDS = 60
+_ROLE_CHECK_SECONDS = 300
 
 
 def _id(value):
@@ -354,6 +361,8 @@ class TrialService:
         self._lock, self._stop = threading.RLock(), threading.Event()
         self._thread = None
         self._member_after = self._request_after = None
+        self._next_cleanup = 0
+        self._next_scan = self._role_checked_until = 0
         self._last_error = self._last_poll = None
 
     def _error(self, exc, phase):
@@ -362,15 +371,18 @@ class TrialService:
             self.event_sink, "worker_error", component="trials", phase=phase, **error_fields(exc)
         )
 
+    def _request(self, *args):
+        return retry_local_contention(self.client.request, *args, stop_event=self._stop)
+
     def _member(self, user_id):
-        row = self.client.request("GET", f"/guilds/{self.guild}/members/{user_id}")
+        row = self._request("GET", f"/guilds/{self.guild}/members/{user_id}")
         _, roles, bot = _member(row, user_id)
         if bot:
             raise ValueError("Trials are available to human members only.")
         return roles
 
     def _safe_role(self):
-        rows = self.client.request("GET", f"/guilds/{self.guild}/roles")
+        rows = self._request("GET", f"/guilds/{self.guild}/roles")
         if not isinstance(rows, list):
             raise DiscordError("Invalid Discord role inventory")
         roles = {}
@@ -453,7 +465,7 @@ class TrialService:
                 now = self._current(now)
                 if not self.store.active(user_id, now=now):
                     continue
-            self.client.request(
+            self._request(
                 "PUT" if wanted else "DELETE",
                 f"/guilds/{self.guild}/members/{user_id}/roles/{self.role}",
             )
@@ -530,7 +542,12 @@ class TrialService:
         return self.store.list(offset=offset, limit=limit)
 
     def _scan_members(self, now, *, grant_safe):
-        rows = self.client.guild_members(self.guild, limit=_PAGE_SIZE, after=self._member_after)
+        if self._member_after is None and now < self._next_scan:
+            return 0
+        rows = retry_local_contention(
+            self.client.guild_members, self.guild, limit=_PAGE_SIZE, after=self._member_after,
+            stop_event=self._stop,
+        )
         now = self._current(now)
         if not isinstance(rows, list) or len(rows) > _PAGE_SIZE:
             raise DiscordError("Invalid Discord member page")
@@ -552,6 +569,8 @@ class TrialService:
                 restore.append(user_id)
         granted, removals = self.store.observe_members(members, now=now, allow_welcome=grant_safe)
         self._member_after = str(max(map(int, ids))) if len(rows) == _PAGE_SIZE else None
+        if self._member_after is None:
+            self._next_scan = now + _MEMBER_SCAN_SECONDS
         for user_id in restore:
             self.store.set_sync(user_id, False)
         for user_id in (removals + granted)[:60]:
@@ -564,18 +583,23 @@ class TrialService:
         return len(granted)
 
     def _cleanup_requests(self, now):
-        if self.requests is None:
+        if self.requests is None or now < self._next_cleanup:
             return 0
         owners = self.requests.owners(limit=50, after=self._request_after)
-        cleaned = 0
+        cleaned, failed = 0, False
         for user_id in owners:
             if self._stop.is_set():
                 break
             try:
                 cleaned += self._cleanup(_id(user_id), now)
             except Exception as exc:
+                failed = True
                 self._error(exc, "member")
         self._request_after = owners[-1] if len(owners) == 50 else None
+        # Continue a long owner list next step and retry provider failures next
+        # step; otherwise rest until the next sweep.
+        if self._request_after is None and not failed:
+            self._next_cleanup = now + _CLEANUP_SECONDS
         return cleaned
 
     def step(self, now=None):
@@ -583,11 +607,14 @@ class TrialService:
             now = _number(self.clock() if now is None else now)
             self._last_error = None
             result = {"synced": 0, "welcome_grants": 0, "cleaned": 0}
-            try:
-                grant_safe = self._safe_role()
-            except Exception as exc:
-                self._error(exc, "audit")
-                grant_safe = False
+            grant_safe = now < self._role_checked_until
+            if not grant_safe:
+                try:
+                    grant_safe = self._safe_role()
+                except Exception as exc:
+                    self._error(exc, "audit")
+                    grant_safe = False
+                self._role_checked_until = now + _ROLE_CHECK_SECONDS if grant_safe else 0
             now = self._current(now)
             for user_id in self.store.reconciliation_users(now=now):
                 if self._stop.is_set():

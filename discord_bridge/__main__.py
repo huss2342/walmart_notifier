@@ -16,6 +16,7 @@ from pathlib import Path
 
 from .api import DiscordClient, DiscordError
 from .core import JobStore, render_message, route_keys, validate_batch
+from .elite_signal import EliteSignal
 from .monitoring import DeliveryMonitor, emit_event
 from .provision import ProvisionError
 from .service import deliver_due, make_server
@@ -222,6 +223,7 @@ def main(argv=None) -> int:
             on_queued=waking.set,
             on_observed=lambda result, items: monitor.intake(result, items=items),
             event_sink=monitor.emit,
+            elite_signal=EliteSignal.from_env(monitor.emit),
         )
 
         def worker():

@@ -43,10 +43,18 @@ class MyTrialCommands:
             raise ValueError("Human members only")
         row = self.service.store.get(user, now=self.service.clock())
         separate = self.state["roles"]["pro"] in roles
-        lines = ["**Your Pro trial**"]
+        welcome = self.state.get("channels", {}).get("welcome")
+        where = f"<#{welcome}>" if _id(welcome) else "#💳-welcome"
         if row is None:
-            lines.append("You have no recorded Pro trial.")
-        elif row["revoked"]:
+            # Free trials now run on Whop (3 days, card on file); this command
+            # only knows the retired Discord trials.
+            if separate:
+                return ("**Your Pro**\nYou have Pro. Trial dates, billing and cancelling are in "
+                        f"{where} → **My account → Manage subscription**.")
+            return ("**Your Pro**\nNo Pro right now. Start a 3-day free trial: tap "
+                    f"**Try Pro free** in {where}.")
+        lines = ["**Your Pro trial**"]
+        if row["revoked"]:
             lines.append("Your Pro trial was ended early.")
         elif row["active"]:
             expiry = int(row["expires_at"])

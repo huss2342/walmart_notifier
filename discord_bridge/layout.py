@@ -53,6 +53,9 @@ PROVISION_PERMISSIONS = SETUP_PERMISSIONS | BOT_RUNTIME_PERMISSIONS | USE_APPLIC
 # Other member actions stay unavailable through zero base permissions and the
 # strict guild-role audit; channel rules only need these posting restrictions.
 MEMBER_ACTION_DENY = SEND_MESSAGES | EMBED_LINKS
+# Sole guild-wide grant on @everyone (set by the owner; the bot never holds it).
+# Channel overwrites never deny it, so members react wherever they can read.
+EVERYONE_PERMISSIONS = ADD_REACTIONS
 
 ROLE_NAMES = {"starter": "Starter", "pro": "Pro"}
 OPTIONAL_ROLE_NAMES = {"trial": "Pro Trial"}
@@ -197,7 +200,7 @@ OPTIONAL_CHANNELS = (
         "item-requests",
         "pro-firehose",
         "Pro personal item requests. Use /request add, list, edit, delete or test-dm. "
-        "Matches are sent only by DM. Enable server DMs; ten requests per member.",
+        "Matches are sent only by DM. Enable server DMs; add as many requests as you like.",
     ),
     Channel(
         "trial-management", "operations",

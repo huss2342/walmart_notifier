@@ -302,6 +302,20 @@ def test_global_429_from_one_worker_gates_other_channels_without_retrying(monkey
     assert client.request("POST", "/channels/333/messages", {}) == {}
 
 
+def test_rate_limit_provenance_distinguishes_http_response_from_local_preflight(monkeypatch):
+    client, factory, _ = socket_client(
+        monkeypatch, SocketResponse({"global": True, "retry_after": 3.25}, status=429)
+    )
+    with pytest.raises(DiscordError) as remote:
+        client.request("POST", "/channels/111/messages", {})
+    assert remote.value.rate_limit_source == "server"
+    with pytest.raises(DiscordError) as local:
+        client.request("POST", "/channels/222/messages", {})
+    assert local.value.rate_limit_source == "local"
+    assert local.value.outcome.value == "not_submitted"
+    assert len(factory.requests) == 1
+
+
 def test_429_body_in_flight_temporarily_gates_all_reservations(monkeypatch):
     paused = PausedResponse(status=429, data={"global": True, "retry_after": 2.5})
     client, factory, _ = socket_client(monkeypatch, paused)
@@ -494,3 +508,86 @@ def test_socket_timeout_at_deadline_is_classified_without_waiting_for_watchdog(m
     assert failure.value.ambiguous
     assert len(factory.requests) == 1
     assert factory.connections[0].closed
+
+
+def test_background_retry_waits_out_brief_local_contention_only():
+    from discord_bridge.api import retry_local_contention
+
+    calls = []
+
+    def flaky(*errors):
+        pending = list(errors)
+
+        def call(*args, **kwargs):
+            calls.append((args, kwargs))
+            if pending:
+                raise pending.pop(0)
+            return "ok"
+
+        return call
+
+    local = DiscordError(status=429, retry_after=0.01, rate_limit_source="local")
+    assert retry_local_contention(flaky(local, local), "GET", "/x", limit=1) == "ok"
+    assert calls[-1] == (("GET", "/x"), {"limit": 1}) and len(calls) == 3
+    # Provider 429s, long local cooldowns and non-429 errors are never retried.
+    for error in (
+        DiscordError(status=429, retry_after=0.01, rate_limit_source="server"),
+        DiscordError(status=429, retry_after=7, rate_limit_source="local"),
+        DiscordError(status=500),
+    ):
+        calls.clear()
+        with pytest.raises(DiscordError) as raised:
+            retry_local_contention(flaky(error), "GET", "/x")
+        assert raised.value is error and len(calls) == 1
+    # The budget bounds total waiting even if contention never clears.
+    calls.clear()
+    with pytest.raises(DiscordError):
+        retry_local_contention(flaky(*[local] * 50), "GET", "/x", budget=0.05)
+    assert len(calls) <= 7
+    stopped = threading.Event()
+    stopped.set()
+    calls.clear()
+    with pytest.raises(DiscordError):
+        retry_local_contention(flaky(local), "GET", "/x", stop_event=stopped)
+    assert len(calls) == 1
+
+
+def test_idle_pooled_connection_is_replaced_before_reuse(monkeypatch):
+    client, factory, clock = socket_client(monkeypatch, SocketResponse(), SocketResponse(),
+                                           SocketResponse())
+    assert client.request("GET", "/users/@me") == {}
+    clock[0] += 5
+    assert client.request("GET", "/users/@me") == {}
+    assert len(factory.connections) == 1
+    clock[0] += client._MAX_IDLE_SECONDS + 1
+    assert client.request("GET", "/users/@me") == {}
+    assert len(factory.connections) == 2 and factory.connections[0].closed
+    assert client._connection_count == 1 and client._connections == [factory.connections[1]]
+
+
+def test_every_api_call_is_observed_without_ids_or_tokens(monkeypatch, tmp_path):
+    from discord_bridge.monitoring import DeliveryMonitor
+
+    client, _, clock = socket_client(
+        monkeypatch,
+        SocketResponse({"id": "1"}, X_RateLimit_Remaining="4"),
+        SocketResponse({"retry_after": 2}, status=429),
+    )
+    monitor = DeliveryMonitor(tmp_path, entry_point="collector_worker", console=False)
+    client.observer = monitor.emit
+    client.request("POST", "/channels/111111111111111111/messages", {})
+    with pytest.raises(DiscordError):
+        client.request("GET", "/guilds/222222222222222222/members/333333333333333333")
+    with pytest.raises(DiscordError):  # local gate: never reaches the network
+        client.request("GET", "/guilds/222222222222222222/members/333333333333333333")
+    rows = [json.loads(line) for line in monitor.path.read_text().splitlines()]
+    assert [r["event"] for r in rows] == ["discord_api"] * 3
+    sent, limited, gated = rows
+    assert sent["endpoint"] == "/channels/{major_id}/messages" and sent["method"] == "POST"
+    assert sent["status"] == 200 and sent["outcome"] == "accepted"
+    assert sent["ratelimit_remaining"] == 4 and sent["caller"] == "other"
+    assert limited["endpoint"] == "/guilds/{major_id}/members/{id}"
+    assert limited["status"] == 429 and limited["rate_limit_source"] == "server"
+    assert gated["rate_limit_source"] == "local" and gated["outcome"] == "not_submitted"
+    text = monitor.path.read_text()
+    assert "111111111111111111" not in text and "333333333333333333" not in text

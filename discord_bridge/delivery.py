@@ -9,7 +9,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from .api import DiscordError
+from .api import DiscordError, retry_local_contention
 from .monitoring import emit_event, error_fields
 from .policy import RETIRED_ROUTE_KEYS
 
@@ -21,7 +21,9 @@ class _AuditClient:
     def request(self, *args, **kwargs):
         if self.stopping.is_set():
             raise DiscordError("Delivery stopping")
-        return self.client.request(*args, **kwargs)
+        return retry_local_contention(
+            self.client.request, *args, stop_event=self.stopping, **kwargs
+        )
 
 
 def deliver_due(
@@ -37,6 +39,8 @@ def deliver_due(
     stop_event=None,
     event_sink=None,
     correlation_id=None,
+    audit_cache=None,
+    audit_ttl=0.0,
 ):
     """Send up to `limit` messages; counters distinguish items from messages.
 
@@ -176,11 +180,9 @@ def deliver_due(
                         "skipped": "dispatch_skipped",
                     }[counter],
                     batch,
-                    status=413,
                     reason="http_413_review" if outcome == "held" else "http_413",
                     ambiguous=outcome == "held",
-                    provider_code=exc.provider_code,
-                    **error_fields(exc),
+                    **error_fields(exc, status=413),
                 )
                 return {counter: count}
             limited = exc.status == 429
@@ -195,12 +197,10 @@ def deliver_due(
                 event(
                     "dispatch_failed",
                     batch,
-                    status=exc.status or 0,
                     reason=f"http_{exc.status}" if exc.status else "retry_limit",
                     ambiguous=exc.ambiguous,
                     elapsed_seconds=time.monotonic() - send_started,
-                    provider_code=exc.provider_code,
-                    **error_fields(exc),
+                    **error_fields(exc, status=exc.status or 0),
                 )
                 return {"failed": count}
             delay = exc.retry_after if limited else min(300, 2 ** min(attempts, 8))
@@ -223,14 +223,11 @@ def deliver_due(
             event(
                 "dispatch_throttled" if limited else "dispatch_retry",
                 batch,
-                status=exc.status or 0,
                 reason="rate_limited" if limited else "remote_retry",
                 scope="global" if exc.global_limit else "route",
-                retry_after_seconds=delay,
                 ambiguous=exc.ambiguous,
                 elapsed_seconds=time.monotonic() - send_started,
-                provider_code=exc.provider_code,
-                **error_fields(exc),
+                **error_fields(exc, status=exc.status or 0, retry_after_seconds=delay),
             )
             return {"retried": count, "throttled": int(limited)}
 
@@ -255,9 +252,22 @@ def deliver_due(
             defer_learned_routes()
             if next_wait() > 0 or not store.has_due(now=current()):
                 break
+            # Optional: reuse a recent passing audit (the owner's choice; it
+            # costs ~0.8s of Discord reads per wave). Failures are never cached.
+            if audit_cache is not None and audit_cache.get("until", 0) > time.monotonic():
+                assessment = {"ok": True}
+            else:
+                assessment = None
             audit_started = time.monotonic()
             try:
-                assessment = auditor(_AuditClient(client, stopping), state.get("guild_id"), state)
+                if assessment is None:
+                    assessment = auditor(
+                        _AuditClient(client, stopping), state.get("guild_id"), state
+                    )
+                    if audit_cache is not None:
+                        audit_cache.pop("until", None)
+                        if audit_ttl > 0 and assessment.get("ok") is True:
+                            audit_cache["until"] = time.monotonic() + audit_ttl
             except DiscordError as exc:
                 if exc.status == 429:
                     delay = exc.retry_after
@@ -267,13 +277,12 @@ def deliver_due(
                     event(
                         "audit_throttled",
                         scope="audit",
-                        status=429,
-                        retry_after_seconds=max(0.01, delay),
+                        **error_fields(exc, status=429, retry_after_seconds=max(0.01, delay)),
                     )
                 else:
                     result["blocked"] = True
-                    event("privacy_blocked", reason="audit_error", status=exc.status or 0,
-                          provider_code=exc.provider_code, **error_fields(exc))
+                    event("privacy_blocked", reason="audit_error",
+                          **error_fields(exc, status=exc.status or 0))
                 break
             except (ValueError, KeyError, TypeError):
                 assessment = {"ok": False}

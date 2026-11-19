@@ -262,7 +262,7 @@ def test_single_alert_keeps_original_format_and_has_no_fill_delay(tmp_path):
     assert run(store, remote)["sent"] == 1
     payload = remote.calls[0][1]
     assert "content" not in payload
-    assert payload["components"][0]["components"][0]["label"] == "Open review item"
+    assert payload["components"][0]["components"][0]["label"] == "Claim item"
 
 
 def test_old_quiet_pro_category_cannot_starve_behind_three_fresh_paid_channels(tmp_path):
@@ -358,3 +358,26 @@ def test_ready_paid_routes_take_free_slot_while_free_uses_spare_capacity(tmp_pat
     assert result["messages"] == 4
     assert all(STATE["channels"]["yesterday-recap"] not in route for route, _ in remote.calls)
     assert any(state["channels"]["price-200-plus"] in route for route, _ in remote.calls)
+
+
+def test_passing_audit_is_reused_within_its_ttl_and_failures_are_never_cached(tmp_path):
+    store = JobStore(tmp_path / "q")
+    cache, audits, verdict = {}, [], {"ok": True}
+
+    def audited(*_):
+        audits.append(True)
+        return dict(verdict)
+
+    def deliver(item, now):
+        store.record([product(item)], now=now)
+        return deliver_due(store, Remote(), STATE, live=True, now=now, auditor=audited,
+                           audit_cache=cache, audit_ttl=600)
+
+    assert deliver(1, 1000)["sent"] and len(audits) == 1
+    assert deliver(2, 1001)["sent"] and len(audits) == 1, "a recent pass is reused"
+    cache["until"] = 0  # TTL elapsed
+    verdict["ok"] = False
+    assert deliver(3, 1002)["blocked"] and len(audits) == 2
+    assert deliver(4, 1003)["blocked"] and len(audits) == 3, "failures are rechecked every wave"
+    verdict["ok"] = True
+    assert deliver(5, 1004)["sent"] and len(audits) == 4

@@ -30,7 +30,7 @@ _MAX_PAGES = 100
 _PAGE_SIZE = 100
 _ID = re.compile(r"[A-Za-z0-9]{6,80}\Z")
 _PATH = re.compile(
-    r"/(?:memberships|payments|promo_codes)(?:/[A-Za-z0-9_]+)?(?:/apply_promo_code)?\Z"
+    r"/(?:memberships|payments|promo_codes|checkout_configurations)(?:/[A-Za-z0-9_]+)?(?:/apply_promo_code)?\Z"
 )
 _PROVIDER_CODES = frozenset(
     {
@@ -352,7 +352,7 @@ class WhopClient:
         if not isinstance(account, dict) or account.get("id") != self.company_id:
             _invalid(ambiguous)
 
-    def _membership(self, row, *, ambiguous=False):
+    def _membership(self, row, *, ambiguous=False, any_plan=False):
         if not isinstance(row, dict):
             _invalid(ambiguous)
         self._account(row, ambiguous=ambiguous)
@@ -360,11 +360,15 @@ class WhopClient:
             _id(row.get("id"), "mem_")
         except ValueError:
             _invalid(ambiguous)
-        if (
-            row.get("product_id") not in self.product_ids
-            or row.get("variant_id") not in self.variant_ids
+        if row.get("product_id") not in self.product_ids or (
+            not any_plan and row.get("variant_id") not in self.variant_ids
         ):
             _invalid(ambiguous)
+        if any_plan:
+            try:
+                _id(row.get("variant_id"), "plan_")
+            except ValueError:
+                _invalid(ambiguous)
         product = row.get("product")
         if not isinstance(product, dict) or product.get("id") != row["product_id"]:
             _invalid(ambiguous)
@@ -507,13 +511,23 @@ class WhopClient:
             "variant_ids": self.variant_ids,
         }
 
-    def list_memberships(self, discord_id=None):
+    def list_memberships(self, discord_id=None, *, any_plan=False):
+        """Memberships of the configured plans (all statuses, canceled included).
+
+        ``any_plan=True`` covers every plan of the configured products, retired
+        and hidden ones too. Use it only for history checks (has this person
+        ever been a member?), never to grant access.
+        """
         query = self._query()
+        if any_plan:
+            query.pop("variant_ids")
         if discord_id is not None:
             if not isinstance(discord_id, str) or not re.fullmatch(r"[0-9]{17,20}", discord_id):
                 raise ValueError("Invalid Discord identifier")
             query["external_account"] = "discord_" + discord_id
-        return self._pages("/memberships", query, self._membership)
+        validator = (
+            (lambda row: self._membership(row, any_plan=True)) if any_plan else self._membership)
+        return self._pages("/memberships", query, validator)
 
     def retrieve_membership(self, membership_id):
         _id(membership_id, "mem_")
@@ -584,6 +598,38 @@ class WhopClient:
                 existing_memberships_only
                 and (type(row.get("stock")) is not int or row["stock"] != 1)
             )
+        ):
+            _invalid(True)
+        return row
+
+    def create_checkout(self, plan_id, *, metadata, redirect_url, idempotency_key):
+        """Personal checkout session; payments/memberships inherit its metadata."""
+        _intent(idempotency_key)
+        if plan_id not in self.variant_ids:
+            raise ValueError("Checkout plan is outside the configured scope")
+        if (
+            not isinstance(metadata, dict)
+            or not metadata
+            or len(metadata) > 10
+            or any(not isinstance(k, str) or not isinstance(v, str) or len(v) > 200 for k, v in metadata.items())
+        ):
+            raise ValueError("Invalid checkout metadata")
+        if not isinstance(redirect_url, str) or not redirect_url.startswith("https://"):
+            raise ValueError("Invalid checkout redirect")
+        row = self._request(
+            "POST",
+            "/checkout_configurations",
+            {"variant_id": plan_id, "metadata": metadata, "redirect_url": redirect_url},
+            idempotency_key=idempotency_key,
+        )
+        url = row.get("purchase_url") if isinstance(row, dict) else None
+        if (
+            not isinstance(row.get("id"), str)
+            or not isinstance(url, str)
+            or not url.startswith("https://whop.com/")
+            or len(url) > 2048
+            or any(ch.isspace() for ch in url)
+            or (row.get("metadata") or {}).get("discord_user_id") != metadata.get("discord_user_id")
         ):
             _invalid(True)
         return row

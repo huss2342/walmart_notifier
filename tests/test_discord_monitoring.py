@@ -119,7 +119,7 @@ def test_delivery_monitor_reports_sixty_day_compressed_retention(tmp_path):
     status = monitor.status()
     assert status["retention_days"] == 60
     assert status["max_bytes"] == 10 * 1024 * 1024
-    assert status["total_max_bytes"] == 64 * 1024 * 1024
+    assert status["total_max_bytes"] == 256 * 1024 * 1024
     assert status["compressed_archives"] is True
 
 
@@ -327,3 +327,24 @@ def test_standalone_startup_audit_refusal_is_persisted_before_worker_starts(
     assert rows[0]["entry_point"] == "standalone_worker"
     assert "PRIVATE" not in json.dumps(rows)
     assert "PRIVATE" not in capsys.readouterr().err
+
+
+def test_background_monitor_keeps_caller_context_and_reports_disk_failures(tmp_path):
+    from discord_bridge.telemetry_context import bind_request
+
+    monitor = DeliveryMonitor(tmp_path, entry_point="collector_worker", console=False,
+                              clock=lambda: 1234.5, background=True)
+    with bind_request("e" * 32):
+        assert monitor.emit("intake", new=1, duplicates=0, queued=1)
+    assert monitor.emit("queue_summary", jobs={"pending": 1})
+    assert monitor.flush()
+    rows = records(monitor.path)
+    assert [row["event"] for row in rows] == ["intake", "queue_summary"]
+    assert rows[0]["http_request_id"] == "e" * 32 and "http_request_id" not in rows[1]
+    assert rows[0]["timestamp"] == 1234.5
+    assert monitor.status()["last_error"] is None
+    monitor._writer._write = lambda data: (_ for _ in ()).throw(OSError("disk gone"))
+    assert monitor.emit("worker_error", error_type="RuntimeError", phase="worker")
+    assert monitor.flush()
+    assert monitor.status()["last_error"] == "file_unavailable"
+    assert monitor.status()["dropped_events"] == 1

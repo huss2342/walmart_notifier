@@ -109,7 +109,8 @@ def test_sdk_failure_records_only_safe_classification_and_http_status():
     run(handler.error(interaction, error))
     assert events == [("worker_error", {"component": "trials", "phase": "worker",
                                        "error_type": "DiscordError", "outcome": "rejected",
-                                       "status": 429})]
+                                     "status": 429, "global_limit": False,
+                                     "rate_limit_source": "unknown"})]
     assert "private-token" not in str(events) + str(interaction.messages)
 
 

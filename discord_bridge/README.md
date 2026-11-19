@@ -325,6 +325,17 @@ Use a Walmart `/ip/` product link or item ID for an exact product watch.
   privately direct the member to run `/request list` again.
 - `/request test-dm` checks delivery and resumes watches after DMs are enabled.
   It sends a test DM; it does not simulate a product match or reset product deduplication.
+- `/request listed [page]` privately lists matches that were already listed when the
+  member added a request and were seen in the last two hours, highest value first.
+
+Matches for listings that already existed when a request was added arrive after a
+one-minute gather as one compact catch-up DM: a numbered list (name, value, matched
+request) with numbered Claim buttons, showing the ten highest values. If more
+matched, the DM points to `/request listed`; the rest are not sent individually.
+Every DM is checked against Discord's message limits and a 10 KiB body ceiling
+before sending; a catch-up that would not fit continues in the next DM, labelled
+"(2 of 2)". A size rejection (413, or 400 code 50035) splits a catch-up into smaller
+DMs and never resends the rejected body; a single item fails as `payload_too_large`.
 
 Existing watches survive updates; members can edit them without deleting their
 list. Each comma-separated phrase counts as one of the ten watches, so
@@ -369,7 +380,9 @@ channel with the owner account, bind its exact ID, and register only this comman
 For an existing installation, deploy the updated request modules and restart
 the collector, then preview and apply `request_setup register` again to expose
 the optional `min_value` slash option. Existing watches migrate automatically
-without a minimum. Registration does not run automatically on startup.
+without a minimum. Registration does not run automatically on startup. After the
+2026-11-19 update, rebuild first, then preview and apply `register` once more so
+`/request listed` appears; the upsert keeps the command ID and its permissions.
 
 The plan prints the exact parent and permission overwrites: only Pro gets View,
 History, Use Application Commands and Send Messages; the bot retains its normal posting access.

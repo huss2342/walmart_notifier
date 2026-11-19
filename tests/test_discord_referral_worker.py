@@ -188,7 +188,7 @@ def test_paid_referral_applies_one_reward_then_returns_to_normal_after_use(setup
     "changes",
     [
         {"status": "open"},
-        {"billing_reason": "subscription_cycle"},
+        {"billing_reason": "one_time"},
         {"billing_reason": "subscription_update"},
         {"paid_at": None},
         {"account_id": "biz_someoneelse"},
@@ -206,6 +206,24 @@ def test_unqualified_events_do_not_manufacture_rewards(setup, changes):
     service.poll()
     assert store.rewards(REFERRER) == []
     assert provider.applied == []
+
+
+def test_first_charge_after_free_trial_credits_the_referrer(setup):
+    # 3-day trial: signup is $0 (no paid payment); the first real charge is a cycle.
+    service, store, provider = setup
+    referred_purchase(setup)
+    provider.payments[0]["billing_reason"] = "subscription_cycle"
+    service.poll()
+    assert store.rewards(REFERRER)[0]["state"] == "applied"
+
+
+def test_trialing_referrer_gets_reward_on_their_first_paid_month(setup):
+    service, store, provider = setup
+    provider.members[REFERRER] = [membership(status="trialing")]
+    referred_purchase(setup)
+    service.poll()
+    assert store.rewards(REFERRER)[0]["state"] == "applied"
+    assert provider.applied and provider.applied[0][0] == MEMBERSHIP
 
 
 def test_manual_tester_can_share_and_keep_reward_until_a_paid_membership_is_linked(setup):
@@ -402,3 +420,24 @@ def test_consumed_reward_promo_can_be_inactive_without_losing_invoice_confirmati
     )
     service.poll()
     assert store.summary(REFERRER)["used"] == 1
+
+
+def test_get_pro_buyer_without_whop_discord_link_still_receives_rewards(setup):
+    # Get Pro buyers are identified by the bot's own checkout metadata, not a Whop link.
+    service, store, provider = setup
+    provider.members = {}
+    referred_purchase(setup)
+    service.poll()
+    assert store.rewards(REFERRER)[0]["state"] == "pending"
+    provider.members["unlinked"] = [membership(metadata={"discord_user_id": REFERRER})]
+    service._all_cache = None
+    assert service.member_view(REFERRER)["membership_state"] == "active"
+    service._all_cache = None
+    service.poll()
+    assert store.rewards(REFERRER)[0]["state"] == "applied"
+
+
+def test_other_members_metadata_is_never_claimed(setup):
+    service, store, provider = setup
+    provider.members = {"unlinked": [membership(metadata={"discord_user_id": FRIEND})]}
+    assert service.member_view(REFERRER)["membership_state"] == "none"

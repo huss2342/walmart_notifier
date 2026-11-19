@@ -39,12 +39,21 @@ def _account(row):
     return row.get("account_id") or (row.get("account") or {}).get("id")
 
 
+_FIRST_CHARGE_REASONS = frozenset({"subscription_create", "subscription_cycle"})
+
+
 class ReferralService:
     def __init__(self, provider, store, *, company_id, product_ids, plan_prices, checkout_plan_id,
-                 event_sink=None):
+                 event_sink=None, extra_plan_prices=None, linked_cache_seconds=0):
         self.provider, self.store = provider, store
         self.company_id, self.product_ids = company_id, frozenset(product_ids)
+        # plan_prices: the trial plans; friend codes hash exactly these keys.
         self.plan_prices = dict(plan_prices)
+        # scope_prices adds hidden no-trial copies so returning referrers still
+        # get their rewards. Never used for the friend-code hash.
+        self.scope_prices = {**dict(extra_plan_prices or {}), **self.plan_prices}
+        self.linked_cache_seconds = linked_cache_seconds
+        self._linked_cache = {}
         self.checkout_plan_id = checkout_plan_id
         if checkout_plan_id not in self.plan_prices:
             raise ValueError("Referral checkout must use a configured monthly plan")
@@ -107,7 +116,7 @@ class ReferralService:
             isinstance(row, dict)
             and _account(row) == self.company_id
             and row.get("product_id") in self.product_ids
-            and row.get("variant_id") in self.plan_prices
+            and row.get("variant_id") in self.scope_prices
         )
 
     def _promo(self, row, *, reward, require_active=True):
@@ -183,13 +192,58 @@ class ReferralService:
             self._promo(promo, reward=False)
         return profile
 
+    def _all_memberships(self):
+        """All scoped memberships, cached briefly so one poll lists them once."""
+        now = time.monotonic()
+        cached = getattr(self, "_all_cache", None)
+        if cached is not None and now - cached[0] < 15:
+            return cached[1]
+        rows = self.provider.list_memberships()
+        self._all_cache = (now, rows)
+        return rows
+
+    def _linked(self, discord_id):
+        """Memberships Whop links to this Discord account.
+
+        The poll runs for every referral profile every minute, so Whop calls
+        grow with every member who ever opened their link. Most profiles have
+        no Whop-linked membership (button buyers are matched from the one full
+        list by metadata), so only an EMPTY answer is cached: a member who has
+        linked memberships is always read fresh, never from a stale status.
+        """
+        now = time.monotonic()
+        hit = self._linked_cache.get(discord_id)
+        if hit is not None and now - hit < self.linked_cache_seconds:
+            return []
+        rows = self.provider.list_memberships(discord_id=discord_id)
+        if rows or not self.linked_cache_seconds:
+            self._linked_cache.pop(discord_id, None)
+        else:
+            self._linked_cache[discord_id] = now
+            if len(self._linked_cache) > 10000:
+                self._linked_cache.clear()
+        return rows
+
     def _membership(self, discord_id):
         # This provider filter is the identity proof. No email, display name,
         # manually supplied membership ID, browser parameter or role is trusted.
         rows = [
             row
-            for row in self.provider.list_memberships(discord_id=discord_id)
+            for row in self._linked(discord_id)
             if self._scoped(row) and _user(row)
+        ]
+        # Get Pro buyers never link Discord inside Whop. Their membership carries
+        # the Discord ID in metadata written by this bot's own checkout session
+        # (pro_access.py), created only for the authenticated button clicker.
+        seen = {row["id"] for row in rows}
+        rows += [
+            row
+            for row in self._all_memberships()
+            if row["id"] not in seen
+            and self._scoped(row)
+            and _user(row)
+            and isinstance(row.get("metadata"), dict)
+            and row["metadata"].get("discord_user_id") == discord_id
         ]
         users = {_user(row) for row in rows}
         if len(users) > 1:
@@ -230,7 +284,10 @@ class ReferralService:
         for payment in payments:
             if (
                 not self._paid(payment)
-                or payment.get("billing_reason") != "subscription_create"
+                # A 3-day trial makes the first real charge a renewal cycle, not the
+                # $0 signup. Friend promos are new-users-only and credit is unique per
+                # referee, so any paid subscription charge carrying one is the referral.
+                or payment.get("billing_reason") not in _FIRST_CHARGE_REASONS
                 or not payment.get("promo_code_id")
             ):
                 continue
@@ -482,16 +539,22 @@ class ReferralService:
         finally:
             self._poll_lock.release()
 
+    def code_owner(self, code):
+        """Who shared this friend code (local lookup; Whop still enforces eligibility)."""
+        return self.store.owner_of_code(code)
+
     def member_view(self, discord_id):
         operation = getattr(self.provider, "operation_deadline", None)
         with operation(25) if operation is not None else nullcontext():
             return self._member_view(discord_id)
 
     def _member_view(self, discord_id):
+        # A click always reads Whop fresh (the poll cache may be minutes old).
+        self._linked_cache.pop(discord_id, None)
         profile = self._profile(discord_id)
         member = self._membership(discord_id)
         counts = self.store.summary(discord_id)
-        normal = self.plan_prices[(member or {}).get("variant_id", self.checkout_plan_id)]
+        normal = self.scope_prices[(member or {}).get("variant_id", self.checkout_plan_id)]
         own_applied = [
             row
             for row in self.store.rewards(discord_id)

@@ -12,6 +12,11 @@ STARTER_DELAY_SECONDS = 300
 FREE_DELAY_SECONDS = 86400
 FREE_ROUTE_KEY = "yesterday-recap"
 JOB_LIFETIME_SECONDS = 1800
+# An $80+ offer the extension saw out of stock and that returns after at least
+# this long away is announced again ("Back in stock"), once per cooldown.
+RESTOCK_MIN_CENTS = 8000
+RESTOCK_AWAY_SECONDS = 900
+RESTOCK_COOLDOWN_SECONDS = 3600
 FREE_JOB_LIFETIME_SECONDS = 7 * 86400
 
 PRODUCT_CATEGORY_TOPICS = (

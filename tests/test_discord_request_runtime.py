@@ -40,7 +40,7 @@ def test_atomic_collector_intake_matches_a_fresh_reobservation(tmp_path):
     watches.set_dm_status(USER, "ready")
     watches.add(USER, "air fryer", now=101)
     jobs.record([item], now=102)
-    assert watches.claim(now=103)["user_id"] == USER
+    assert watches.claim(now=102 + 60)["user_id"] == USER  # Older match: gathered first.
 
 
 def test_feature_startup_audits_before_any_child_starts(tmp_path):

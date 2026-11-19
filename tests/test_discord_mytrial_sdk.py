@@ -123,7 +123,7 @@ def test_real_sdk_no_trial_cannot_query_another_member(monkeypatch, tmp_path):
         # must never replace the authenticated interaction user's identity.
         target.data["options"] = [{"name": "member", "type": 6, "value": OWNER}]
         reply = await dispatch(tree, rest, target)
-        assert "trial" in reply.lower() and "no" in reply.lower()
+        assert "your pro" in reply.lower() and "my account" in reply.lower()
         assert str(int(hidden["expires_at"])) not in reply and OWNER not in reply
         assert rest.calls == [("GET", f"/guilds/{GUILD}/members/{OTHER}", None)]
         assert service.store.get(OTHER) is None

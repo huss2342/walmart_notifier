@@ -6,6 +6,7 @@ import http.client
 import json
 import math
 import re
+import select
 import socket
 import threading
 import time
@@ -33,6 +34,14 @@ class DeliveryOutcome(StrEnum):
         return self in {self.ACCEPTED, self.UNKNOWN}
 
 
+class RateLimitSource(StrEnum):
+    """Where a 429 arose; local gates do not submit an HTTP request."""
+
+    LOCAL = "local"
+    SERVER = "server"
+    UNKNOWN = "unknown"
+
+
 TRANSPORT_ERROR_TYPES = frozenset({
     "TimeoutError", "gaierror", "SSLError", "ConnectionError", "ConnectionResetError",
     "ConnectionAbortedError", "BrokenPipeError", "RemoteDisconnected", "BadStatusLine",
@@ -55,6 +64,7 @@ class DiscordError(Exception):
         response_bytes: int | None = None,
         outcome: DeliveryOutcome | None = None,
         transport_error: str | None = None,
+        rate_limit_source: RateLimitSource | None = None,
     ):
         super().__init__(message)
         self.status = status
@@ -64,6 +74,10 @@ class DiscordError(Exception):
         self.provider_code = provider_code
         self.request_bytes = request_bytes
         self.response_bytes = response_bytes
+        try:
+            self.rate_limit_source = RateLimitSource(rate_limit_source)
+        except (ValueError, TypeError):
+            self.rate_limit_source = RateLimitSource.UNKNOWN
         self.transport_error = transport_error if isinstance(transport_error, str) and (
             transport_error in TRANSPORT_ERROR_TYPES
         ) else None
@@ -75,6 +89,46 @@ class DiscordError(Exception):
                 if status is None or status >= 500
                 else DeliveryOutcome.REJECTED
             )
+
+
+LOCAL_CONTENTION_BUDGET = 3.0
+
+
+def retry_local_contention(call, *args, stop_event=None, budget=LOCAL_CONTENTION_BUDGET, **kwargs):
+    """Run a background-worker client call through brief local contention.
+
+    The shared client refuses (rather than blocks) when another thread holds
+    the same resource, the pool is full or a sub-second learned cooldown is
+    active. Those 429s are raised before any bytes are sent, so a short wait
+    is always safe and stops ordinary contention surfacing as worker errors.
+    Provider 429s, long cooldowns and every other error still raise at once.
+    The budget sums requested delays, so it stays bounded with a frozen clock.
+    """
+    waited, attempt = 0.0, 0
+    while True:
+        try:
+            return call(*args, **kwargs)
+        except DiscordError as exc:
+            delay = exc.retry_after
+            if (
+                exc.status != 429
+                or exc.rate_limit_source is not RateLimitSource.LOCAL
+                or type(delay) not in (int, float)
+                or not math.isfinite(delay)
+                or delay < 0
+                or waited + delay > budget
+            ):
+                raise
+            # Contention (another worker's multi-request audit) often lasts
+            # ~1s; back off 50->400ms instead of re-polling every 50ms.
+            delay = max(0.01, min(max(delay, 0.05 * 2**attempt), max(delay, 0.4), budget - waited))
+            attempt += 1
+            if stop_event is not None:
+                if stop_event.wait(delay):
+                    raise
+            else:
+                time.sleep(delay)
+            waited += delay
 
 
 def encode_payload(payload: dict) -> bytes:
@@ -114,6 +168,21 @@ def _route_identity(method: str, path: str) -> tuple[tuple[str, str], tuple[str,
         "{id}" if part.isascii() and part.isdecimal() else part for part in parts
     )
     return (method, normalized), major
+
+
+_ENDPOINT_PART = re.compile(r"(?:[a-z@-]{1,32}|\{[a-z_]{1,20}\})?")
+_CALLERS = (
+    ("discord-route", "channel"), ("discord-delivery", "channel"),
+    ("discord-welcome", "welcome"), ("discord-membership", "membership"),
+    ("discord-trials", "trials"), ("discord-request-runtime", "request-runtime"),
+    ("discord-requests", "personal"), ("discord-personal-requests", "gateway"),
+    ("asyncio", "gateway"),
+)
+
+
+def _caller():
+    name = threading.current_thread().name
+    return next((label for prefix, label in _CALLERS if name.startswith(prefix)), "other")
 
 
 class _RequestDeadline:
@@ -171,6 +240,10 @@ class DiscordClient:
     _GLOBAL_REQUESTS = 25
     _GLOBAL_WINDOW = 1.0
     _MAX_CONNECTIONS = 4
+    # Idle keep-alive sockets are silently dropped upstream; reusing one turns
+    # a POST into an ambiguous RemoteDisconnected. A fresh TLS handshake is
+    # far cheaper than that retry (and its duplicate/review risk).
+    _MAX_IDLE_SECONDS = 20.0
     _BUSY_DELAY = 0.05
     _MAX_RESPONSE = 1_048_576
 
@@ -193,6 +266,22 @@ class DiscordClient:
         self._blocked: dict[tuple, float] = {}
         self._route_buckets: dict[tuple[str, str], str] = {}
         self._global_until = 0.0
+        # Optional per-call observer (event, **fields); see _observe.
+        self.observer = None
+        self._call = threading.local()
+
+    def _reusable(self, connection, now) -> bool:
+        """Skip pooled sockets that sat idle too long or the peer already closed."""
+        if now - getattr(connection, "_idle_since", now) > self._MAX_IDLE_SECONDS:
+            return False
+        sock = getattr(connection, "sock", None)
+        if not isinstance(sock, socket.socket):
+            return True
+        try:
+            # An idle keep-alive socket is readable only on EOF/reset or junk.
+            return not select.select([sock], [], [], 0)[0]
+        except (OSError, ValueError):
+            return False
 
     def _limit_key(self, route: tuple[str, str], major: tuple[str, ...]) -> tuple:
         bucket = self._route_buckets.get(route)
@@ -394,6 +483,48 @@ class DiscordClient:
         return rows
 
     def _request(self, method: str, path: str, payload: dict | None = None, *, query=""):
+        observer = self.observer
+        if observer is None:
+            return self._send(method, path, payload, query=query)
+        self._validate_route(method, path)
+        started = time.monotonic()
+        self._call.status, self._call.remaining = 0, None
+        try:
+            result = self._send(method, path, payload, query=query)
+        except DiscordError as exc:
+            self._observe(observer, method, path, started, exc)
+            raise
+        self._observe(observer, method, path, started, None)
+        return result
+
+    def _observe(self, observer, method, path, started, error):
+        """One record per call: caller, endpoint shape (no IDs/tokens), outcome."""
+        with suppress(Exception):
+            endpoint = "/".join(
+                part if _ENDPOINT_PART.fullmatch(part) else "{token}"
+                for part in _route_identity(method, path)[0][1].split("/")
+            )
+            fields = {
+                "caller": _caller(),
+                "method": method,
+                "endpoint": endpoint,
+                "status": self._call.status if error is None else (error.status or 0),
+                "elapsed_seconds": time.monotonic() - started,
+                "outcome": "accepted" if error is None else error.outcome.value,
+            }
+            if self._call.remaining is not None:
+                fields["ratelimit_remaining"] = self._call.remaining
+            if error is not None:
+                if error.status == 429:
+                    fields["rate_limit_source"] = error.rate_limit_source.value
+                    fields["global_limit"] = bool(error.global_limit)
+                    if isinstance(error.retry_after, (int, float)):
+                        fields["retry_after_seconds"] = error.retry_after
+                if error.transport_error:
+                    fields["transport_error"] = error.transport_error
+            observer("discord_api", **fields)
+
+    def _send(self, method: str, path: str, payload: dict | None = None, *, query=""):
         self._validate_route(method, path)
         route, major = _route_identity(method, path)
         data = encode_payload(payload) if payload is not None else None
@@ -416,14 +547,25 @@ class DiscordClient:
                     retry_after=wait,
                     global_limit=global_limit,
                     outcome=DeliveryOutcome.NOT_SUBMITTED,
+                    rate_limit_source=RateLimitSource.LOCAL,
                 )
             while self._started and self._started[0] <= now - self._GLOBAL_WINDOW:
                 self._started.popleft()
             self._started.append(now)
             self._inflight.add((route, major))
-            connection = self._connections.pop() if self._connections else None
+            connection, stale = None, []
+            while self._connections:
+                candidate = self._connections.pop()
+                if self._reusable(candidate, now):
+                    connection = candidate
+                    break
+                stale.append(candidate)
+                self._connection_count -= 1
             if connection is None:
                 self._connection_count += 1
+        for candidate in stale:
+            with suppress(OSError):
+                candidate.close()
         response = None
         deadline = None
         submitted = False
@@ -460,6 +602,9 @@ class DiscordClient:
                 response = connection.getresponse()
                 status = response.status
             response_headers = response.headers or {}
+            self._call.status = status
+            with suppress(TypeError, ValueError):
+                self._call.remaining = int(response_headers.get("X-RateLimit-Remaining"))
             with self._lock:
                 key = self._learn_bucket(route, major, response_headers)
                 if status == 429:
@@ -528,6 +673,7 @@ class DiscordClient:
                 provider_code=provider_code,
                 request_bytes=len(data) if data is not None else 0,
                 response_bytes=len(body),
+                rate_limit_source=RateLimitSource.SERVER if status == 429 else None,
             )
         except (OSError, urllib.error.URLError, ValueError, http.client.HTTPException) as exc:
             timed_out = deadline is not None and (
@@ -555,6 +701,7 @@ class DiscordClient:
                 self._inflight.discard((route, major))
                 self._pending_limits.discard((route, major))
                 if connection is not None and reusable and not self._closed:
+                    connection._idle_since = time.monotonic()
                     self._connections.append(connection)
                     connection = None
                 else:

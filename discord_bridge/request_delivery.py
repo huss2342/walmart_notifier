@@ -10,31 +10,42 @@ import time
 import uuid
 
 from .api import DeliveryOutcome, DiscordError
-from .messages import render_message
 from .monitoring import emit_event, error_fields
+from .payload_limits import payload_problems
+from .request_render import product_link, render_bundle_message, render_request_message
 from .request_store import RequestStore, member_ref
+
+__all__ = ["RequestWorker", "render_bundle_message", "render_request_message"]
+
+# Parked-DM reconciliation: at most one history read per interval while idle,
+# over a window starting this long before the claim (clock-skew margin).
+RECONCILE_INTERVAL_SECONDS = 60
+RECONCILE_SLACK_SECONDS = 15 * 60
+RECONCILE_WINDOW = 100
+_DISCORD_EPOCH_MS = 1_420_070_400_000
+_LINK = re.compile(r"\]\((https://[^)\s]+)\)")
 
 
 def _snowflake(value):
     return isinstance(value, str) and re.fullmatch(r"[0-9]{17,20}", value) is not None
 
 
+def _snowflake_at(timestamp):
+    """The smallest Discord ID at this Unix time, or None if it has none."""
+    if type(timestamp) not in (int, float) or not math.isfinite(timestamp):
+        return None
+    value = str((int(timestamp * 1000) - _DISCORD_EPOCH_MS) << 22)
+    return value if _snowflake(value) else None
+
+
 def _delay(value, default=5):
     return max(0.05, value) if type(value) in (int, float) and math.isfinite(value) else default
 
 
-def render_request_message(job):
-    item = job["item"]
-    payload = render_message(
-        item, first_seen=job["observed"], last_seen=job["observed"], route="pro-all"
-    )
-    queries = ", ".join(query.replace("@", "@\u200b") for query in job["queries"])
-    payload["content"] = "Your requested item was found!"
-    payload["embeds"][0]["description"] = (
-        f"Matched requests: {queries}\nObserved: <t:{int(job['observed'])}:R>"
-    )
-    payload.update(nonce=job["nonce"], enforce_nonce=True)
-    return payload
+def _size_rejected(exc):
+    """Discord refused the body itself: 413, or 400 Invalid Form Body (50035),
+    which also reports embed-size errors. The same body must never be resent."""
+    return exc.status == 413 or (exc.status == 400 and exc.provider_code == 50035)
 
 
 class RequestWorker:
@@ -57,6 +68,7 @@ class RequestWorker:
         self.pro = state.get("roles", {}).get("pro")
         self.trial_store = trial_store
         self._thread = None
+        self._wake = threading.Event()
         self._cycle_lock = threading.Lock()
         self._last_error = None
         self._last_success = None
@@ -69,6 +81,7 @@ class RequestWorker:
         self._active_job = None
         self._correlation_id = uuid.uuid4().hex
         self._next_summary = 0
+        self._next_reconcile = 0
         if self.enabled:
             if not _snowflake(self.guild) or not _snowflake(self.pro) or self.guild == self.pro:
                 raise ValueError(
@@ -145,12 +158,30 @@ class RequestWorker:
                 self._last_error = None
             self._event("worker_recovered", transition="recovered", phase="claim")
 
+    def _too_large(self, result, job, *, now, phase, reason, exc=None):
+        """Split an oversized bundle into smaller continuation DMs; fail a single item.
+
+        Called before any POST (local validator) or after a definite rejection.
+        Either way the rejected body is never submitted again.
+        """
+        outcome = self.store.split(job, now=now, reason=reason)
+        details = error_fields(exc) if exc is not None else {}
+        self._last_error = "payload_too_large"
+        if outcome == "split":
+            result["retried"] += 1
+            self._event("dispatch_retry", reason="payload_too_large", phase=phase, **details)
+        elif outcome == "failed":
+            result["failed"] += 1
+            self._event("dispatch_failed", reason=reason, phase=phase, **details)
+        else:
+            result["skipped"] += 1
+            self._last_error = "lease_changed"
+            self._event("dispatch_skipped", reason="lease_changed", phase=phase)
+
     def _handle_error(self, result, job, exc, *, now, submitted, phase):
         self._event(
             "request_provider_error",
             phase=phase,
-            status=exc.status,
-            provider_code=exc.provider_code,
             ambiguous=submitted and exc.outcome.may_have_been_accepted,
             **error_fields(exc),
         )
@@ -160,6 +191,14 @@ class RequestWorker:
             self._last_error = "ambiguous_send"
             result["review"] += 1
             self._event("dispatch_skipped", reason="ambiguous_send", ambiguous=True, review=1)
+            return
+        if phase == "send" and _size_rejected(exc):
+            # Before 2026-11-19 a 413 was retried with the identical body until
+            # the alerts expired. A bundle now splits; a single item fails.
+            self._too_large(
+                result, job, now=now, phase=phase, exc=exc,
+                reason="payload_too_large" if exc.status == 413 else f"http_{exc.status}",
+            )
             return
         if phase in {"member", "audit"} and not limited:
             # Provider/auth/access errors do not prove the member lost Pro.
@@ -194,11 +233,10 @@ class RequestWorker:
             self._last_error = "rate_limited"
             self._event(
                 "dispatch_throttled",
-                status=429,
-                retry_after_seconds=delay,
                 scope="global" if exc.global_limit else "route",
+                **error_fields(exc, status=429, retry_after_seconds=delay),
             )
-        elif exc.status in {400, 401, 403, 404}:
+        elif exc.status in {400, 401, 403, 404, 413}:
             self.store.settle(job, "failed", now=now, reason=f"http_{exc.status}")
             result["failed"] += 1
             self._last_error = "provider_rejected"
@@ -208,8 +246,107 @@ class RequestWorker:
             self.store.retry(job, now=now, delay=delay)
             result["retried"] += 1
             self._last_error = "provider_unavailable"
-            self._event("dispatch_retry", reason="remote_retry", retry_after_seconds=delay,
-                        phase=phase, **error_fields(exc))
+            self._event("dispatch_retry", reason="remote_retry", phase=phase,
+                        **error_fields(exc, retry_after_seconds=delay))
+
+    def _still_due(self, result, job, *, now, phase):
+        """Revalidate before the next provider step; None when this cycle ends here.
+
+        Matches that no longer apply are cancelled one by one and the rest go
+        out. A shutdown hands the still-valid DM back instead of cancelling it.
+        """
+        fresh = self.store.validate(job, now=now)
+        if fresh is None:
+            self.store.settle(job, "cancelled", now=now, reason="no_current_match")
+            result["skipped"] += 1
+            self._event("dispatch_skipped", phase=phase, reason="no_current_match")
+            return None
+        if self.stop_event.is_set():
+            self.store.retry(fresh, now=now, delay=0, reason="stopping")
+            result["retried"] += 1
+            self._event("dispatch_retry", phase=phase, reason="stopping")
+            return None
+        self._active_job = fresh
+        return fresh
+
+    def _own_message(self, message):
+        author = message.get("author") if isinstance(message, dict) else None
+        if not isinstance(author, dict):
+            return False
+        bot = self.state.get("bot_user_id")
+        return author.get("id") == bot if _snowflake(bot) else author.get("bot") is True
+
+    @staticmethod
+    def _carries(message, items):
+        """True when a DM links any of these items (Claim button or product link)."""
+        urls = set()
+        for row in message.get("components") or ():
+            for button in (row.get("components") if isinstance(row, dict) else None) or ():
+                if isinstance(button, dict) and isinstance(button.get("url"), str):
+                    urls.add(button["url"])
+        for embed in message.get("embeds") or ():
+            if not isinstance(embed, dict):
+                continue
+            if isinstance(embed.get("url"), str):
+                urls.add(embed["url"])
+            urls.update(_LINK.findall(str(embed.get("description") or "")))
+        for item in items:
+            wanted = {item.get("review_url"), item.get("product_url")}
+            if isinstance(item.get("item_id"), str):
+                wanted.add(product_link(item))
+            if urls & (wanted - {None}):
+                return True
+        return False
+
+    def _reconcile(self, now):
+        """Settle at most one parked possibly-sent DM from its DM channel history.
+
+        One bounded GET of the messages posted since the DM was claimed: the
+        bot's own DM linking one of its items means it was delivered; a
+        complete window without one means it was not (failed, re-armed by the
+        next in-stock sighting, never resent straight away). A full window,
+        an unreadable channel or a non-bot author leaves it parked.
+        """
+        reader = getattr(self.client, "channel_messages", None)
+        if reader is None or now < self._next_reconcile or self.stop_event.is_set():
+            return
+        self._next_reconcile = now + RECONCILE_INTERVAL_SECONDS
+        candidate = self.store.reconcile_candidate(now=now)
+        if candidate is None:
+            return
+        after = _snowflake_at(candidate["since"] - RECONCILE_SLACK_SECONDS)
+        try:
+            messages = reader(candidate["channel_id"], limit=RECONCILE_WINDOW, after=after)
+        except DiscordError as exc:
+            if exc.status not in {403, 404}:
+                return  # Transient: the next idle window reads again.
+            messages = None
+        found = next(
+            (
+                message for message in messages or ()
+                if self._own_message(message) and self._carries(message, candidate["items"])
+            ),
+            None,
+        )
+        if found is not None:
+            outcome = "sent"
+        elif messages is not None and len(messages) < RECONCILE_WINDOW:
+            outcome = "undelivered"
+        else:
+            outcome = "unresolved"
+        message_id = found.get("id") if found is not None else None
+        settled = self.store.reconcile(
+            candidate, outcome, message_id=message_id if _snowflake(message_id) else None
+        )
+        self._event(
+            "dispatch_skipped",
+            phase="reconcile",
+            reason={"sent": "reconciled_sent", "undelivered": "reconciled_undelivered"}.get(
+                outcome, "reconcile_unresolved"
+            ),
+            member_ref=member_ref(candidate["user_id"]),
+            reconciled=settled,
+        )
 
     def tick(self, now=None):
         result = {
@@ -244,6 +381,11 @@ class RequestWorker:
             self._poll_succeeded(current())
             self._active_job = job
             if job is None:
+                try:
+                    self._reconcile(current())
+                except Exception as exc:
+                    # Parked rows stay parked; never a send, never a failed cycle.
+                    self._event("worker_error", phase="reconcile", **error_fields(exc))
                 return result
             self._event("dispatch_claimed", phase="claim")
             phase = "audit"
@@ -272,13 +414,10 @@ class RequestWorker:
                 result["blocked"] += 1
                 return result
             phase = "validate"
-            fresh = self.store.validate(job, now=current())
-            if fresh is None or self.stop_event.is_set():
-                self.store.settle(job, "cancelled", now=current(), reason="no_current_match")
-                result["skipped"] += 1
-                self._event("dispatch_skipped", phase=phase, reason="no_current_match")
+            job = self._still_due(result, job, now=current(), phase=phase)
+            if job is None:
                 return result
-            channel = fresh.get("channel_id")
+            channel = job.get("channel_id")
             if not channel:
                 phase = "channel"
                 response = self.client.request(
@@ -321,14 +460,11 @@ class RequestWorker:
                 result["blocked"] += 1
                 return result
             phase = "validate"
-            fresh = self.store.validate(job, now=current())
-            if fresh is None or self.stop_event.is_set():
-                self.store.settle(job, "cancelled", now=current(), reason="no_current_match")
-                result["skipped"] += 1
-                self._event("dispatch_skipped", phase=phase, reason="no_current_match")
+            job = self._still_due(result, job, now=current(), phase=phase)
+            if job is None:
                 return result
             phase = "begin_send"
-            committed = self.store.begin_send(fresh, now=current(), channel_id=channel)
+            committed = self.store.begin_send(job, now=current(), channel_id=channel)
             if committed is None:
                 result["skipped"] += 1
                 self._event("dispatch_skipped", phase=phase, reason="lease_changed")
@@ -336,6 +472,13 @@ class RequestWorker:
             self._active_job = committed
             phase = "render"
             payload = render_request_message(committed)
+            if payload_problems(payload):
+                # Nothing was submitted; send smaller parts instead of a body
+                # Discord would refuse.
+                self._too_large(
+                    result, committed, now=current(), phase=phase, reason="payload_too_large"
+                )
+                return result
             submitted = True
             phase = "send"
             self._event("dispatch_sending", phase=phase)
@@ -349,8 +492,8 @@ class RequestWorker:
                 result["sent"] += 1
                 self._last_error = None
                 self._last_success = current()
-                self._event("dispatch_sent", items=1, messages=1,
-                            elapsed_seconds=time.monotonic() - started)
+                self._event("dispatch_sent", items=1 + len(committed.get("bundle") or ()),
+                            messages=1, elapsed_seconds=time.monotonic() - started)
             else:
                 result["review"] += 1
                 self._last_error = "lease_changed"
@@ -460,13 +603,23 @@ class RequestWorker:
                 failures = min(5, failures + 1) if self._cycle_failed else 0
                 # One alert/second is a bounded share of the shared pool. Paid
                 # channel backlog never absolutely starves personal Pro alerts.
-                self.stop_event.wait(min(30, 2**failures) if failures else 1)
+                # A new match wakes the idle poll early; failures keep backoff.
+                if failures:
+                    self.stop_event.wait(min(30, 2**failures))
+                else:
+                    self._wake.wait(1)
+                    self._wake.clear()
             self._event("worker_lifecycle", transition="stopped", phase="worker")
 
         self._thread = threading.Thread(target=run, name="discord-requests", daemon=True)
         self._thread.start()
 
+    def wake(self):
+        """Hint that intake may have queued an alert; the claim stays authoritative."""
+        self._wake.set()
+
     def stop(self):
         self.stop_event.set()
+        self._wake.set()
         if self._thread and self._thread is not threading.current_thread():
             self._thread.join(timeout=12)

@@ -27,11 +27,23 @@ from .observations import _text as _text
 from .observations import normalize_item as normalize_item
 from .observations import route_keys as route_keys
 from .observations import validate_batch as validate_batch
-from .policy import FREE_DELAY_SECONDS, FREE_ROUTE_KEY, RETIRED_ROUTE_KEYS
+from .policy import (
+    FREE_DELAY_SECONDS,
+    FREE_ROUTE_KEY,
+    RESTOCK_AWAY_SECONDS,
+    RESTOCK_COOLDOWN_SECONDS,
+    RESTOCK_MIN_CENTS,
+    RETIRED_ROUTE_KEYS,
+)
 from .policy import FREE_JOB_LIFETIME_SECONDS as FREE_JOB_LIFETIME_SECONDS
 from .policy import JOB_LIFETIME_SECONDS as JOB_LIFETIME_SECONDS
 from .policy import PRICE_BANDS as PRICE_BANDS
 from .request_store import initialize_requests, match_requests
+
+# Requesters hear first: a fresh Pro post waits at most this long for a ready
+# member's request DM on the same item. The request worker releases it early.
+DM_FIRST_HOLD_SECONDS = 3.0
+
 
 # Application wire ceiling; kept here for existing dispatcher configuration/tests.
 MAX_MESSAGE_BYTES = 10 * 1024
@@ -137,6 +149,9 @@ class JobStore:
         seed_only=False,
         request_event_sink=None,
         event_sink=None,
+        search_queries=None,
+        restocked=None,
+        restock_any_value=None,
     ) -> dict:
         # Validate the entire batch before any side effect, even for direct Python callers.
         if not isinstance(items, list) or not 1 <= len(items) <= MAX_BATCH:
@@ -151,8 +166,19 @@ class JobStore:
             for item in items:
                 encoded = json.dumps(item, separators=(",", ":"), ensure_ascii=True)
                 exists = db.execute(
-                    "SELECT first_seen FROM items WHERE item_id=?", (item["item_id"],)
+                    "SELECT first_seen,last_seen FROM items WHERE item_id=?", (item["item_id"],)
                 ).fetchone()
+                # Back in stock: the extension saw this offer out of stock since
+                # it was last seen in stock, and that was a while ago.
+                # restock_any_value: comebacks the backend rule already judged
+                # (sub-$80 after a day unseen); the $80+ floor is for extension flags.
+                restock = bool(
+                    restocked and item["item_id"] in restocked and item["available"]
+                    and exists is not None
+                    and ((item["value_cents"] or 0) >= RESTOCK_MIN_CENTS
+                         or item["item_id"] in (restock_any_value or ()))
+                    and now - exists["last_seen"] >= RESTOCK_AWAY_SECONDS
+                )
                 if exists:
                     duplicates += 1
                     db.execute(
@@ -212,13 +238,43 @@ class JobStore:
                         "AND batch_id IS NULL AND reason='observation_no_longer_matches'",
                         (item["item_id"], route, now),
                     )
-                    if routed is not None and (inserted.rowcount or rearmed.rowcount):
+                    transition = ("queued" if inserted.rowcount
+                                  else "rearmed" if rearmed.rowcount else None)
+                    if restock and not historical:
+                        # Re-arm this route's finished job (one row per item and
+                        # route), at most once per cooldown. `due` marks the restock.
+                        back = db.execute(
+                            "UPDATE jobs SET state='pending',due=?,next_attempt=?,expires=?,"
+                            "attempts=0,reason=NULL,message_id=NULL,sent_at=NULL,"
+                            "lease_token=NULL,lease_until=NULL,batch_id=NULL "
+                            "WHERE item_id=? AND route=? AND due<=? AND (state IN "
+                            "('sent','expired','failed','skipped') OR "
+                            "(state='pending' AND expires<=?))",
+                            (now, now, now + JOB_LIFETIME_SECONDS, item["item_id"], route,
+                             now - RESTOCK_COOLDOWN_SECONDS, now),
+                        )
+                        if back.rowcount:
+                            added = True
+                            due, expires, transition = now, now + JOB_LIFETIME_SECONDS, "restocked"
+                    if routed is not None and transition:
                         routed.append({"phase": "intake", "route": route,
                                        "item_ids": [item["item_id"]], "job_ids": [key],
-                                       "transition": "queued" if inserted.rowcount else "rearmed",
-                                       "due": due, "expires": expires})
+                                       "transition": transition, "due": due, "expires": expires})
                 queued += int(added)
-            match_requests(db, items, now=now, seed_only=seed_only, activity=activity)
+            match_requests(
+                db, items, now=now, seed_only=seed_only, activity=activity,
+                search_queries=search_queries,
+            )
+            if not seed_only:
+                db.execute(
+                    """UPDATE jobs SET next_attempt=MAX(next_attempt,?)
+                    WHERE state='pending' AND attempts=0 AND batch_id IS NULL AND route!=?
+                    AND item_id IN (SELECT a.item_id FROM personal_request_alerts a
+                        JOIN personal_request_users u USING(user_id)
+                        WHERE a.created=? AND a.state='pending' AND a.backlog=0
+                        AND u.dm_status='ready')""",
+                    (now + DM_FIRST_HOLD_SECONDS, FREE_ROUTE_KEY, now),
+                )
         # Receipts describe durable work only; a later transaction failure must
         # never leave logs claiming a route was queued when it was rolled back.
         groups = {}
@@ -470,6 +526,14 @@ class JobStore:
                             :25
                         ]
                     )
+                    # A restock re-sends a finished job: its dispatch (also the
+                    # Discord nonce) needs an id of its own, tied to the restock.
+                    restocked = [row["due"] for row in rows if row["route"] != FREE_ROUTE_KEY
+                                 and row["due"] - row["first_seen"] >= RESTOCK_AWAY_SECONDS]
+                    if restocked:
+                        batch_id = hashlib.sha256(
+                            f"restock-v1:{batch_id}:{max(restocked):.3f}".encode()
+                        ).hexdigest()[:25]
                 jobs = [self._job(row) for row in rows]
                 valid = all(
                     job["state"] in {"pending", "leased"}

@@ -182,7 +182,7 @@ def test_unavailable_during_membership_check_prevents_delivery(tmp_path):
     assert provider.messages == []
 
 
-@pytest.mark.parametrize("latest_value", [9999, None])
+@pytest.mark.parametrize("latest_value", [9999, 5000])
 def test_value_below_minimum_at_submission_prevents_dm(tmp_path, monkeypatch, latest_value):
     store, request, provider, worker = setup(tmp_path)
     store.edit(USER, request["id"], "air fryer", min_value=100, now=11)

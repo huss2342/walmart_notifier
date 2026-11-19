@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from .observations import _product_image
-from .policy import FREE_DELAY_SECONDS, FREE_ROUTE_KEY, STARTER_DELAY_SECONDS
+from .policy import (
+    FREE_DELAY_SECONDS,
+    FREE_ROUTE_KEY,
+    RESTOCK_AWAY_SECONDS,
+    STARTER_DELAY_SECONDS,
+)
 
 
 def _embed_title(text: str) -> str:
@@ -12,19 +17,24 @@ def _embed_title(text: str) -> str:
     return text.encode("utf-16-le", errors="replace")[:512].decode("utf-16-le", errors="ignore")
 
 
-def render_message(item: dict, *, first_seen: float, last_seen: float, route: str) -> dict:
+def render_message(
+    item: dict, *, first_seen: float, last_seen: float, route: str, restocked: bool = False
+) -> dict:
     value = item["value_cents"]
     money = f"${value / 100:,.2f}" if value else "Retail value unverified"
     title = item["title"].replace("@", "@\u200b")
     historical = route == FREE_ROUTE_KEY
     lines = [f"Category: {item['category']}"]
+    if restocked and not historical:
+        lines.insert(0, "Back in stock")
     if historical:
         lines.append(f"Historical alert — {FREE_DELAY_SECONDS / 3600:g}-hour delay")
     elif route == "starter-items":
         lines.append(f"{STARTER_DELAY_SECONDS / 60:g}-minute delay")
-    lines.extend(
-        [f"First detected: <t:{int(first_seen)}:f>", f"Last observed: <t:{int(last_seen)}:R>"]
-    )
+    # No "Last observed": it was frozen at send time and only repeated the
+    # detection time. Back-in-stock alerts say when the item was first listed.
+    label = "First listed" if restocked and not historical else "First detected"
+    lines.append(f"{label}: <t:{int(first_seen)}:f>")
     description = "\n".join(lines)
     if historical:
         description += (
@@ -45,12 +55,9 @@ def render_message(item: dict, *, first_seen: float, last_seen: float, route: st
         "components": [
             {
                 "type": 1,
+                # The card title already opens the product page.
                 "components": [
-                    {"type": 2, "style": 5, "label": label, "url": url}
-                    for label, url in (
-                        ("Open review item", item["review_url"]),
-                        ("View product", item["product_url"]),
-                    )
+                    {"type": 2, "style": 5, "label": "Claim item", "url": item["review_url"]}
                 ],
             }
         ],
@@ -68,6 +75,8 @@ def render_batch(jobs: list[dict]) -> dict:
             first_seen=job["first_seen"],
             last_seen=job["last_seen"],
             route=job["route"],
+            # A re-armed restock is the only job due well after first detection.
+            restocked=job.get("due", job["first_seen"]) - job["first_seen"] >= RESTOCK_AWAY_SECONDS,
         )
         for job in jobs
     ]
@@ -86,15 +95,12 @@ def render_batch(jobs: list[dict]) -> dict:
         # the other cards to reach the numbered button rows below the bundle.
         embed["url"] = jobs[index - 1]["item"]["review_url"]
         result["embeds"].append(embed)
-        row = message["components"][0]
-        for button in row["components"]:
-            button["label"] = f"{index} · {button['label']}"
-        # Two item pairs share each row only for larger paid bursts. All
-        # review/product links survive within five rows and four buttons/row.
-        if len(jobs) > 5 and index % 2 == 0:
-            result["components"][-1]["components"].extend(row["components"])
-        else:
-            result["components"].append(row)
+        button = message["components"][0]["components"][0]
+        button["label"] = f"{index} · {button['label']}"
+        # One claim button per item, five per row: ten items fit in two rows.
+        if index % 5 == 1:
+            result["components"].append({"type": 1, "components": []})
+        result["components"][-1]["components"].append(button)
     characters = sum(
         len((embed["title"] + embed["description"] + embed["footer"]["text"]).encode("utf-16-le"))
         // 2

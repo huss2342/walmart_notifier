@@ -40,10 +40,9 @@ def test_requests_survive_restart_and_enforce_ownership_and_limit(tmp_path):
     with pytest.raises(ValueError, match="not found"):
         restarted.edit(OTHER, request["id"], "coffee", now=11)
     assert restarted.delete(OTHER, request["id"]) is False
-    for index in range(9):
+    for index in range(30):
         restarted.add(USER, f"keyword {index}", now=12)
-    with pytest.raises(ValueError, match="10"):
-        restarted.add(USER, "one too many", now=13)
+    assert len(restarted.list(USER)) == 31, "there is no per-member request cap"
 
 
 @pytest.mark.parametrize(
@@ -201,7 +200,9 @@ def test_real_jobstore_intake_atomically_matches_fresh_reobservations(tmp_path):
     assert store.claim(now=11) is None
     accepted = jobs.record([product()], now=12)
     assert accepted["duplicates"] == 1
-    assert store.claim(now=13)["queries"] == ["air fryer"]
+    # Listed before the request: an older match, bundled after a short gather.
+    assert store.claim(now=13) is None
+    assert store.claim(now=12 + 60)["queries"] == ["air fryer"]
 
 
 def test_jobstore_seed_is_quiet_but_later_fresh_observation_can_match(tmp_path):

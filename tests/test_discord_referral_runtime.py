@@ -111,3 +111,28 @@ def test_bad_live_referral_configuration_keeps_existing_delivery_available(tmp_p
     assert notifier.live is True
     assert notifier.referrals is None
     assert notifier.health()["referrals"]["last_error"] == "configuration"
+
+
+def test_billing_db_moves_to_the_volume_once_and_keeps_the_original(tmp_path, monkeypatch):
+    import sqlite3
+
+    from discord_bridge.referral_runtime import _billing_db
+
+    private, volume = tmp_path / "private", tmp_path / "db"
+    private.mkdir()
+    volume.mkdir()
+    old = private / "pro_access.sqlite3"
+    with sqlite3.connect(old) as db:
+        db.execute("CREATE TABLE t(x)")
+        db.execute("INSERT INTO t VALUES (7)")
+    monkeypatch.delenv("DISCORD_BILLING_DB_DIR", raising=False)
+    assert _billing_db(private, "pro_access.sqlite3") == old
+    monkeypatch.setenv("DISCORD_BILLING_DB_DIR", str(volume))
+    new = _billing_db(private, "pro_access.sqlite3")
+    assert new == volume / "pro_access.sqlite3" and old.exists()
+    with sqlite3.connect(new) as db:
+        assert db.execute("SELECT x FROM t").fetchone() == (7,)
+        db.execute("INSERT INTO t VALUES (8)")
+    _billing_db(private, "pro_access.sqlite3")  # second start: no re-copy
+    with sqlite3.connect(new) as db:
+        assert db.execute("SELECT COUNT(*) FROM t").fetchone() == (2,)

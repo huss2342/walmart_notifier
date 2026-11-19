@@ -117,10 +117,12 @@ def test_message_is_safe_without_claim_count_or_pings():
     assert "claims_remaining" not in text
     assert "Claims remaining" not in text
     assert "5-minute delay" not in text
-    assert [button["label"] for button in message["components"][0]["components"]] == [
-        "Open review item",
-        "View product",
+    # The title opens the product; the single button opens the claim page.
+    buttons = message["components"][0]["components"]
+    assert [(button["label"], button["url"]) for button in buttons] == [
+        ("Claim item", clean["review_url"]),
     ]
+    assert message["embeds"][0]["url"] == clean["product_url"]
 
 
 @pytest.mark.parametrize("folder", ["asr", "seo"])
@@ -162,7 +164,7 @@ def test_missing_or_untrusted_optional_image_does_not_block_alert(image):
     assert clean.get("image_url", "") == ""
     message = render_message(clean, first_seen=1000, last_seen=1000, route="pro-all")
     assert "thumbnail" not in message["embeds"][0]
-    assert len(message["components"][0]["components"]) == 2
+    assert len(message["components"][0]["components"]) == 1
 
 
 def test_legacy_queued_item_without_image_still_renders():
@@ -198,3 +200,69 @@ def test_long_product_slug_falls_back_to_short_safe_discord_links():
     message = render_message(clean, first_seen=1000, last_seen=1000, route="pro-all")
     assert all(len(button["url"]) <= 512 for button in message["components"][0]["components"])
     assert clean["product_url"] == "https://www.walmart.com/ip/20449164214"
+
+
+def _sent_all(store, now):
+    while (job := store.claim(now=now)) is not None:
+        store.finish(job, "sent", message_id="123456789012345678")
+
+
+def _pending(store):
+    with store._connect() as db:
+        return sorted(row["route"] for row in db.execute(
+            "SELECT route FROM jobs WHERE state='pending' AND route!='yesterday-recap'"))
+
+
+def test_an_80_plus_offer_back_in_stock_is_announced_again_once_per_cooldown(tmp_path):
+    store = JobStore(tmp_path / "queue.sqlite3")
+    offer = normalize_item(item(149.99))
+    store.record([offer], now=1000)
+    _sent_all(store, 1000)
+    assert _pending(store) == []
+    # Seen again in stock soon after, or without the extension's out-of-stock evidence: nothing.
+    store.record([offer], now=1500, restocked={offer["item_id"]})
+    store.record([offer], now=9000)
+    assert _pending(store) == []
+    # Out of stock for 20 minutes, then back.
+    result = store.record([offer], now=9000 + 1200, restocked={offer["item_id"]})
+    routes = _pending(store)
+    assert routes == sorted(r for r in route_keys(offer) if r != "yesterday-recap")
+    assert result["queued"] == 1
+    job = store.claim(now=10_200)
+    assert job["due"] == 10_200
+    from discord_bridge.messages import render_batch
+    assert "Back in stock" in json.dumps(render_batch([job]))
+    store.finish(job, "sent", message_id="123456789012345679")
+    _sent_all(store, 10_200)
+    # The extension keeps flagging a return for a few minutes (a failed upload's
+    # retry): repeats right after the alert queue nothing.
+    store.record([offer], now=10_220, restocked={offer["item_id"]})
+    assert _pending(store) == []
+    # Another return within the hour is not announced; after it, it is.
+    store.record([offer], now=10_200 + 1200, restocked={offer["item_id"]})
+    assert _pending(store) == []
+    store.record([offer], now=10_200 + 1200 + 3600, restocked={offer["item_id"]})
+    assert _pending(store) != []
+
+
+def test_restocks_under_80_or_out_of_stock_rows_are_never_announced(tmp_path):
+    store = JobStore(tmp_path / "queue.sqlite3")
+    cheap = normalize_item(item(79.99))
+    store.record([cheap], now=1000)
+    _sent_all(store, 1000)
+    store.record([cheap], now=5000, restocked={cheap["item_id"]})
+    assert _pending(store) == []
+    gone = normalize_item(item(149.99, available=False))
+    store.record([gone], now=6000, restocked={gone["item_id"]})
+    assert _pending(store) == []
+
+
+def test_only_a_job_due_well_after_first_detection_renders_back_in_stock(tmp_path):
+    from discord_bridge.messages import render_batch
+    offer = normalize_item(item(149.99))
+    job = {"item": offer, "route": "pro-all", "first_seen": 1000.0, "last_seen": 1000.0,
+           "due": 1000.0}
+    assert "Back in stock" not in json.dumps(render_batch([job]))
+    assert "Back in stock" in json.dumps(render_batch([{**job, "due": 1900.0}]))
+    free = {**job, "route": "yesterday-recap", "due": 90_000.0}
+    assert "Back in stock" not in json.dumps(render_batch([free]))
