@@ -31,7 +31,7 @@ test('both ad variants always use the permanent Discord invite', () => {
 test('every current Join button uses the permanent invite without a routing script', () => {
   const html = readFileSync(new URL('../public/index.html', import.meta.url), 'utf8');
   const links = [...html.matchAll(/<a\b[^>]*data-discord-join[^>]*href="([^"]+)"/g)];
-  assert.equal(links.length, 2);
+  assert.ok(links.length >= 2);
   for (const [, href] of links) assert.equal(href, 'https://discord.gg/VzwNcSgWBk');
   assert.doesNotMatch(html, /<script\b/i);
 });

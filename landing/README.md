@@ -2,6 +2,9 @@
 
 Live website: https://reviewer-alerts.pages.dev/
 
+The page was redesigned on November 18, 2026; see "November 18 redesign" at
+the end. The sections in between record the earlier design and the Reddit test.
+
 ## Plan and design contract
 
 1. Lead with the owner's reported posting-to-alert time of approximately six
@@ -131,3 +134,37 @@ Credential discovery was restored with a local junction from
 `C:\Users\Navi\AppData\Roaming\xdg.config\.wrangler\config`.
 No credential contents were copied or printed. Task-created diagnostics were
 preserved in `C:\Users\Navi\AppData\Local\Temp\rr-wrangler-session-diagnostics-20261112`.
+
+## November 18 redesign
+
+The page has one job: a tap on the yellow Discord button.
+
+- Concept: the hero is a phone lock screen at 4:08 AM on Friday, October 30,
+  showing the couch alert. Headline (owner's wording, same day): "Stop scrolling
+  Walmart RR. We'll alert you instantly." The owner prefers "instantly" to
+  "~6 seconds" in the headline; the figure stays in the line below as proof.
+  Buttons read "Get free alerts on Discord". The line under it ends "even at hours
+  like this", which points at the clock.
+- Color: the blue is the bot avatar's (`#0045c2`). Yellow (`#ffcc33`) is used
+  only for Join buttons. Phones in dark mode get navy sections instead of white.
+- Type: Barlow Condensed ExtraBold for the clock, headlines and prices,
+  self-hosted in `public/assets/fonts/` with its SIL OFL license text. Body text
+  and the notification use the visitor's system font.
+- Proof: a ledger of the three past Pro alerts (October 29 and 30) with their
+  alert times and retail values, taken from the earlier page in git history.
+  The times are when the alerts were sent, not proof of the ~6 second figure,
+  which is still the owner's.
+- A docked Join bar shows whenever no other Join button is on screen. It uses
+  CSS scroll-driven animations; browsers without them show the bar all the time.
+- `<meta name="darkreader-lock">` stops the Dark Reader extension from
+  repainting the palette. Without it, white sections turn black and the yellow
+  button turns brown for anyone who runs that extension.
+- Still no JavaScript and no inline styles; the CSP in `_headers` is unchanged.
+- The landing test now accepts two or more Join links instead of exactly two.
+- `terms.html` describes the 3-day Whop trial and the $15 founding price, and
+  its "Updated" date is now November 18. `privacy.html` only gained the two
+  color-scheme meta tags.
+- Checked at 320, 360, 390, 820, 1440 and 2560 pixel widths, in light and dark
+  mode. Not checked on a physical phone.
+- Released to production at https://reviewer-alerts.pages.dev/ with the deploy
+  command above plus `--commit-dirty=true`.
