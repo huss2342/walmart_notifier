@@ -35,8 +35,9 @@ const DIAGNOSTIC_NUMBERS = [
   'pagerHiddenCount', 'pagerMarkerCount', 'pagerPlaceholderHrefCount',
   'pagerTargetPlaceholderCount', 'pagerPageHrefCount', 'pagerOtherHrefCount',
   'acceptedCount', 'rejectedCount', 'variantCount', 'outOfStockCount', 'missingValueCount',
-  // fast-read: stock mix, response size, CDN age and product count of one read.
-  'stockIn', 'stockOut', 'stockOther', 'bytes', 'ageSeconds', 'products',
+  // fast-read: stock mix, response size, CDN age and product count of one read;
+  // searchHash identifies a search read (32-bit FNV-1a of its normalised query, never the text).
+  'stockIn', 'stockOut', 'stockOther', 'bytes', 'ageSeconds', 'products', 'searchHash',
   // restock-watch: offer value and the timings around a return to stock.
   'valueCents', 'awayMs', 'sinceOutMs', 'sinceReturnMs', 'outReads', 'reads'
 ];
@@ -328,6 +329,8 @@ function cleanDiagnostic(event, details, at = Date.now()) {
     if (!FAST_READ_OUTCOMES.includes(details?.outcome) ||
         !['newest', 'value', 'value80', 'requests', 'priority', 'departments', 'research'].includes(details?.lane)) return null;
     entry.outcome = details.outcome;
+    // A read of one of the hot searches (fast-reads.js), recorded only when true.
+    if (details.hot === true) entry.hot = true;
   }
   if (event === 'restock-watch') {
     // Public item ids and fixed labels only; never titles, URLs or raw field values.

@@ -337,6 +337,17 @@ scrolling, no focus turn. One read runs at a time and read starts are 1.4-1.8
 seconds apart (about 37 a minute; the owner raised the earlier 24), so the
 schedule decides where that fixed budget goes, never how much of it there is.
 After any bot-check sign the spacing returns to 2.5-2.9 seconds for a day.
+Since 2.32.6 (November 19) starts are 1.05-1.45 seconds apart and at least 0.1
+seconds after the previous read and its upload finished: reads take about 1.2
+seconds, so the old 1.4-1.8 s spacing gave about 35 a minute, and this gives
+about 41. The extra reads go to six hot searches, read every 60 seconds at rank
+0 beside the $80+ pages: a reviewer search lists only the claimable items
+matching its word, so a new item appears there minutes before the 300-item
+`price_high` and `min_price=79` lists show it (29% of new $80+ items in the Nov
+16-19 audit). The set starts from six seed words and then follows each search's
+yield of new in-stock $80+ items (3-day half-life, a 25% + 0.5 margin before a
+newcomer replaces a member); a hot member search is read sooner, never twice.
+Hot searches pause during the gentler day after a bot-check sign.
 
 Each step reads the most important due target. Lower rank always goes first;
 within a rank, the target most overdue for its own interval goes first:

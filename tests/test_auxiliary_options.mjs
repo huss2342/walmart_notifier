@@ -566,16 +566,21 @@ test('direct-read card shows each lane\'s newest read, failures and a bot-check 
         outcome: 'items' },
       { event: 'fast-read', at: now - 4_000, lane: 'value', page: 1, count: 18, items: 30, durationMs: 1205,
         outcome: 'items' },
-      { event: 'fast-read', at: now - 9_000, lane: 'value80', page: 3, count: 22, items: 34, outcome: 'error' }
+      { event: 'fast-read', at: now - 9_000, lane: 'value80', page: 3, count: 22, items: 34, outcome: 'error' },
+      { event: 'fast-read', at: now - 2_000, lane: 'requests', page: 1, count: 1, items: 4, hot: true,
+        durationMs: 900, outcome: 'items' }
     ],
     reviewerFastReads: { blocks: 1, until: now + 4 * 60_000, slowUntil: now + 86_400_000 }
   } });
   await new Promise(resolve => setImmediate(resolve));
   const text = ui.elements.fastStatus.textContent;
   assert.match(text, /paused after a bot-check sign/);
-  assert.match(text, /3 direct reads in the last 60 s\s+\(about 3 a minute\)/);
+  assert.match(text, /4 direct reads in the last 60 s\s+\(about 4 a minute\)/);
   assert.match(text, /Highest value:\s+last read \d+ s ago, page 1, 18 offers at \$80\+ of 30 items \(1\.2 s\)/);
   assert.match(text, /\$80\+ list:\s+last read \d+ s ago, page 3.* Last result: error/);
+  // A hot search read (Nov 19) shows on its own line as well as its lane's.
+  assert.match(text, /Hot searches:\s+last read \d+ s ago, page 1, 1 offer at \$80\+ of 4 items \(0\.9 s\)/);
+  assert.match(text, /Member requests:\s+last read \d+ s ago, page 1 of 4 items/);
   assert.doesNotMatch(text, /Newest|Departments/);
   assert.equal(ui.elements.overallStatus.textContent, 'Running');
 

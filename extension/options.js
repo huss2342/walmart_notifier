@@ -722,7 +722,8 @@ function since(at) {
 
 const FAST_LANES = [
   ['value', 'Highest value'], ['value80', '$80+ list'], ['newest', 'Newest'],
-  ['requests', 'Member requests'], ['priority', 'Priority searches'], ['departments', 'Departments']
+  ['requests', 'Member requests'], ['priority', 'Priority searches'], ['hot', 'Hot searches'],
+  ['departments', 'Departments']
 ];
 
 /**
@@ -754,11 +755,12 @@ function renderFastStatus(history, fastState) {
   frag.appendChild(line('hint', `${recent} direct read${recent === 1 ? '' : 's'} in the last ${Math.round(covered / 1000)} s`,
     `(about ${Math.round(recent * 60_000 / covered)} a minute).`));
   for (const [lane, name] of FAST_LANES) {
-    const last = reads.filter(entry => entry.lane === lane).at(-1);
+    // Hot searches are member or priority searches read every minute, flagged `hot`.
+    const last = reads.filter(entry => lane === 'hot' ? entry.hot === true : entry.lane === lane).at(-1);
     if (!last) continue;
     let detail = `last read ${since(last.at)}`;
     if (Number.isSafeInteger(last.page)) detail += `, page ${last.page}`;
-    if (['value', 'value80'].includes(lane) && Number.isSafeInteger(last.count)) {
+    if (['value', 'value80', 'hot'].includes(lane) && Number.isSafeInteger(last.count)) {
       detail += `, ${last.count} offer${last.count === 1 ? '' : 's'} at $80+`;
     }
     if (Number.isSafeInteger(last.items)) detail += ` of ${last.items} items`;

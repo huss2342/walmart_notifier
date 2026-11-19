@@ -15,8 +15,15 @@ Runs entirely on your own machine. **No cloud account, no hosting bill, $0/month
 
 - **Direct reads** (`fast-reads.js`): catalogue pages are read from their
   server-rendered page data inside an open reviewer tab, without rendering or
-  scrolling. One read at a time, starts 1.4-1.8 s apart (about 37 a minute),
-  2.5 s for a day after any bot-check sign; the scanning tabs keep running.
+  scrolling. One read at a time, starts 1.05-1.45 s apart and 0.1 s after the
+  previous read finished (about 41 a minute at Nov 19 response times; 2.32.6
+  raised it from ~35 for hot searches), 2.5 s for a day after any bot-check
+  sign; the scanning tabs keep running.
+- **Hot searches** (2.32.6): six keyword searches read every 60 s alongside the
+  $80+ pages, because a new item shows in a matching search minutes before the
+  catalogue lists. Seeds: chair, ktaxon, sofa, tablet, trampoline, rack; the set
+  then follows which searches surface new in-stock $80+ items (scores halve
+  every 3 days, kept in `chrome.storage.local`). See `fast-reads.js`.
 - **Highest value first:** `sort=price_high` page 1 every 10 s, other pages
   holding $80+ offers every 20 s. Lane `value80` reads the `min_price=79` list
   (the only list holding every $80+ offer, variant listings included): pages with

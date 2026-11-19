@@ -1,13 +1,15 @@
 // Direct reads of the reviewer catalogue's own page data. No rendering or
 // scrolling: the server-rendered page already carries its 40 items as data.
-// One read at a time; read starts 1.4-1.8 s apart (about 37 a minute; the
-// owner raised the old 24), back to 2.5-2.9 s for a day after any bot-check
-// sign. Each step reads the most important target that is due; a lower rank
-// always goes first:
+// One read at a time; a read starts 1.05-1.45 s after the previous start and
+// at least 0.1 s after the previous read (and its upload) finished: about 41 a
+// minute at Nov 19's read durations (see hot searches below). Back to 2.5-2.9 s
+// for a day after any bot-check sign.
+// Each step reads the most important target that is due; a lower rank always
+// goes first:
 //   0  sort=price_high page 1 every 10 s (first of all), every other page holding $80+ items
 //      every 20 s (the owner's two most valuable reads); the min_price=79 list
 //      (about 8 pages), each page holding an $80+ offer every 40 s, the rest
-//      every 3 min
+//      every 3 min; the 6 hot searches (page 1) every 60 s
 //   1  the slow, fixed checks: sort=new page 1 (5 min) and member request
 //      searches that had no products at their last read (30 min)
 //   2  member request searches with products (page 1, every 4 min at best):
@@ -17,13 +19,41 @@
 //   4  sort=new pages 2-4
 //   5  department pages, deepest first, only in slots nothing above needs
 // Within a rank, the target most overdue for its own interval goes first.
+// Hot searches (Nov 19, owner-approved, about +6 reads a minute): in 72 hours,
+// 46 new $80+ items (29%) showed in a keyword search minutes before the
+// price_high and min_price=79 lists did (median 8.4 min; 19 never reached them).
+// A reviewer search returns only the claimable items matching its word right
+// now ("chair" 4 items, "dresser" none), so a new item is on its page 1 at once,
+// while the 309-item catalogue lists update late. Searches ignore sort=price_high
+// and min_price, so no search-only $80+ list exists. Watching chair, ktaxon,
+// sofa, tablet, trampoline and rack every 60 s would have caught 29 of the 46.
+// Those six are the seeds; then the set follows the yield. Every page-1 read of
+// a member, priority or hot search scores the in-stock $80+ items new to that
+// search (absent from its reads of the last 6 hours; its first read only sets
+// the baseline). Scores halve every 3 days; seeds start at 2. The hot set is the
+// top 6: a newcomer must score above the weakest x 1.25 + 0.5, so ties keep the
+// current members and the set does not flap. A hot member or priority search is
+// the same target read sooner, never twice; its later pages keep their cadence.
+// Scores, the set and each search's recent $80+ items persist in storage.local
+// (bounded). Hot reads are rank 0: they share with the $80+ pages by overdue
+// ratio and price_high page 1 still goes first. Their reads are new budget. The
+// rate was limited both by the spacing (1.4-1.8 s) and by each read's own
+// duration (median 1.2 s with its upload) plus a 0.25 s pause, so lowering the
+// spacing alone could add at most ~4 reads a minute; both went down. On the
+// measured durations that is 34.7 -> 40.9 reads a minute, and every other rank
+// keeps its cadence (data/hot-searches-20261119/cadence_sim.mjs). The rate
+// follows Walmart's response time: 30% faster answers would give ~46 a minute
+// (36.8 before). During the gentler pace after a bot-check sign no search is hot.
+// Each search read logs a 32-bit FNV-1a hash of its normalised query
+// (searchHash), whether it was a hot read (hot), its $80+ count and its
+// upload's requestId; never the query text. That makes per-search yield auditable.
 // Nov 19 (owner-approved, same read load): sort=new page 1 went from 30 s to
 // 5 min (it found no $80+ item first in the Nov 16-19 audit) and empty searches
 // from 12 to 30 min (a third of search reads were empty); the ~2 reads a minute
 // this frees go to searches with products. The read rate is set by the spacing
-// alone (every step reads one due target, departments fill the rest), so
-// intervals only move reads between targets; they never add any
-// (simulated on the Nov 19 workload: 34.68 reads a minute before and after).
+// and the reads' own durations (every step reads one due target, departments
+// fill the rest), so intervals only move reads between targets; they never add
+// any (simulated on the Nov 19 workload: 34.68 reads a minute before and after).
 // Walmart's price order is approximate: each page ends with a few cheaper items
 // (page 1 ending at $64 while page 2 runs $142-$91), so a page counts by
 // whether it holds any item above a floor, never by its last item.
@@ -42,8 +72,8 @@ const ReviewerFastReads = (() => {
   const HOME = 'https://www.walmart.com/reviews/claim-product';
   const ALARM = 'fastReads';
   const STATE_KEY = 'reviewerFastReads';
-  const STEP_MS = 250; // Pause after each read.
-  const MIN_SPACING_MS = 1_400; // Between read starts, plus up to SPACING_JITTER_MS.
+  const STEP_MS = 100; // Pause after each read (250 until Nov 19).
+  const MIN_SPACING_MS = 1_050; // Between read starts, plus up to SPACING_JITTER_MS (1_400 until Nov 19).
   const SPACING_JITTER_MS = 400; // Irregular starts, not a metronome.
   const SAFE_SPACING_MS = 2_500; // The old rate, kept for a day after any bot-check sign.
   const SAFE_AFTER_BLOCK_MS = 24 * 60 * 60_000;
@@ -70,14 +100,27 @@ const ReviewerFastReads = (() => {
   const RECHECK_MS = 10_000;
   const PROBE_TIMEOUT_MS = 10_000;
   const MAX_PROBES = 8;
-  // Owner-listed research reads wait behind the $80+ pages only.
+  // Owner-listed research reads wait behind the rank-0 reads ($80+ pages, hot searches) only.
   const RESEARCH_TIMEOUT_MS = 120_000;
   const MAX_RESEARCH = 4;
   const SECOND = 1_000;
   const MINUTE = 60_000;
+  // Hot searches (see the header): seeds, set size, scoring and storage bounds.
+  const HOT_SEEDS = Object.freeze(['chair', 'ktaxon', 'sofa', 'tablet', 'trampoline', 'rack']);
+  const HOT_KEY = 'reviewerHotSearches';
+  const HOT_SIZE = 6;
+  const HOT_HALF_LIFE_MS = 3 * 24 * 60 * MINUTE;
+  const HOT_PRIOR = 2; // A seed starts as if it had surfaced two new $80+ items.
+  const HOT_SWAP_RATIO = 1.25; // A newcomer must score above the weakest hot search x 1.25 + 0.5,
+  const HOT_SWAP_MARGIN = 0.5; // and at least 0.5 to fill a free place.
+  const HOT_REMEMBER_MS = 6 * 60 * MINUTE; // An item a search showed in this window is not new to it.
+  const HOT_MEMORY_ITEMS = 16; // $80+ item ids remembered per search.
+  const HOT_MAX_SCORES = 400; // Scored searches kept (lowest dropped first).
+  const HOT_MIN_SCORE = 0.01; // A forgotten search's score below this is dropped.
+  const HOT_SAVE_MS = MINUTE; // Memory-only changes are saved at most this often.
   const INTERVALS = Object.freeze({
     value: Object.freeze([10 * SECOND]), valueHigh: 20 * SECOND, valueDeep: 4 * MINUTE,
-    value80: 40 * SECOND, value80Idle: 3 * MINUTE,
+    value80: 40 * SECOND, value80Idle: 3 * MINUTE, hot: MINUTE,
     // Searches with products aim at 4 min and get whatever reads are left over;
     // searches empty at their last read (member or priority) wait 30 min.
     member: 4 * MINUTE, memberEmpty: 30 * MINUTE, priority: 12 * MINUTE,
@@ -107,9 +150,25 @@ const ReviewerFastReads = (() => {
 
   const searchKey = query => query.trim().replace(/\s+/g, ' ').toLocaleLowerCase('en-US');
 
+  // 32-bit FNV-1a over the UTF-8 bytes of a normalised query: a short, stable
+  // search identity for the diagnostics, never the query itself. In Python:
+  //   h = 0x811c9dc5; for b in key.encode(): h = ((h ^ b) * 0x01000193) & 0xffffffff
+  function searchHash(key) {
+    let hash = 0x811c9dc5;
+    const mix = byte => { hash = Math.imul(hash ^ byte, 0x01000193) >>> 0; };
+    for (const char of key) {
+      const code = char.codePointAt(0);
+      if (code < 0x80) mix(code);
+      else if (code < 0x800) { mix(0xc0 | code >> 6); mix(0x80 | code & 63); }
+      else if (code < 0x10000) { mix(0xe0 | code >> 12); mix(0x80 | code >> 6 & 63); mix(0x80 | code & 63); }
+      else { mix(0xf0 | code >> 18); mix(0x80 | code >> 12 & 63); mix(0x80 | code >> 6 & 63); mix(0x80 | code & 63); }
+    }
+    return hash;
+  }
+
   function create(chrome, { tabIds, send, paused, diagnostic, queries = async () => [], departments = async () => [],
     onBlocked = async () => {}, mustSend = () => false, setTimer = setTimeout, clearTimer = clearTimeout,
-    random = Math.random }) {
+    random = Math.random, hotSeeds = HOT_SEEDS }) {
     let timer = null;
     let running = false;
     let lastStartAt = 0;
@@ -132,6 +191,12 @@ const ReviewerFastReads = (() => {
     let departmentPausedUntil = 0;
     const probes = [];
     const researchQueue = [];
+    // Hot searches: scores (key -> { score, at }, decaying from `at`), each
+    // search's recent $80+ items (key -> Map id -> last seen), the hot set (keys,
+    // in the order they joined) and when the state was last saved.
+    const hot = { loading: null, scores: new Map(), memory: new Map(), set: [], dirty: false, savedAt: 0,
+      candidates: null };
+    const seeds = (Array.isArray(hotSeeds) ? hotSeeds : []).filter(query => typeof query === 'string' && query.trim());
 
     const readState = async () => {
       try { return (await chrome.storage.local.get(STATE_KEY))[STATE_KEY] || { blocks: 0, until: 0 }; }
@@ -163,36 +228,170 @@ const ReviewerFastReads = (() => {
       ({ key: `newest:${index + 1}`, lane: 'newest', page: index + 1, rank: index ? RANK.newestDeep : RANK.slow,
         interval }));
 
+    const decayed = (entry, now) => entry
+      ? entry.score * 2 ** (-Math.max(0, now - entry.at) / HOT_HALF_LIFE_MS) : 0;
+
+    // Scores, item memory and the hot set survive reloads; anything malformed is skipped.
+    function loadHot() {
+      hot.loading ||= (async () => {
+        let stored = null;
+        try { stored = (await chrome.storage.local.get(HOT_KEY))[HOT_KEY]; } catch { stored = null; }
+        const now = Date.now();
+        const key = value => typeof value === 'string' && value.length > 0 && value.length <= 200;
+        if (stored && typeof stored === 'object' && stored.v === 1) {
+          for (const row of Array.isArray(stored.scores) ? stored.scores.slice(0, HOT_MAX_SCORES) : []) {
+            if (Array.isArray(row) && key(row[0]) && Number.isFinite(row[1]) && row[1] >= 0 && row[1] <= 1e6 &&
+                Number.isFinite(row[2])) hot.scores.set(row[0], { score: row[1], at: Math.min(row[2], now) });
+          }
+          for (const row of Array.isArray(stored.memory) ? stored.memory.slice(0, HOT_MAX_SCORES) : []) {
+            if (!Array.isArray(row) || !key(row[0]) || !Array.isArray(row[1])) continue;
+            hot.memory.set(row[0], new Map(row[1].filter(entry => Array.isArray(entry) &&
+              typeof entry[0] === 'string' && /^ip-\d{1,20}$/.test(entry[0]) && Number.isFinite(entry[1]) &&
+              now - entry[1] <= HOT_REMEMBER_MS).slice(-HOT_MEMORY_ITEMS).map(entry => [entry[0], entry[1]])));
+          }
+          hot.set = [...new Set((Array.isArray(stored.hot) ? stored.hot : []).filter(key))].slice(0, HOT_SIZE);
+        }
+        // A seed without a score starts at the prior, once: a seed that then
+        // finds nothing keeps its decaying score and can lose its place.
+        for (const query of seeds) {
+          const seed = searchKey(query);
+          if (!hot.scores.has(seed)) {
+            hot.scores.set(seed, { score: HOT_PRIOR, at: now });
+            hot.dirty = true;
+          }
+        }
+      })();
+      return hot.loading;
+    }
+
+    // Saved at most once a minute, or at once when a score or the set changed.
+    // Searches no longer configured keep only a score, until it decays away.
+    function saveHot(now, force = false) {
+      if (!hot.dirty || (!force && now - hot.savedAt < HOT_SAVE_MS)) return;
+      const candidates = hot.candidates || new Map();
+      const keep = key => candidates.has(key) || hot.set.includes(key);
+      for (const key of hot.memory.keys()) if (!keep(key)) hot.memory.delete(key);
+      for (const [key, entry] of hot.scores) if (!keep(key) && decayed(entry, now) < HOT_MIN_SCORE) hot.scores.delete(key);
+      if (hot.scores.size > HOT_MAX_SCORES) {
+        const order = [...hot.scores].sort((a, b) => Number(keep(a[0])) - Number(keep(b[0])) ||
+          decayed(a[1], now) - decayed(b[1], now));
+        for (const [key] of order.slice(0, hot.scores.size - HOT_MAX_SCORES)) hot.scores.delete(key);
+      }
+      hot.dirty = false;
+      hot.savedAt = now;
+      const value = { v: 1, hot: [...hot.set],
+        scores: [...hot.scores].map(([key, entry]) => [key, Math.round(entry.score * 10_000) / 10_000, entry.at]),
+        memory: [...hot.memory].slice(-HOT_MAX_SCORES).map(([key, items]) => [key, [...items]]) };
+      Promise.resolve().then(() => chrome.storage.local.set({ [HOT_KEY]: value })).catch(() => {});
+    }
+
+    // One page-1 read of a search: counts the in-stock $80+ items new to it (not
+    // in its reads of the last HOT_REMEMBER_MS). Its first read only sets the baseline.
+    function scoreSearch(key, items, now) {
+      const before = hot.memory.get(key);
+      const memory = new Map();
+      if (before) for (const [id, at] of before) if (now - at <= HOT_REMEMBER_MS) memory.set(id, at);
+      let fresh = 0;
+      for (const item of items) {
+        if (typeof item?.item_id !== 'string' || !(item.value_usd >= VALUE_FLOOR)) continue;
+        if (before && item.available !== false && !memory.has(item.item_id)) fresh += 1;
+        memory.delete(item.item_id);
+        memory.set(item.item_id, now);
+      }
+      while (memory.size > HOT_MEMORY_ITEMS) memory.delete(memory.keys().next().value);
+      hot.memory.set(key, memory);
+      hot.dirty = true;
+      if (fresh) {
+        hot.scores.set(key, { score: decayed(hot.scores.get(key), now) + fresh, at: now });
+        if (hot.candidates) reviewHot(hot.candidates, now); // The only time the order can change.
+      }
+      saveHot(now, fresh > 0);
+    }
+
+    // The hot set: the top HOT_SIZE candidates by score. A newcomer takes the
+    // weakest place only when it scores above HOT_SWAP_RATIO x that + HOT_SWAP_MARGIN
+    // (ties keep the current members); a free place needs HOT_SWAP_MARGIN. All
+    // scores decay alike, so the order changes only when a search finds something.
+    function reviewHot(candidates, now) {
+      hot.candidates = candidates;
+      const score = key => decayed(hot.scores.get(key), now);
+      const kept = hot.set.filter(key => candidates.has(key));
+      let changed = kept.length !== hot.set.length;
+      const others = [];
+      for (const key of candidates.keys()) {
+        if (!hot.scores.has(key) || kept.includes(key)) continue;
+        const value = score(key);
+        if (value >= HOT_SWAP_MARGIN) others.push({ key, value });
+      }
+      others.sort((a, b) => b.value - a.value); // Stable: ties keep the candidate order.
+      for (const { key, value } of others) {
+        if (kept.length < HOT_SIZE) {
+          kept.push(key);
+          changed = true;
+          continue;
+        }
+        let weakest = 0;
+        let low = Infinity;
+        kept.forEach((member, index) => {
+          const current = score(member);
+          if (current <= low) { low = current; weakest = index; } // On a tie, the latest to join.
+        });
+        if (!(value > low * HOT_SWAP_RATIO + HOT_SWAP_MARGIN)) break; // Later ones score lower still.
+        kept.splice(weakest, 1);
+        kept.push(key);
+        changed = true;
+      }
+      if (changed) {
+        hot.set = kept;
+        hot.dirty = true;
+        saveHot(now, true);
+      }
+      return new Set(kept);
+    }
+
     // Member searches first: they become personal DMs. A query in both lists
-    // counts as a member search.
-    async function searchTargets() {
+    // counts as a member search. A hot seed in neither list is read only while
+    // hot, page 1, as a priority search numbered after the owner's list. A hot
+    // search keeps its target (and so its last read): it is read sooner, never twice.
+    // While the gentler pace after a bot-check sign is on, no search is hot.
+    async function searchTargets(now, slow = false) {
+      await loadHot();
       let lists;
       try { lists = await queries(); } catch { lists = []; }
       const members = Array.isArray(lists) ? lists : Array.isArray(lists?.members) ? lists.members : [];
       const priority = !Array.isArray(lists) && Array.isArray(lists?.priority) ? lists.priority : [];
-      const targets = [];
-      const keys = new Set();
-      const add = (query, index, lane) => {
+      const candidates = new Map();
+      const add = (query, index, lane, seed = false) => {
         if (typeof query !== 'string' || !query.trim()) return;
         const key = searchKey(query);
-        if (keys.has(key)) return;
-        keys.add(key);
+        if (!candidates.has(key)) candidates.set(key, { query, index, lane, seed });
+      };
+      members.forEach((query, index) => add(query, index + 1, 'requests'));
+      priority.forEach((query, index) => add(query, index + 1, 'priority'));
+      seeds.forEach((query, index) => add(query, priority.length + index + 1, 'priority', true));
+      const hotKeys = reviewHot(candidates, now);
+      const targets = [];
+      for (const [key, { query, index, lane, seed }] of candidates) {
         const info = searches.get(key);
         const member = lane === 'requests';
-        // An empty member search keeps its slow 30-minute check ahead of the
-        // searches with products, which share every read left after it.
-        targets.push({ key: `search:${key}:1`, lane, page: 1, query, index,
-          rank: !member ? RANK.deep : info?.empty ? RANK.slow : RANK.member,
-          interval: info?.empty ? INTERVALS.memberEmpty : member ? INTERVALS.member : INTERVALS.priority });
+        if (!slow && hotKeys.has(key)) {
+          targets.push({ key: `search:${key}:1`, lane, page: 1, query, index, hot: true, rank: RANK.value,
+            interval: INTERVALS.hot });
+        } else if (!seed) {
+          // An empty member search keeps its slow 30-minute check ahead of the
+          // searches with products, which share every read left after it.
+          targets.push({ key: `search:${key}:1`, lane, page: 1, query, index,
+            rank: !member ? RANK.deep : info?.empty ? RANK.slow : RANK.member,
+            interval: info?.empty ? INTERVALS.memberEmpty : member ? INTERVALS.member : INTERVALS.priority });
+        }
+        if (seed) continue;
         for (let page = 2; page <= Math.min(info?.totalPages || 1, SEARCH_PAGES); page += 1) {
           targets.push({ key: `search:${key}:${page}`, lane, page, query, index, rank: RANK.deep,
             interval: member ? INTERVALS.memberPages : INTERVALS.priorityPages });
         }
-      };
-      members.forEach((query, index) => add(query, index + 1, 'requests'));
-      priority.forEach((query, index) => add(query, index + 1, 'priority'));
+      }
       // Forget searches that are no longer configured.
-      for (const key of searches.keys()) if (!keys.has(key)) searches.delete(key);
+      for (const key of searches.keys()) if (!candidates.has(key)) searches.delete(key);
       const current = new Set(targets.map(target => target.key));
       for (const key of lastRead.keys()) if (key.startsWith('search:') && !current.has(key)) lastRead.delete(key);
       return targets;
@@ -214,10 +413,10 @@ const ReviewerFastReads = (() => {
       return departmentQueue.shift();
     }
 
-    async function nextTarget(now) {
+    async function nextTarget(now, slow = false) {
       // A target never read yet counts as twice due: first in line, without
       // letting a large new batch shut out a short-interval target for minutes.
-      const due = [...valueTargets(), ...await searchTargets(), ...newestTargets()]
+      const due = [...valueTargets(), ...await searchTargets(now, slow), ...newestTargets()]
         .map(target => ({ ...target, overdue: lastRead.has(target.key)
           ? (now - lastRead.get(target.key)) / target.interval : 2 }))
         .filter(target => target.overdue >= 1)
@@ -288,6 +487,8 @@ const ReviewerFastReads = (() => {
         const products = Number.isSafeInteger(reply.products) ? reply.products : reply.items.length;
         searches.set(searchKey(target.query), { at: Date.now(), empty: products === 0,
           totalPages: Number.isInteger(reply.totalPages) && reply.totalPages > 0 ? reply.totalPages : 1 });
+        // Probes are the scan coordinator's emptiness checks: they do not score.
+        if (!probe) scoreSearch(searchKey(target.query), reply.items, Date.now());
       }
     }
 
@@ -311,8 +512,10 @@ const ReviewerFastReads = (() => {
       const { lane, page, query = '', catId = '' } = target;
       const url = target.url || urlFor(lane, page, query, catId);
       const startedAt = Date.now();
+      // A search is logged by a hash of its query, never the query itself.
       const base = { lane, page,
-        ...(Number.isSafeInteger(target.index) && target.index > 0 ? { targetIndex: target.index } : {}) };
+        ...(Number.isSafeInteger(target.index) && target.index > 0 ? { targetIndex: target.index } : {}),
+        ...(query ? { searchHash: searchHash(searchKey(query)) } : {}), ...(target.hot ? { hot: true } : {}) };
       const elapsed = () => ({ durationMs: Date.now() - startedAt });
       const reply = await read(url, target.research ? 'reviewer:research-read' : 'reviewer:fast-read');
       const status = Number.isInteger(reply?.status) ? { responseStatus: reply.status } : {};
@@ -359,8 +562,8 @@ const ReviewerFastReads = (() => {
         ...(Number.isSafeInteger(reply.age) ? { ageSeconds: reply.age } : {}),
         ...(Number.isSafeInteger(reply.products) ? { products: reply.products } : {}),
         ...(lane === 'departments' && Number.isSafeInteger(reply.totalItems) ? { count: reply.totalItems } : {}),
-        // For price_high pages: how many $80+ items (in stock or not) the page holds.
-        ...(['value', 'value80'].includes(lane)
+        // For price_high pages and searches: how many $80+ items (in stock or not) the page holds.
+        ...(['value', 'value80'].includes(lane) || (query && lane !== 'departments')
           ? { count: reply.items.filter(item => item.value_usd >= VALUE_FLOOR).length } : {}) };
       const items = reply.items;
       if (probe) {
@@ -392,8 +595,10 @@ const ReviewerFastReads = (() => {
           lastRead.set(target.key, Date.now() + RECHECK_MS - target.interval);
         }
       }
+      // The upload's request id joins this read to the items it delivered.
       log({ ...base, ...status, ...totals, outcome: result?.ok ? 'items' : 'error', items: items.length,
-        new: result?.summary?.new || 0, duplicates: result?.summary?.duplicates || 0, ...elapsed() });
+        new: result?.summary?.new || 0, duplicates: result?.summary?.duplicates || 0,
+        ...(typeof result?.requestId === 'string' ? { requestId: result.requestId } : {}), ...elapsed() });
       return reply;
     }
 
@@ -413,7 +618,8 @@ const ReviewerFastReads = (() => {
           return;
         }
         const probe = probes.shift();
-        const target = probe ? probe.target : await nextTarget(Date.now());
+        const target = probe ? probe.target
+          : await nextTarget(Date.now(), Date.now() < (Number(state.slowUntil) || 0));
         if (!target) return;
         lastStartAt = Date.now();
         const slow = lastStartAt < (Number(state.slowUntil) || 0);
@@ -478,7 +684,7 @@ const ReviewerFastReads = (() => {
     }
 
     // One owner-listed reviewer list page, summarised in full and never
-    // ingested. Waits behind the $80+ pages only; null on backoff or timeout.
+    // ingested. Waits behind the rank-0 reads only; null on backoff or timeout.
     function research(raw) {
       return new Promise(resolve => {
         let url;
@@ -513,9 +719,17 @@ const ReviewerFastReads = (() => {
       return Boolean(info?.empty && Date.now() - info.at < EMPTY_PROOF_MS);
     }
 
-    return { ensure, run, probe, research, recentlyEmpty, alarmName: ALARM };
+    // The hot set (normalised queries, in joining order) and current scores.
+    async function hotSearches() {
+      await loadHot();
+      const now = Date.now();
+      return { hot: [...hot.set], scores: Object.fromEntries([...hot.scores]
+        .map(([key, entry]) => [key, Math.round(decayed(entry, now) * 1_000) / 1_000])) };
+    }
+
+    return { ensure, run, probe, research, recentlyEmpty, hotSearches, alarmName: ALARM };
   }
 
-  return { create, urlFor, SORTS, INTERVALS, RECHECK_MS, MIN_SPACING_MS, SAFE_SPACING_MS, VALUE_FLOOR, VALUE_DEEP_FLOOR,
-    VALUE_MAX_PAGES };
+  return { create, urlFor, searchHash, SORTS, INTERVALS, RECHECK_MS, MIN_SPACING_MS, SAFE_SPACING_MS, STEP_MS,
+    VALUE_FLOOR, VALUE_DEEP_FLOOR, VALUE_MAX_PAGES, HOT_SEEDS, HOT_SIZE, HOT_HALF_LIFE_MS };
 })();

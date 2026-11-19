@@ -73,8 +73,9 @@ _NUMERIC_FIELDS = frozenset({
     "pagerNumericTextCount", "pagerTargetTextCount", "pagerTargetAriaCount",
     "pagerHiddenCount", "pagerMarkerCount", "pagerPlaceholderHrefCount",
     "pagerTargetPlaceholderCount", "pagerPageHrefCount", "pagerOtherHrefCount",
-    # fast-read: stock mix, response size, CDN age and product count of one read.
-    "stockIn", "stockOut", "stockOther", "bytes", "ageSeconds", "products",
+    # fast-read: stock mix, response size, CDN age and product count of one read;
+    # searchHash identifies a search read (32-bit FNV-1a of its normalised query, never the text).
+    "stockIn", "stockOut", "stockOther", "bytes", "ageSeconds", "products", "searchHash",
     # restock-watch: offer value and the timings around a return to stock.
     "valueCents", "awayMs", "sinceOutMs", "sinceReturnMs", "outReads", "reads",
 })
@@ -110,7 +111,7 @@ _EVENT_KEYS = _NUMERIC_FIELDS | _CARD_COUNTS | {
     "at", "event", "reason", "mode", "lane", "samples", "failureCode", "operation",
     "stage", "state", "outcome", "requestId", "streamId", "intakePhase", "component",
     "statusCode", "errorStage", "errorReason", "releaseReason", "cleanupConfirmed", "transport",
-    "targetId", "decision",
+    "targetId", "decision", "hot",
 } | _RESTOCK_KEYS
 _SCANNER_STATE_LABELS = {
     "phase": frozenset({
@@ -360,6 +361,11 @@ def _event(value: object) -> dict:
         if data.get("lane") not in {"newest", "value", "value80", "requests", "priority",
                                     "departments", "research"}:
             raise ValueError(INVALID_REPORT)
+        # A read of one of the hot searches; the extension records only `true`.
+        if "hot" in data:
+            if data["hot"] is not True:
+                raise ValueError(INVALID_REPORT)
+            clean["hot"] = True
     elif name == "restock-watch":
         # Public item ids and fixed labels only: the evidence behind a "Back in stock".
         if type(data.get("itemId")) is not str or _ITEM_ID.fullmatch(data["itemId"]) is None:
@@ -388,6 +394,8 @@ def _event(value: object) -> dict:
     elif "outcome" in data:
         raise ValueError(INVALID_REPORT)
     if "decision" in data and name != "scanner-recovery":
+        raise ValueError(INVALID_REPORT)
+    if "hot" in data and name != "fast-read":
         raise ValueError(INVALID_REPORT)
     if name != "restock-watch" and _RESTOCK_KEYS & data.keys():
         raise ValueError(INVALID_REPORT)

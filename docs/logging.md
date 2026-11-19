@@ -199,6 +199,13 @@ record each step. All fields are item IDs, fixed labels, booleans or numbers.
 - `fast-read` events now carry the read's stock mix (`stockIn`, `stockOut`,
   `stockOther`: free offers by `availabilityStatusV2`), `products`, `bytes` (page
   size) and `ageSeconds` (the CDN `Age` header, when present).
+- Since 2.32.6 a search read (`requests` or `priority` lane) also carries
+  `searchHash`, a 32-bit FNV-1a hash of its normalised query (trimmed, spaces
+  collapsed, lower case; never the query text), `count` (its $80+ items), `hot:
+  true` when it was one of the six hot searches read every minute, and the
+  upload's `requestId` (any lane), which joins the read to the `ingest-stage`
+  events and the items it delivered. To name a hash, hash the known queries:
+  `h = 0x811c9dc5; for b in key.encode(): h = ((h ^ b) * 0x01000193) & 0xffffffff`.
 
 Reading the evidence:
 

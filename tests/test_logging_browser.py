@@ -358,6 +358,45 @@ process.stdout.write(JSON.stringify(output));
     assert "private" not in json.dumps(output)
 
 
+def test_search_reads_keep_query_hash_hot_flag_and_request_id():
+    incoming = report((1,))
+    incoming["events"][0].update(
+        event="fast-read", lane="requests", outcome="items", page=1, items=4, count=1,
+        targetIndex=3, searchHash=3_405_691_582, hot=True, requestId="c" * 32,
+        durationMs=900, responseStatus=200, totalPages=1,
+    )
+    store = BrowserDiagnosticsStore(":memory:")
+    store.record_report(incoming)
+    assert store.snapshot()["report"] == incoming
+
+
+FAST_SEARCH_READ = {"event": "fast-read", "lane": "priority", "outcome": "items", "page": 1,
+                    "searchHash": 7, "hot": True}
+INGEST_QUEUED = {"event": "ingest-stage", "lane": "requests", "stage": "queued",
+                 "outcome": "waiting", "intakePhase": "fast", "requestId": "d" * 32, "page": 1,
+                 "items": 4}
+
+
+@pytest.mark.parametrize(
+    ("valid", "bad"),
+    [
+        (FAST_SEARCH_READ, {"hot": False}),
+        (FAST_SEARCH_READ, {"hot": "yes"}),
+        (FAST_SEARCH_READ, {"hot": 1}),
+        (FAST_SEARCH_READ, {"searchHash": -1}),
+        (FAST_SEARCH_READ, {"searchHash": "a1b2c3d4"}),
+        (INGEST_QUEUED, {"hot": True}),
+    ],
+)
+def test_hot_flag_and_search_hash_are_strict(valid, bad):
+    incoming = report((1,))
+    incoming["events"][0].update(valid)
+    BrowserDiagnosticsStore(":memory:").record_report(deepcopy(incoming))
+    incoming["events"][0].update(bad)
+    with pytest.raises(ValueError, match="Invalid browser diagnostics report"):
+        BrowserDiagnosticsStore(":memory:").record_report(incoming)
+
+
 def test_research_reads_are_logged_as_their_own_fast_read_lane():
     incoming = report((1,))
     incoming["events"][0].update(

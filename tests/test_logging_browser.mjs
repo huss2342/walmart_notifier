@@ -265,6 +265,22 @@ test('restock-watch keeps the evidence behind a "Back in stock": ids, fixed labe
   }
 });
 
+test('search reads keep a query hash, the hot flag and the upload request id, never the query', () => {
+  const f = fixture();
+  const e = f.api.cleanDiagnostic('fast-read', { lane: 'requests', outcome: 'items', page: 1, items: 4, count: 1,
+    targetIndex: 3, searchHash: 3_405_691_582, hot: true, requestId: 'c'.repeat(32), query: 'private search',
+    url: 'https://www.walmart.com/reviews/claim-product?q=private' }, 123);
+  assert.deepEqual([e.searchHash, e.hot, e.requestId, e.count], [3_405_691_582, true, 'c'.repeat(32), 1]);
+  assert.equal(e.query, undefined);
+  assert.equal(e.url, undefined);
+  // Only a literal true is a hot read; the flag never rides on other events.
+  assert.equal(f.api.cleanDiagnostic('fast-read', { lane: 'priority', outcome: 'items', hot: 'yes' }, 1).hot, undefined);
+  assert.equal(f.api.cleanDiagnostic('ingest-stage', { stage: 'queued', outcome: 'waiting', lane: 'requests',
+    hot: true }, 1).hot, undefined);
+  assert.equal(f.api.cleanDiagnostic('fast-read', { lane: 'priority', outcome: 'items', searchHash: -1 }, 1).searchHash,
+    undefined);
+});
+
 test('direct reads log their stock mix, size, CDN age and product count', () => {
   const f = fixture();
   const e = f.api.cleanDiagnostic('fast-read', { lane: 'value80', outcome: 'items', page: 2, items: 41,
