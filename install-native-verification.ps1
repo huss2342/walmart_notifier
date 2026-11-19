@@ -14,7 +14,7 @@ function Test-OwnedNativeRegistration {
             $nativeDocument.type -eq 'stdio' -and
             [IO.Path]::GetFullPath([string]$nativeDocument.path) -eq [IO.Path]::GetFullPath($ExpectedLauncher) -and
             @($nativeDocument.allowed_origins).Count -eq 1 -and
-            $nativeDocument.allowed_origins[0] -ceq 'chrome-extension://oidgbnehgnikmniolojjkmhlpifdoiil/'
+            $nativeDocument.allowed_origins[0] -ceq 'chrome-extension://nanfeahhlhikgdpdffcdfonhjdigjjpb/'
         )
     } catch { return $false }
 }
@@ -83,7 +83,7 @@ if ($PSCmdlet.ShouldProcess($nativeManifest, 'Compile and register current-user 
         description = 'Reviewer Item Relay bounded Windows verification input'
         path = $nativeLauncher
         type = 'stdio'
-        allowed_origins = @('chrome-extension://oidgbnehgnikmniolojjkmhlpifdoiil/')
+        allowed_origins = @('chrome-extension://nanfeahhlhikgdpdffcdfonhjdigjjpb/')
     }
     [IO.File]::WriteAllText($nativeManifest, ($nativeDocument | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
     New-Item -Path $nativeRegistry -Force | Out-Null

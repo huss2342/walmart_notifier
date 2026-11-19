@@ -300,7 +300,7 @@ def test_prepare_rejects_nonfinite_or_invalid_geometry(bad):
 
 def test_launch_requires_manifest_exact_origin_and_real_parent(tmp_path):
     path = tmp_path / "host.json"
-    origin = "chrome-extension://oidgbnehgnikmniolojjkmhlpifdoiil/"
+    origin = "chrome-extension://nanfeahhlhikgdpdffcdfonhjdigjjpb/"
     path.write_text(
         json.dumps(
             {
@@ -313,7 +313,7 @@ def test_launch_requires_manifest_exact_origin_and_real_parent(tmp_path):
     assert validate_launch([origin, "--parent-window=123", "--host-manifest", str(path)]) == 123
     for args in [
         [origin, "--parent-window=0"],
-        [origin.replace("oidgb", "aaaaa"), "--parent-window=123"],
+        [origin.replace("nanfe", "aaaaa"), "--parent-window=123"],
         [origin, "--parent-window=123", "extra"],
     ]:
         with pytest.raises(DesktopError):

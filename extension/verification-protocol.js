@@ -3,7 +3,7 @@ var VerificationNativeProtocol = (() => {
   const spec = {
     "version": 1,
     "hostName": "com.reviewer_item_relay.verification",
-    "extensionOrigin": "chrome-extension://oidgbnehgnikmniolojjkmhlpifdoiil/",
+    "extensionOrigin": "chrome-extension://nanfeahhlhikgdpdffcdfonhjdigjjpb/",
     "limits": {
       "messageBytes": 16384,
       "holdMs": 30000,

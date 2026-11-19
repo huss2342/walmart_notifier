@@ -68,7 +68,7 @@ def test_owned_registration_rejects_foreign_manifest_and_accepts_exact_manifest(
         "name": "com.reviewer_item_relay.verification",
         "type": "stdio",
         "path": str(launcher),
-        "allowed_origins": ["chrome-extension://oidgbnehgnikmniolojjkmhlpifdoiil/"],
+        "allowed_origins": ["chrome-extension://nanfeahhlhikgdpdffcdfonhjdigjjpb/"],
     }
     manifest.write_text(json.dumps(document))
     prefix = f". {quoted(INSTALLER)}; "

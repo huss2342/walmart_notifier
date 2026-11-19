@@ -9,7 +9,7 @@ Run `./install-native-verification.ps1 -WhatIf` to preview, then run the install
 without `-WhatIf`. It uses the project `.venv` and the Windows .NET C# compiler;
 it downloads nothing and needs no elevation. Chrome's registry entry lives under
 the current user's `Software\Google\Chrome\NativeMessagingHosts`. Its manifest
-allows only extension `oidgbnehgnikmniolojjkmhlpifdoiil`. Reload the extension and
+allows only extension `nanfeahhlhikgdpdffcdfonhjdigjjpb`. Reload the extension and
 enable Windows fallback in Options. A different unpacked extension ID is refused.
 
 `./install-native-verification.ps1 -Remove` removes only this project's owned
