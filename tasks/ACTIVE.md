@@ -9,7 +9,9 @@ text-only chat. Native AutoMod's text-only link/media rule exempts exactly Pro
 and Pro Trial. Its keyword filter caused the member forwarding failures, as
 confirmed in Discord's audit log. All 18 Pro feeds remain read-only. Canonical
 policy, live permission read-back and deployed runtime audit agree; notifier is
-healthy. Member forwarding retry remains pending. See
+healthy. A Pro member's picture forward was verified at 7:17 PM. Pro and Pro
+Trial now bypass slowmode only in General so a forward and its separate comment
+can both send; Free retains the 10-second cooldown. Comment retry remains pending. See
 [the forwarding receipt](discord-forwarding-20261121.md) for validation and rollback.
 
 ## Freshness measurement (November 19 16:02 CST; backend live, extension 2.32.7 reload pending)

@@ -37,7 +37,9 @@ and evidence are in [the rollout record](../tasks/free-pro-launch-20261028.md).
   [discord-updates-templates.md](../tasks/discord-updates-templates.md).
 - Member chat only in #general and #feature-requests, with 10-second slowmode.
   General allows embeds and uploads only for Pro and Pro Trial; Free members
-  retain text-only chat. Pro feeds remain read-only. Uploads and embeds remain
+  retain text-only chat. Pro and Pro Trial bypass slowmode only in General so
+  a forward and its separate comment can both send. Free keeps the 10-second
+  cooldown. Pro feeds remain read-only. Uploads and embeds remain
   blocked in #feature-requests. The native text-only AutoMod rule exempts Pro
   and Pro Trial so their links and forwards work; it still blocks other members'
   common URLs, custom-emoji markup and role pings. Built-in Discord stickers and

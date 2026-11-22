@@ -10,6 +10,7 @@ from discord_bridge.api import DiscordError
 from discord_bridge.layout import (
     ATTACH_FILES,
     BOT_RUNTIME_PERMISSIONS,
+    BYPASS_SLOWMODE,
     CREATE_INVITE,
     PROVISION_PERMISSIONS,
     server_manifest,
@@ -293,7 +294,7 @@ def test_community_text_and_general_embeds_keep_other_member_actions_restricted(
                 forbidden &= ~USE_APPLICATION_COMMANDS
                 assert permissions & USE_APPLICATION_COMMANDS
                 if pro in memberships:
-                    forbidden &= ~(EMBED | ATTACH_FILES)
+                    forbidden &= ~(EMBED | ATTACH_FILES | BYPASS_SLOWMODE)
                     assert permissions & (EMBED | ATTACH_FILES) == EMBED | ATTACH_FILES
             assert not permissions & forbidden
             assert bool(permissions & SEND) is (channel_id in chat)
@@ -358,6 +359,18 @@ def test_general_media_requires_pro_without_opening_pro_posting(tmp_path):
             if key != "feature-requests":
                 assert not access & SEND
     assert audit(client, GUILD, state)["ok"]
+
+
+def test_pro_forward_comments_bypass_slowmode_only_in_general(tmp_path):
+    client, _, state = apply_server(tmp_path)
+    for memberships in ([], [state["roles"]["starter"]], [state["roles"]["pro"]]):
+        for key, channel_id in state["channels"].items():
+            access = client.permissions(channel_id, memberships)
+            expected = key == "general" and state["roles"]["pro"] in memberships
+            assert bool(access & BYPASS_SLOWMODE) is expected
+        for key in ("general", "feature-requests"):
+            channel = next(c for c in client.channels if c["id"] == state["channels"][key])
+            assert channel["rate_limit_per_user"] == 10
 
 
 def test_audit_rejects_general_media_granted_to_everyone(tmp_path):

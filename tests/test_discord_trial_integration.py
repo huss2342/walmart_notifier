@@ -47,6 +47,8 @@ def test_optional_trial_role_is_accepted_and_restricted_to_pro_feeds(tmp_path):
     assert not client.permissions(state["channels"]["pro-all"], [TRIAL]) & (1 << 11)
     media = (1 << 14) | (1 << 15)
     assert client.permissions(state["channels"]["general"], [TRIAL]) & media == media
+    assert client.permissions(state["channels"]["general"], [TRIAL]) & (1 << 52)
+    assert not client.permissions(state["channels"]["feature-requests"], [TRIAL]) & (1 << 52)
     assert not client.permissions(state["channels"]["general"]) & media
     assert not client.permissions(state["channels"]["audit"], [TRIAL]) & (1 << 10)
 

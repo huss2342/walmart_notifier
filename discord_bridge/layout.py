@@ -47,10 +47,11 @@ BYPASS_SLOWMODE = 1 << 52
 READER_PERMISSIONS = VIEW_CHANNEL | READ_MESSAGE_HISTORY
 BOT_RUNTIME_PERMISSIONS = READER_PERMISSIONS | SEND_MESSAGES | EMBED_LINKS
 SETUP_PERMISSIONS = MANAGE_CHANNELS | MANAGE_GUILD | MANAGE_ROLES
-# Setup must hold Attach Files to create the Pro-only media overwrite. Runtime
-# delivery still uses embeds and never needs an upload grant.
+# Setup must hold the Pro media/comment grants to create their overwrites.
+# Runtime delivery still uses embeds and needs neither upload nor bypass grants.
 PROVISION_PERMISSIONS = (
-    SETUP_PERMISSIONS | BOT_RUNTIME_PERMISSIONS | USE_APPLICATION_COMMANDS | ATTACH_FILES
+    SETUP_PERMISSIONS | BOT_RUNTIME_PERMISSIONS | USE_APPLICATION_COMMANDS
+    | ATTACH_FILES | BYPASS_SLOWMODE
 )
 # Discord only accepts overwrite bits the creating bot holds. Manage Roles in
 # an overwrite additionally requires Administrator, which we never request.
@@ -249,7 +250,12 @@ def permission_overwrites(
             category.audience == "pro" and role in {"pro", "trial"}
         ) or (pro_media and role in {"pro", "trial"})
         if allowed:
-            role_allow = EMBED_LINKS | ATTACH_FILES if pro_media else READER_PERMISSIONS
+            # Discord posts a forward's note separately; slowmode blocks that
+            # second message unless the member can bypass it here.
+            role_allow = (
+                EMBED_LINKS | ATTACH_FILES | BYPASS_SLOWMODE
+                if pro_media else READER_PERMISSIONS
+            )
             if application_commands and role in {"pro", "trial"}:
                 # Discord requires Send Messages even for private slash replies.
                 role_allow |= USE_APPLICATION_COMMANDS | SEND_MESSAGES
