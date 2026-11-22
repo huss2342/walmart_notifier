@@ -47,7 +47,11 @@ BYPASS_SLOWMODE = 1 << 52
 READER_PERMISSIONS = VIEW_CHANNEL | READ_MESSAGE_HISTORY
 BOT_RUNTIME_PERMISSIONS = READER_PERMISSIONS | SEND_MESSAGES | EMBED_LINKS
 SETUP_PERMISSIONS = MANAGE_CHANNELS | MANAGE_GUILD | MANAGE_ROLES
-PROVISION_PERMISSIONS = SETUP_PERMISSIONS | BOT_RUNTIME_PERMISSIONS | USE_APPLICATION_COMMANDS
+# Setup must hold Attach Files to create the Pro-only media overwrite. Runtime
+# delivery still uses embeds and never needs an upload grant.
+PROVISION_PERMISSIONS = (
+    SETUP_PERMISSIONS | BOT_RUNTIME_PERMISSIONS | USE_APPLICATION_COMMANDS | ATTACH_FILES
+)
 # Discord only accepts overwrite bits the creating bot holds. Manage Roles in
 # an overwrite additionally requires Administrator, which we never request.
 # Other member actions stay unavailable through zero base permissions and the
@@ -148,8 +152,8 @@ CHANNELS = (
     Channel(
         "general",
         "community",
-        "Community chat and forwarded alerts with 10-second slowmode. No uploads. "
-        "Links remain subject to AutoMod. "
+        "Community chat with 10-second slowmode. Pro and Pro Trial can share links, "
+        "images and forwarded alerts; Free members have text-only chat. "
         "Never share account credentials or personal information.",
     ),
     Channel(
@@ -219,7 +223,7 @@ def permission_overwrites(
     *,
     application_commands: bool = False,
     public_commands: bool = False,
-    allow_embeds: bool = False,
+    pro_media: bool = False,
 ) -> list[dict]:
     """Explicit ACLs avoid role-combination leaks and public creation windows."""
     public = category.audience == "everyone"
@@ -228,16 +232,14 @@ def permission_overwrites(
     chat = public and category.community
     if public_commands and not chat:
         raise ValueError("Public commands require a community chat channel")
-    if allow_embeds and not chat:
-        raise ValueError("Member embeds require a community chat channel")
+    if pro_media and not chat:
+        raise ValueError("Pro media requires a community chat channel")
     reader_allow = (READER_PERMISSIONS | (SEND_MESSAGES if chat else 0)) if public else 0
     if public_commands:
         reader_allow |= USE_APPLICATION_COMMANDS
     member_deny = (EMBED_LINKS if chat else MEMBER_ACTION_DENY) | (0 if public else VIEW_CHANNEL)
-    if allow_embeds:
-        # Forwarded Pro alert cards carry embeds; the destination must allow them.
-        reader_allow |= EMBED_LINKS
-        member_deny &= ~EMBED_LINKS
+    if pro_media:
+        member_deny |= ATTACH_FILES
     if application_commands:
         member_deny |= USE_APPLICATION_COMMANDS
     result = [{"id": guild_id, "type": 0, "allow": str(reader_allow), "deny": str(member_deny)}]
@@ -245,9 +247,9 @@ def permission_overwrites(
     for role in audience_roles:
         allowed = category.audience == "starter" or (
             category.audience == "pro" and role in {"pro", "trial"}
-        )
+        ) or (pro_media and role in {"pro", "trial"})
         if allowed:
-            role_allow = READER_PERMISSIONS
+            role_allow = EMBED_LINKS | ATTACH_FILES if pro_media else READER_PERMISSIONS
             if application_commands and role in {"pro", "trial"}:
                 # Discord requires Send Messages even for private slash replies.
                 role_allow |= USE_APPLICATION_COMMANDS | SEND_MESSAGES

@@ -290,9 +290,11 @@ def test_community_text_and_general_embeds_keep_other_member_actions_restricted(
             permissions = client.permissions(channel_id, memberships)
             forbidden = prohibited
             if channel_id == state["channels"]["general"]:
-                forbidden &= ~(USE_APPLICATION_COMMANDS | EMBED)
+                forbidden &= ~USE_APPLICATION_COMMANDS
                 assert permissions & USE_APPLICATION_COMMANDS
-                assert permissions & EMBED
+                if pro in memberships:
+                    forbidden &= ~(EMBED | ATTACH_FILES)
+                    assert permissions & (EMBED | ATTACH_FILES) == EMBED | ATTACH_FILES
             assert not permissions & forbidden
             assert bool(permissions & SEND) is (channel_id in chat)
     for channel_id in state["channels"].values():
@@ -341,12 +343,15 @@ def test_audit_accepts_stronger_community_slowmode(tmp_path):
     assert audit(client, GUILD, state)["ok"]
 
 
-def test_general_accepts_forwarded_alert_embeds_without_opening_pro_posting(tmp_path):
+def test_general_media_requires_pro_without_opening_pro_posting(tmp_path):
     client, _, state = apply_server(tmp_path)
     for memberships in ([], [state["roles"]["pro"]], list(state["roles"].values())):
         general = client.permissions(state["channels"]["general"], memberships)
-        assert general & (VIEW | HISTORY | SEND | EMBED) == VIEW | HISTORY | SEND | EMBED
-        assert not general & ATTACH_FILES  # Forwarding alert embeds needs no uploads.
+        assert general & (VIEW | HISTORY | SEND) == VIEW | HISTORY | SEND
+        media = EMBED | ATTACH_FILES
+        assert bool(general & media) is bool(state["roles"]["pro"] in memberships)
+        if state["roles"]["pro"] in memberships:
+            assert general & media == media
         for key in ("pro-all", "price-80-200", "type-furniture", "feature-requests"):
             access = client.permissions(state["channels"][key], memberships)
             assert not access & EMBED
@@ -355,12 +360,12 @@ def test_general_accepts_forwarded_alert_embeds_without_opening_pro_posting(tmp_
     assert audit(client, GUILD, state)["ok"]
 
 
-def test_audit_rejects_blocked_forward_embeds_in_general(tmp_path):
+def test_audit_rejects_general_media_granted_to_everyone(tmp_path):
     client, _, state = apply_server(tmp_path)
     general = next(c for c in client.channels if c["id"] == state["channels"]["general"])
     everyone = next(o for o in general["permission_overwrites"] if o["id"] == GUILD)
-    everyone["allow"] = str(int(everyone["allow"]) & ~EMBED)
-    everyone["deny"] = str(int(everyone["deny"]) | EMBED)
+    everyone["allow"] = str(int(everyone["allow"]) | EMBED)
+    everyone["deny"] = str(int(everyone["deny"]) & ~EMBED)
     assert not audit(client, GUILD, state)["ok"]
 
 

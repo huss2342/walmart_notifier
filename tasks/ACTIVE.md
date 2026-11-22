@@ -4,10 +4,12 @@ Updated November 12, 2026 (America/Chicago).
 
 ## General alert forwarding (November 21, 2026; live)
 
-General allows embeds for forwarded Pro alert cards; member uploads remain
-blocked. All 18 Pro feeds remain read-only for Pro and Pro Trial. The canonical
-permission policy and runtime audit include this General-only exception. Live
-read-back and deployed runtime audit pass; notifier is healthy. See
+General allows embeds and uploads only for Pro and Pro Trial; Free keeps
+text-only chat. Native AutoMod's text-only link/media rule exempts exactly Pro
+and Pro Trial. Its keyword filter caused the member forwarding failures, as
+confirmed in Discord's audit log. All 18 Pro feeds remain read-only. Canonical
+policy, live permission read-back and deployed runtime audit agree; notifier is
+healthy. Member forwarding retry remains pending. See
 [the forwarding receipt](discord-forwarding-20261121.md) for validation and rollback.
 
 ## Freshness measurement (November 19 16:02 CST; backend live, extension 2.32.7 reload pending)

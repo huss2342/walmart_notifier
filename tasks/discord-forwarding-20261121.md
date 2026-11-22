@@ -1,38 +1,58 @@
-# General alert forwarding — November 21, 2026
+# General Pro media and forwarding - November 21, 2026
 
-The owner requested member forwarding from Pro feeds into General while keeping
-Pro feeds read-only, then confirmed uploads should remain blocked. General now
-allows Embed Links so forwarded alert cards can retain their embeds. Discord
-does not expose a separate permission for forwarding. Forwarded file attachments
-still require Attach Files; that permission remains unavailable to members.
+General permits links, embeds, uploads and media forwards for **Pro** and
+**Pro Trial**. Free members retain text-only chat. All 18 Pro alert feeds remain
+read-only for every member role. The owner explicitly selected this policy
+while investigating failed member forwards; it supersedes the earlier request
+to keep all member uploads blocked.
 
-Only General's @everyone overwrite changed: allow `2147552256` became
-`2147568640`, and deny `16384` became `0`. No category, Pro channel, role base,
-slowmode, application command, or AutoMod rule changed. General's existing live
-topic remains unchanged; the manifest topic now describes forwarded alerts.
+## Cause and repair
 
-The canonical layout and strict runtime audit now require this General-only
-exception. Two regressions first failed under the previous policy. The full
-3,106-test run found only three trial integration failures caused by a fixture
-rebuilding General's previous ACL; that fixture was corrected and all 11 trial
-integration tests passed. A final combined provisioning/trial integration run
-passed all 125 tests. One existing platform test was skipped in the full run.
-Changed-file lint and whitespace checks pass. Repo-wide lint still reports 13
-existing findings in unrelated Elite integration and server test files.
+The first embed-only change did not solve member forwarding. Discord's native
+audit log recorded three General messages from the affected Pro member blocked
+by an AutoMod keyword rule at 6:42-6:44 PM Central. The owner bypasses AutoMod,
+so a successful owner forward was insufficient evidence for member behavior.
 
-The replacement image layers only `layout.py` and `provision.py` over the running
-image. Notifier environment values matched Compose before replacement. Live
-read-back verified only General's ACL changed, uploads remained unavailable, and
-all 18 Pro feeds remained read-only for Pro, Pro Trial, and their combination.
-The deployed source hashes match the repository. The deployed runtime audit
-passes, Docker health is healthy, and the request Gateway is connected. No
-member-account forwarding test or public test message was performed.
+The native rule **Text-only community: block links and custom media** retains
+its five regexes, block-message response and empty word allowlist. Its role
+exceptions are now exactly Pro and Pro Trial; no Free or channel exception was
+added. Native UI read-back after saving confirmed those two roles. The mention
+spam, suspected spam and item-request command rules remain unchanged. The role
+exception applies to the text-only rule wherever it runs; ordinary typed Pro
+links can also pass that rule in other channels where they may type.
 
-Evidence: `data/forwarding-20261121/`, including channel snapshots, preview and
-runtime audits, test output, the application receipt and health snapshot.
+General's @everyone overwrite now allows `2147552256` and denies `49152`
+(Embed Links and Attach Files). Its Pro and Pro Trial overwrites each allow
+`49152`, deny `0`. The bot's member overwrite remains allow `84992`, deny `0`.
+No role base or other channel ACL changed. General's topic describes the policy.
 
-Rollback requires restoring General's previous overwrite **and** the previous
-audit policy together. Restore the old overwrite from `applied.json`, tag
-`reviewer-notifier:before-forwarding-20261121` as `reviewer-notifier:local`, then
-run `docker compose up -d --no-build notifier`. The prepared application script
-automatically restores both on deployment failure. No database schema changed.
+The canonical layout and strict audit use the same Pro-only channel exception.
+New-install provisioning temporarily needs Attach Files to create those
+role overwrites; runtime bot permissions still exclude Attach Files. Live ACLs
+were saved through the owner's native UI without granting runtime privileges.
+
+## Verification
+
+Three updated permission regressions failed before implementation. The first
+focused run exposed the temporary setup grant requirement; after fixing it,
+all 135 provisioning, trial integration and request setup tests passed. The
+complete Discord regression suite then passed **1,401 tests** in 109 seconds.
+Changed-file lint and whitespace checks pass. The earlier full suite had only
+three old trial-fixture failures, corrected before this follow-up.
+
+Six live role combinations, including Free plus either Pro entitlement, pass:
+General media allowed only with Pro or Pro Trial; all Pro feeds read-only.
+Only General's ACL changed. The deployed source hashes match the repository,
+the deployed runtime audit passes, Docker is healthy, delivery runs without an
+error, and the request Gateway is connected. Actual member retry is pending;
+no public test message was sent by this task.
+
+Evidence: `data/pro-media-20261121/`, plus the AutoMod rejection screenshot in
+`data/forwarding-20261121/automod-member-rejections.png`. The first attempt's
+historical receipts remain in `data/forwarding-20261121/`.
+
+Rollback must restore channel ACLs and the matching image together. Baseline
+`reviewer-notifier:before-pro-media-20261121` contains the earlier embed-only
+policy; original ACLs are in `data/pro-media-20261121/channels-before.json`.
+Remove the two AutoMod role exceptions to restore its original text-only rule.
+No database schema, queue history or membership assignment changed.
