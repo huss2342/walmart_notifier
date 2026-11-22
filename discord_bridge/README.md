@@ -36,7 +36,9 @@ and evidence are in [the rollout record](../tasks/free-pro-launch-20261028.md).
   keys remain unchanged; owner posting templates are in
   [discord-updates-templates.md](../tasks/discord-updates-templates.md).
 - Member chat only in #general and #feature-requests, with 10-second slowmode.
-  Member uploads and embeds are unavailable; native owner-managed AutoMod blocks
+  General allows embeds so members can forward Pro alert cards there; Pro feeds
+  remain read-only. Member uploads remain unavailable, and embeds remain blocked
+  in #feature-requests. Native owner-managed AutoMod blocks
   common URLs, custom-emoji markup and role pings. Built-in Discord stickers and
   standard emoji may remain usable. The minimal bot cannot read AutoMod rules;
   verify them in Server Settings after changes. See the

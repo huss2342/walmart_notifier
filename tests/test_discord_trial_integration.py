@@ -34,6 +34,7 @@ def trial_server(tmp_path):
         channel["permission_overwrites"] = permission_overwrites(
             GUILD, state["bot_user_id"], state["roles"], category,
             public_commands=channel["id"] == state["channels"]["general"],
+            allow_embeds=channel["id"] == state["channels"]["general"],
         )
     return client, path, state
 

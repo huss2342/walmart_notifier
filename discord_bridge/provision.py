@@ -429,6 +429,7 @@ def _resource_findings(
             category,
             application_commands=spec.key in {"item-requests", "trial-management"},
             public_commands=spec.key == "general",
+            allow_embeds=spec.key == "general",
         )
         try:
             if _acl(channel.get("permission_overwrites")) != _acl(expected_acl):
@@ -703,6 +704,7 @@ def provision(
                 "permission_overwrites": permission_overwrites(
                     guild_id, bot_user_id, state["roles"], category,
                     public_commands=not is_category and action["key"] == "general",
+                    allow_embeds=not is_category and action["key"] == "general",
                 ),
             }
             if not is_category:

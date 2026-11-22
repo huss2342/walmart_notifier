@@ -2,6 +2,14 @@
 
 Updated November 12, 2026 (America/Chicago).
 
+## General alert forwarding (November 21, 2026; live)
+
+General allows embeds for forwarded Pro alert cards; member uploads remain
+blocked. All 18 Pro feeds remain read-only for Pro and Pro Trial. The canonical
+permission policy and runtime audit include this General-only exception. Live
+read-back and deployed runtime audit pass; notifier is healthy. See
+[the forwarding receipt](discord-forwarding-20261121.md) for validation and rollback.
+
 ## Freshness measurement (November 19 16:02 CST; backend live, extension 2.32.7 reload pending)
 
 Owner wants 90%+ of $80+ items on Discord within 60 s (hot searches project ~73%).

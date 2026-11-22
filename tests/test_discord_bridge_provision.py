@@ -8,6 +8,7 @@ import json
 import pytest
 from discord_bridge.api import DiscordError
 from discord_bridge.layout import (
+    ATTACH_FILES,
     BOT_RUNTIME_PERMISSIONS,
     CREATE_INVITE,
     PROVISION_PERMISSIONS,
@@ -231,7 +232,7 @@ def test_real_permission_aggregation_keeps_free_starter_and_interest_roles_priva
     assert audit(client, GUILD, state)["ok"]
 
 
-def test_only_two_community_channels_allow_text_but_no_media_threads_apps_or_privileges(tmp_path):
+def test_community_text_and_general_embeds_keep_other_member_actions_restricted(tmp_path):
     from discord_bridge.layout import (
         ADD_REACTIONS,
         ATTACH_FILES,
@@ -289,8 +290,9 @@ def test_only_two_community_channels_allow_text_but_no_media_threads_apps_or_pri
             permissions = client.permissions(channel_id, memberships)
             forbidden = prohibited
             if channel_id == state["channels"]["general"]:
-                forbidden &= ~USE_APPLICATION_COMMANDS
+                forbidden &= ~(USE_APPLICATION_COMMANDS | EMBED)
                 assert permissions & USE_APPLICATION_COMMANDS
+                assert permissions & EMBED
             assert not permissions & forbidden
             assert bool(permissions & SEND) is (channel_id in chat)
     for channel_id in state["channels"].values():
@@ -337,6 +339,29 @@ def test_audit_accepts_stronger_community_slowmode(tmp_path):
         channel = next(c for c in client.channels if c["id"] == state["channels"][key])
         channel["rate_limit_per_user"] = 30
     assert audit(client, GUILD, state)["ok"]
+
+
+def test_general_accepts_forwarded_alert_embeds_without_opening_pro_posting(tmp_path):
+    client, _, state = apply_server(tmp_path)
+    for memberships in ([], [state["roles"]["pro"]], list(state["roles"].values())):
+        general = client.permissions(state["channels"]["general"], memberships)
+        assert general & (VIEW | HISTORY | SEND | EMBED) == VIEW | HISTORY | SEND | EMBED
+        assert not general & ATTACH_FILES  # Forwarding alert embeds needs no uploads.
+        for key in ("pro-all", "price-80-200", "type-furniture", "feature-requests"):
+            access = client.permissions(state["channels"][key], memberships)
+            assert not access & EMBED
+            if key != "feature-requests":
+                assert not access & SEND
+    assert audit(client, GUILD, state)["ok"]
+
+
+def test_audit_rejects_blocked_forward_embeds_in_general(tmp_path):
+    client, _, state = apply_server(tmp_path)
+    general = next(c for c in client.channels if c["id"] == state["channels"]["general"])
+    everyone = next(o for o in general["permission_overwrites"] if o["id"] == GUILD)
+    everyone["allow"] = str(int(everyone["allow"]) & ~EMBED)
+    everyone["deny"] = str(int(everyone["deny"]) | EMBED)
+    assert not audit(client, GUILD, state)["ok"]
 
 
 def test_audit_accepts_current_tier_category_headings_without_price_text(tmp_path):

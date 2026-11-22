@@ -148,7 +148,8 @@ CHANNELS = (
     Channel(
         "general",
         "community",
-        "Community chat with 10-second slowmode. No uploads, GIFs or links. "
+        "Community chat and forwarded alerts with 10-second slowmode. No uploads. "
+        "Links remain subject to AutoMod. "
         "Never share account credentials or personal information.",
     ),
     Channel(
@@ -218,6 +219,7 @@ def permission_overwrites(
     *,
     application_commands: bool = False,
     public_commands: bool = False,
+    allow_embeds: bool = False,
 ) -> list[dict]:
     """Explicit ACLs avoid role-combination leaks and public creation windows."""
     public = category.audience == "everyone"
@@ -226,10 +228,16 @@ def permission_overwrites(
     chat = public and category.community
     if public_commands and not chat:
         raise ValueError("Public commands require a community chat channel")
+    if allow_embeds and not chat:
+        raise ValueError("Member embeds require a community chat channel")
     reader_allow = (READER_PERMISSIONS | (SEND_MESSAGES if chat else 0)) if public else 0
     if public_commands:
         reader_allow |= USE_APPLICATION_COMMANDS
     member_deny = (EMBED_LINKS if chat else MEMBER_ACTION_DENY) | (0 if public else VIEW_CHANNEL)
+    if allow_embeds:
+        # Forwarded Pro alert cards carry embeds; the destination must allow them.
+        reader_allow |= EMBED_LINKS
+        member_deny &= ~EMBED_LINKS
     if application_commands:
         member_deny |= USE_APPLICATION_COMMANDS
     result = [{"id": guild_id, "type": 0, "allow": str(reader_allow), "deny": str(member_deny)}]
