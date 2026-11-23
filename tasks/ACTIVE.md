@@ -14,6 +14,19 @@ Trial now bypass slowmode only in General so a forward and its separate comment
 can both send; Free retains the 10-second cooldown. Comment retry remains pending. See
 [the forwarding receipt](discord-forwarding-20261121.md) for validation and rollback.
 
+## 90% plan (November 23; extension 2.32.8 reload pending, no backend change)
+
+Freshness result (95 h, 173 new $80+): 80% guaranteed on time (worst case =
+first sighting - previous read of same page/search <= 60 s;
+data/freshness-20261119/delay_bounds.py). Lists on time; all 33 late items found
+by searches/tabs; 14 never on any list; hot at 60 s gave 61-64 s; new80
+(sort=new&min_price=79 p1) held 4/23 probed items. Owner approved the plan.
+Commit 46c304a: 12 hot searches ~49 s (worst 56 s), new80 p1 lane ~41 s,
+price_high p2-4 30 s, uploads off the read path (<=3 unanswered, ordered, one
+Walmart request in flight), 500 ms spacing + 54/min token bucket: simulated
+43.1 -> 50.2 reads/min (Walmart ~1 s answers cap ~50/min serially). Re-run
+delay_bounds.py --hours 48 two days after the reload; target ~88-91%.
+
 ## Freshness measurement (November 19 16:02 CST; backend live, extension 2.32.7 reload pending)
 
 Owner wants 90%+ of $80+ items on Discord within 60 s (hot searches project ~73%).
