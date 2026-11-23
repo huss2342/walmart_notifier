@@ -310,8 +310,10 @@ function describe(url) {
   const page = Number(parsed.searchParams.get('page') || 1);
   if (parsed.searchParams.get('catId')) return `department:${parsed.searchParams.get('catId')}:${page}`;
   if (parsed.searchParams.get('q')) return `search:${parsed.searchParams.get('q')}:${page}`;
-  if (parsed.searchParams.get('min_price') === '79') return `value80:${page}`;
-  return `${parsed.searchParams.get('sort') === 'price_high' ? 'value' : 'newest'}:${page}`;
+  const high = parsed.searchParams.get('sort') === 'price_high';
+  // The min_price=79 list: price order (value80) or newest first (new80, Nov 23).
+  if (parsed.searchParams.get('min_price') === '79') return `${high ? 'value80' : 'new80'}:${page}`;
+  return `${high ? 'value' : 'newest'}:${page}`;
 }
 
 const gaps = (asked, what) => {
@@ -335,11 +337,11 @@ test('research reads wait only for due $80+ pages, are never ingested and log as
     : valueReply([120, 95, 85, 70, 55, 45, 35])(url, tabId) });
   await h.steps(4); // value pages 1-4 first
   const pending = h.api.research('https://www.walmart.com/reviews/claim-product?sort=price_low&research=1');
-  await h.steps(20); // the $80+ list's first reads go first
+  await h.steps(24); // the $80+ lists' first reads go first
   const reply = await pending;
   assert.equal(reply.ok, true);
   const at = h.asked.findIndex(row => row.url.includes('research=1'));
-  assert.ok(at >= 4 && at <= 20, `served right after the due $80+ pages: ${at}`);
+  assert.ok(at >= 4 && at <= 24, `served right after the due $80+ pages: ${at}`);
   assert.ok(gaps(h.asked, 'value:1').every(gap => gap <= 12_500), 'never delays value page 1');
   assert.equal(h.sent.some(row => row.lane === 'research'), false, 'never ingested');
   assert.deepEqual(h.logs.filter(row => row.lane === 'research').map(row => [row.outcome, row.items, row.totalPages]),
@@ -347,20 +349,20 @@ test('research reads wait only for due $80+ pages, are never ingested and log as
   assert.equal(await h.api.research('https://www.walmart.com/ip/123'), null);
 });
 
-test('price_high page 1 is read every 10 s and every other $80+ page every 20 s', async () => {
+test('price_high page 1 is read every 10 s and every other $80+ page every 30 s', async () => {
   const h = harness({ respond: valueReply([120, 95, 85, 70, 55, 45, 35]) });
-  await h.steps(120);
+  await h.steps(180);
   assert.deepEqual(h.asked.slice(0, 4).map(row => row.what), ['value:1', 'value:2', 'value:3', 'value:4']);
   const page1 = gaps(h.asked, 'value:1');
   assert.ok(page1.length >= 20);
   assert.ok(page1.every(gap => gap >= 10_000 && gap <= 15_000), String(page1));
   for (const page of [2, 3]) {
     const fast = gaps(h.asked, `value:${page}`).slice(1); // after the start-up burst of first reads
-    assert.ok(fast.length >= 10 && fast.every(gap => gap >= 20_000 && gap <= 25_000), `page ${page}: ${fast}`);
+    assert.ok(fast.length >= 10 && fast.every(gap => gap >= 30_000 && gap <= 35_000), `page ${page}: ${fast}`);
   }
   // Page 3 is all $80+, so page 4 is checked at the fast cadence too, in case a
   // new listing spills an $80+ item onto it; pages after that wait for the pass.
-  assert.ok(gaps(h.asked, 'value:4').slice(1).every(gap => gap <= 25_000), 'boundary page checked fast');
+  assert.ok(gaps(h.asked, 'value:4').slice(1).every(gap => gap <= 35_000), 'boundary page checked fast');
   assert.ok(gaps(h.asked, 'value:5').every(gap => gap >= 240_000), 'page 5 waits for the pass');
   assert.ok(h.asked.some(row => row.what === 'value:8'), 'the first page without a $40+ item ends the pass');
   assert.equal(h.asked.some(row => row.what === 'value:9'), false);
@@ -379,7 +381,7 @@ test('a page counts as $80+ by any item on it, not by the cheaper items Walmart 
   } });
   await h.steps(120);
   for (const page of [2, 3, 4]) {
-    assert.ok(gaps(h.asked, `value:${page}`).slice(1).every(gap => gap <= 25_000), `page ${page} stays in the fast zone`);
+    assert.ok(gaps(h.asked, `value:${page}`).slice(1).every(gap => gap <= 35_000), `page ${page} stays in the fast zone`);
   }
   assert.ok(gaps(h.asked, 'value:5').every(gap => gap >= 240_000), 'page 5 holds no $80+ item');
   assert.ok(h.asked.some(row => row.what === 'value:7'));
@@ -435,7 +437,8 @@ test('a pass runs top-down from the $80 boundary even right after that boundary 
   // must still run 3, 4, 5 ... in order even though pages 3-4 were just fast.
   const deep = h.asked.slice(before).filter(row => row.what.startsWith('value:') &&
     Number(row.what.split(':')[1]) >= 3).map(row => Number(row.what.split(':')[1]));
-  const start = deep.indexOf(3);
+  // (A last fast read of page 3 can come before page 2's re-read moves the boundary.)
+  const start = deep.findIndex((page, index) => page === 3 && deep[index + 1] === 4);
   assert.deepEqual(deep.slice(start, start + 8), [3, 4, 5, 6, 7, 8, 9, 10], String(deep));
 });
 
@@ -545,29 +548,33 @@ test('sort=new page 1 is read every 5 minutes and later new pages rarely', async
   const h = harness({ respond: valueReply([120, 95, 85, 70]) });
   await h.steps(480); // 20 minutes
   const page1 = gaps(h.asked, 'newest:1');
-  assert.ok(page1.length >= 3 && page1.every(gap => gap >= 300_000 && gap <= 310_000), String(page1));
+  // A rank-1 check: it waits behind a batch of due $80+ pages (here all eight
+  // idle min_price=79 pages fall due together every 3 minutes).
+  assert.ok(page1.length >= 3 && page1.every(gap => gap >= 300_000 && gap <= 330_000), String(page1));
   assert.ok(h.asked.filter(row => row.what === 'newest:2').length <= 2);
   assert.ok(h.asked.filter(row => row.what === 'newest:4').length <= 2);
 });
 
-test('read starts stay about 1.25 seconds apart with jitter', async () => {
+test('read starts stay at least 0.5 seconds apart, plus jitter', async () => {
   const h = harness({ respond: valueReply([120]) });
-  assert.equal(h.FastReads.MIN_SPACING_MS, 1_050);
+  assert.equal(h.FastReads.MIN_SPACING_MS, 500);
+  assert.equal(h.FastReads.SPACING_JITTER_MS, 400);
   await h.api.run();
   await h.api.run();
-  h.advance(1_200);
+  h.advance(650);
   await h.api.run();
   assert.equal(h.asked.length, 1);
   h.advance(50);
   await h.api.run();
-  assert.equal(h.asked.length, 2, '1.05 s plus the 0.2 s jitter this harness draws');
-  await h.steps(60, 250);
+  assert.equal(h.asked.length, 2, '0.5 s plus the 0.2 s jitter this harness draws');
+  await h.steps(40, 250);
   const starts = h.asked.map(row => row.at);
-  assert.ok(starts.slice(1).every((at, index) => at - starts[index] >= 1_250));
+  assert.ok(starts.length >= 12);
+  assert.ok(starts.slice(1).every((at, index) => at - starts[index] >= 700));
 });
 
-// Nov 19: a read also waits for the previous one (and its upload) to finish,
-// plus STEP_MS; reads took 1.2 s at the median, so that pause bounded the rate too.
+// Nov 19: a read also waits for the previous one to finish, plus STEP_MS;
+// since Nov 23 not for its upload (reads took ~1 s, uploads ~0.2 s more).
 test('after a slow read the next one waits only the 0.1 s pause, still one at a time', async () => {
   let h = null;
   h = harness({ respond: url => { h.advance(2_000); return valueReply([120])(url); } });
@@ -584,7 +591,7 @@ test('after a slow read the next one waits only the 0.1 s pause, still one at a 
   quick.advance(100);
   await quick.api.run();
   assert.equal(quick.asked.length, 1);
-  assert.equal(quick.delays.at(-1), 1_150, 'the rest of the 1.25 s spacing');
+  assert.equal(quick.delays.at(-1), 600, 'the rest of the 0.7 s spacing');
 });
 
 test('after a bot-check sign, reads keep the old 2.5 s spacing for a day', async () => {
@@ -644,7 +651,7 @@ test('member searches outrank priority searches; empty ones wait thirty minutes'
   assert.deepEqual(searches.slice(0, 3), ['search:sofa:1', 'search:lamp:1', 'search:desk:1']);
   assert.equal(searches.filter(what => what === 'search:Sofa:1').length, 0, 'a shared query runs once, as a member search');
   const sofa = gaps(h.asked, 'search:sofa:1');
-  assert.ok(sofa.length >= 8 && sofa.every(gap => gap >= 240_000 && gap <= 245_000), `searches with products: 4 min ${sofa}`);
+  assert.ok(sofa.length >= 8 && sofa.every(gap => gap >= 240_000 && gap <= 250_000), `searches with products: 4 min ${sofa}`);
   const lamp = gaps(h.asked, 'search:lamp:1');
   assert.ok(lamp.length >= 1 && lamp.every(gap => gap >= 1_800_000 && gap <= 1_805_000), `empty: 30 min ${lamp}`);
   assert.ok(gaps(h.asked, 'search:desk:1').every(gap => gap >= 720_000 && gap <= 725_000), 'priority: 12 min');
@@ -703,7 +710,7 @@ test('unreadable department pages pause department reads instead of spending eve
   await h.steps(240); // 10 minutes
   assert.equal(h.asked.filter(row => row.what.startsWith('department:')).length, 3);
   h.advance(30 * 60_000);
-  await h.steps(20);
+  await h.steps(40);
   assert.ok(h.asked.filter(row => row.what.startsWith('department:')).length > 3, 'department reads resume later');
 });
 
@@ -805,8 +812,10 @@ test('at production scale every rank keeps its cadence within the fixed read bud
   const late = h.asked.filter(row => row.at >= 1_000_000 + 5 * 60_000); // after the first-read burst
   const lateGaps = what => gaps(late, what);
   assert.ok(lateGaps('value:1').every(gap => gap <= 14_000), 'value page 1');
-  assert.ok(lateGaps('value:2').every(gap => gap <= 26_000), 'other $80+ pages');
+  assert.ok(lateGaps('value:2').every(gap => gap <= 36_000), 'other $80+ pages');
   assert.ok(lateGaps('value80:6').every(gap => gap <= 50_000), 'pages of the $80+ list');
+  const new80 = lateGaps('new80:1');
+  assert.ok(new80.length >= 50 && new80.every(gap => gap >= 40_000 && gap <= 50_000), `new80: ${new80}`);
   const newest = lateGaps('newest:1');
   assert.ok(newest.length >= 6 && newest.every(gap => gap >= 300_000 && gap <= 390_000), `newest every ~5 min: ${newest}`);
   // Searches with products share every read the ranks above leave; with 26 of
@@ -825,9 +834,12 @@ test('at production scale every rank keeps its cadence within the fixed read bud
   assert.ok(h.asked.some(row => row.what === 'value:9'), 'the $40 chain is read');
 });
 
-// Hot searches (Nov 19): six searches read every 60 s at rank 0, chosen by how
-// many new in-stock $80+ items their page-1 reads surface.
+// Hot searches (Nov 19): searches read at rank 0, chosen by how many new
+// in-stock $80+ items their page-1 reads surface. Nov 23: 12 of them every 48 s
+// (6 every 60 s before); the six built-in seeds are unchanged.
 const SEEDS = ['chair', 'ktaxon', 'sofa', 'tablet', 'trampoline', 'rack'];
+// A full hot set of 12 for the tests that need one (only the first six are built in).
+const TWELVE = [...SEEDS, 'desk', 'bike', 'grill', 'tent', 'kayak', 'mower'];
 const plain = value => JSON.parse(JSON.stringify(value));
 const offer = (id, value, available = true) => ({ item_id: `ip-${id}`, available, value_usd: value });
 const searchReply = items => ({ ok: true, status: 200, items, products: items.length, totalPages: 3 });
@@ -838,15 +850,20 @@ const fnv = text => {
   return hash;
 };
 
-test('the six hot seeds are read every 60 s, page 1 only, while the $80+ pages keep their cadence', async () => {
+test('the hot seeds are read every 48 s, page 1 only, while the $80+ pages keep their cadence', async () => {
   const h = harness({ hotSeeds: null, respond: url => describe(url).startsWith('search:')
     ? searchReply([item(9_100_000)]) : value80Reply()(url) });
   assert.deepEqual([...h.FastReads.HOT_SEEDS], SEEDS);
-  await h.steps(600, 1_470); // ~14.7 minutes at ~41 reads a minute
+  assert.equal(h.FastReads.HOT_SIZE, 12);
+  assert.equal(h.FastReads.INTERVALS.hot, 48_000);
+  await h.steps(700, 1_200); // 14 minutes at ~50 reads a minute (Nov 23)
   const late = h.asked.filter(row => row.at >= 1_000_000 + 2 * 60_000);
   for (const [index, seed] of SEEDS.entries()) {
     const reads = gaps(late, `search:${seed}:1`);
-    assert.ok(reads.length >= 10 && reads.every(gap => gap >= 60_000 && gap <= 68_000), `${seed}: ${reads}`);
+    // At most ~20% late when due reads bunch up: always within 60 s of the last read.
+    const median = [...reads].sort((x, y) => x - y)[reads.length >> 1];
+    assert.ok(reads.length >= 12 && median <= 50_000 && reads.every(gap => gap >= 48_000 && gap <= 58_000),
+      `${seed}: ${reads}`);
     assert.equal(h.asked.some(row => row.what === `search:${seed}:2`), false, 'page 1 only');
     // Seeds in neither list read as priority searches numbered after the owner's (none here).
     const logged = h.logs.filter(row => row.searchHash === fnv(seed));
@@ -859,14 +876,14 @@ test('the six hot seeds are read every 60 s, page 1 only, while the $80+ pages k
   for (const page of [2, 3, 4]) {
     const reads = gaps(late, `value:${page}`);
     const median = [...reads].sort((x, y) => x - y)[reads.length >> 1];
-    assert.ok(median <= 21_000 && reads.every(gap => gap <= 25_000), `value page ${page} stays at 20 s: ${reads}`);
+    assert.ok(median <= 31_500 && reads.every(gap => gap <= 36_000), `value page ${page} stays at 30 s: ${reads}`);
   }
   for (const page of [1, 2, 3, 4, 6]) {
-    assert.ok(gaps(late, `value80:${page}`).every(gap => gap <= 44_500), `min_price=79 page ${page} stays at 40 s`);
+    assert.ok(gaps(late, `value80:${page}`).every(gap => gap <= 46_000), `min_price=79 page ${page} stays at 40 s`);
   }
   // price_high page 1 is still the most frequent read.
   const count = what => late.filter(row => row.what === what).length;
-  assert.ok(SEEDS.every(seed => count('value:1') > 5 * count(`search:${seed}:1`)));
+  assert.ok(SEEDS.every(seed => count('value:1') > 4 * count(`search:${seed}:1`)));
 });
 
 test('a hot member search is the member target read sooner: never twice, page 2 on its own cadence', async () => {
@@ -874,12 +891,12 @@ test('a hot member search is the member target read sooner: never twice, page 2 
     respond: url => describe(url).startsWith('search:') ? searchReply([item(3_000_000)]) : valueReply([30])(url) });
   await h.steps(480); // 20 minutes
   const sofa = gaps(h.asked, 'search:Sofa:1');
-  assert.ok(sofa.length >= 15 && sofa.every(gap => gap >= 60_000 && gap <= 62_500), `hot member: ${sofa}`);
+  assert.ok(sofa.length >= 20 && sofa.every(gap => gap >= 48_000 && gap <= 52_500), `hot member: ${sofa}`);
   assert.equal(h.asked.some(row => row.what === 'search:sofa:1'), false, 'the seed and priority copies are not read');
   assert.ok(gaps(h.asked, 'search:Sofa:2').every(gap => gap >= 720_000), 'its page 2 keeps the 12-minute member cadence');
-  assert.ok(gaps(h.asked, 'search:lamp:1').every(gap => gap >= 240_000 && gap <= 245_000), 'other members keep 4 min');
+  assert.ok(gaps(h.asked, 'search:lamp:1').every(gap => gap >= 240_000 && gap <= 250_000), 'other members keep 4 min');
   const logged = h.logs.filter(row => row.searchHash === fnv('sofa') && row.page === 1);
-  assert.ok(logged.length >= 15 && logged.every(row => row.lane === 'requests' && row.targetIndex === 2 && row.hot));
+  assert.ok(logged.length >= 20 && logged.every(row => row.lane === 'requests' && row.targetIndex === 2 && row.hot));
   assert.ok(h.sent.filter(row => row.lane === 'requests' && row.targetIndex === 2).length >= 1,
     'sent as the member search, so a held restock is confirmed by its own page');
 });
@@ -926,43 +943,59 @@ test('scores count in-stock $80+ items new to a search, from its second page-1 r
 
 test('a newcomer must beat the weakest hot search by 25% plus 0.5; ties keep the set, nothing flaps', async () => {
   let lamp = [offer(1_099_999, 20)]; // products, so it is read every 4 minutes
-  const h = harness({ hotSeeds: null, searches: { members: ['lamp'] }, respond: url => {
+  const h = harness({ hotSeeds: TWELVE, searches: { members: ['lamp'] }, respond: url => {
     const what = describe(url);
     if (what === 'search:lamp:1') return searchReply(lamp);
     return what.startsWith('search:') ? searchReply([item(9_100_000)]) : valueReply([30])(url);
   } });
   const hotSet = async () => plain((await h.api.hotSearches()).hot);
-  await h.steps(10);
-  assert.deepEqual(await hotSet(), SEEDS, 'the seeds start hot, at their prior of 2');
+  await h.steps(10, 1_200);
+  assert.deepEqual(await hotSet(), TWELVE, 'the seeds start hot, at their prior of 2, and fill all 12 places');
   let id = 1_100_000;
   const fresh = count => Array.from({ length: count }, () => offer(id++, 150));
   const lampReads = () => h.asked.filter(row => row.what === 'search:lamp:1').length;
   const nextRead = async items => {
     lamp = [...lamp, ...items];
     const before = lampReads();
-    for (let step = 0; step < 400 && lampReads() === before; step += 1) await h.steps(1);
+    for (let step = 0; step < 800 && lampReads() === before; step += 1) await h.steps(1, 1_200);
     assert.equal(lampReads(), before + 1);
   };
   await nextRead([]); // baseline
   await nextRead(fresh(2)); // 2 against the seeds' ~2: not enough
-  assert.deepEqual(await hotSet(), SEEDS);
+  assert.deepEqual(await hotSet(), TWELVE);
   await nextRead(fresh(2)); // ~4 > 2 x 1.25 + 0.5
-  assert.deepEqual(await hotSet(), ['chair', 'ktaxon', 'sofa', 'tablet', 'trampoline', 'lamp'],
-    'replaces the latest seed to join among the tied weakest');
+  const swapped = [...TWELVE.slice(0, 11), 'lamp'];
+  assert.deepEqual(await hotSet(), swapped, 'replaces the latest seed to join among the tied weakest');
   const swappedAt = h.now();
-  await h.steps(240); // 10 minutes
+  await h.steps(500, 1_200); // 10 minutes
   const lampGaps = gaps(h.asked.filter(row => row.at > swappedAt + 70_000), 'search:lamp:1');
-  assert.ok(lampGaps.length >= 7 && lampGaps.every(gap => gap <= 62_500), `now read every minute: ${lampGaps}`);
-  assert.equal(h.asked.some(row => row.what === 'search:rack:1' && row.at > swappedAt), false, 'rack is out');
+  assert.ok(lampGaps.length >= 9 && lampGaps.every(gap => gap <= 52_000), `now read every 48 s: ${lampGaps}`);
+  assert.equal(h.asked.some(row => row.what === 'search:mower:1' && row.at > swappedAt), false, 'mower is out');
   // Everything decays alike, so weeks without a find change nothing.
   h.advance(20 * 24 * 60 * 60_000);
-  await h.steps(5);
-  assert.deepEqual(await hotSet(), ['chair', 'ktaxon', 'sofa', 'tablet', 'trampoline', 'lamp']);
+  await h.steps(5, 1_200);
+  assert.deepEqual(await hotSet(), swapped);
+});
+
+test('the hot set holds 12: six built-in seeds, then the best-scoring searches fill the free places', async () => {
+  const start = 5_000_000;
+  const members = Array.from({ length: 10 }, (_, index) => `member ${index}`);
+  // Members 0-7 scored (one new $80+ item or more); 8 and 9 below the 0.5 needed for a free place.
+  const scores = members.map((key, index) => [key, index < 8 ? 1 + index / 10 : 0.4, start]);
+  const store = { reviewerHotSearches: { v: 1, hot: ['chair'], scores, memory: [] } };
+  const h = harness({ store, start, hotSeeds: null, searches: { members }, respond: valueReply([30]) });
+  await h.steps(1);
+  const hot = plain((await h.api.hotSearches()).hot);
+  assert.equal(hot.length, 12);
+  assert.deepEqual(hot.slice(0, 1), ['chair'], 'members of the stored set keep their place');
+  // The other five seeds (prior 2) and the six best members fill the free places, best first.
+  assert.deepEqual(hot.slice(1), ['ktaxon', 'sofa', 'tablet', 'trampoline', 'rack',
+    'member 7', 'member 6', 'member 5', 'member 4', 'member 3', 'member 2']);
 });
 
 test('the swap margin is exact: weakest x 1.25 + 0.5 stays out, just above gets in; a free place needs 0.5', async () => {
   const start = 5_000_000;
-  const full = ['chair', 'ktaxon', 'sofa', 'tablet', 'trampoline', 'rack'];
+  const full = TWELVE;
   for (const [challenger, expected] of [[3, false], [3.001, true]]) {
     const store = { reviewerHotSearches: { v: 1, hot: full,
       scores: [...full.map(key => [key, 2, start]), ['lamp', challenger, start]], memory: [] } };
@@ -970,7 +1003,7 @@ test('the swap margin is exact: weakest x 1.25 + 0.5 stays out, just above gets 
     await h.steps(1);
     const { hot } = await h.api.hotSearches();
     assert.equal(hot.includes('lamp'), expected, `challenger ${challenger}`);
-    assert.equal(hot.length, 6);
+    assert.equal(hot.length, 12);
   }
   for (const [score, expected] of [[0.49, false], [0.5, true]]) {
     const store = { reviewerHotSearches: { v: 1, hot: ['chair'], scores: [['chair', 2, start], ['lamp', score, start]],
@@ -1075,10 +1108,13 @@ test('search reads log a hash of the normalised query, the hot flag, the $80+ co
   for (const word of ['chair', 'Desk', 'Lamp', 'lamp', 'café']) assert.equal(text.includes(word), false, word);
 });
 
-test('at production scale with hot searches and the Nov 19 budget, member searches keep their revisit', async () => {
-  // Read rates from data/hot-searches-20261119/cadence_sim.mjs on the measured
-  // Nov 19 read durations: ~34.7 reads a minute before (a start every ~1.73 s),
-  // ~40.9 with the new spacing (every ~1.47 s).
+test('at production scale with 12 hot searches, new80 and the Nov 23 budget, member searches keep their revisit', async () => {
+  // 2.32.7 (6 hot searches every 60 s, other $80+ price_high pages every 20 s,
+  // no new80) on this same workload at its ~41 reads a minute (a start every
+  // 1.47 s): productive member searches every 251.4 s at the median, 286.7 s at
+  // worst. 2.32.8 reads ~50 a minute (data/plan90-20261123/cadence_sim.mjs on
+  // the Nov 19-23 read durations): a start every ~1.2 s. Here the 12 hot
+  // searches are extra searches, not members (the harder case).
   const members = Array.from({ length: 52 }, (_, index) => `member ${index}`);
   const priority = Array.from({ length: 27 }, (_, index) => `priority ${index}`);
   const respond = url => {
@@ -1103,17 +1139,18 @@ test('at production scale with hot searches and the Nov 19 budget, member search
     const sorted = [...productive].sort((x, y) => x - y);
     return { h, late, median: sorted[sorted.length >> 1], max: sorted.at(-1) };
   };
-  const before = await simulate([], 1_730);
-  const after = await simulate(null, 1_470);
-  assert.ok(after.median <= before.median * 1.05, `members: ${after.median} vs ${before.median}`);
-  assert.ok(after.max <= Math.max(before.max * 1.1, 6.5 * 60_000), `members worst: ${after.max} vs ${before.max}`);
+  const after = await simulate(TWELVE, 1_200);
+  assert.ok(after.median <= 251_370 * 1.05, `members: ${after.median} vs 251370 in 2.32.7`);
+  assert.ok(after.max <= Math.max(286_650 * 1.1, 6.5 * 60_000), `members worst: ${after.max} vs 286650 in 2.32.7`);
   const lateGaps = what => gaps(after.late, what);
   assert.ok(lateGaps('value:1').every(gap => gap <= 12_000), 'value page 1');
-  assert.ok(lateGaps('value:2').every(gap => gap <= 26_000), 'other $80+ pages');
+  assert.ok(lateGaps('value:2').every(gap => gap <= 36_000), 'other $80+ pages');
   assert.ok(lateGaps('value80:6').every(gap => gap <= 48_000), 'pages of the $80+ list');
-  for (const seed of SEEDS) {
+  assert.ok(lateGaps('new80:1').every(gap => gap <= 48_000), 'new80 page 1');
+  for (const seed of TWELVE) {
     const reads = lateGaps(`search:${seed}:1`);
-    assert.ok(reads.length >= 30 && reads.every(gap => gap <= 68_000), `${seed}: ${reads}`);
+    // Every hot read within 60 s of the last: an item new there is never later than that.
+    assert.ok(reads.length >= 40 && reads.every(gap => gap <= 56_000), `${seed}: ${reads}`);
   }
   const newest = lateGaps('newest:1');
   assert.ok(newest.length >= 6 && newest.every(gap => gap >= 300_000 && gap <= 390_000), `newest: ${newest}`);
@@ -1198,8 +1235,11 @@ test('a search-only $80+ item starts a probe: the predicted $80+ page, both new 
   assert.ok(extra.every(row => row.outcome === 'items' && row.items.length > 0));
   assert.deepEqual(extra.map(row => [row.sort ?? '', row.minPrice ?? 0, row.catId ?? '']),
     [['price_high', 79, ''], ['new', 0, ''], ['new', 79, ''], ['', 0, '4044_103150']]);
-  // Measurement only: never ingested, logged as extra (fresh) reads.
-  assert.equal(h.sent.some(row => ['new80', 'departments'].includes(row.lane)), false);
+  // Measurement only: never ingested, logged as extra (fresh) reads. (Since
+  // Nov 23 new80 page 1 is also a regular read every 40 s, ingested.)
+  assert.equal(h.sent.some(row => row.lane === 'departments'), false);
+  const probeNew80 = extra.find(row => row.lane === 'new80');
+  assert.equal(h.sent.some(row => row.lane === 'new80' && row.at === probeNew80.at), false);
   assert.equal(h.logs.filter(row => row.fresh === true).length, 4);
   assert.ok(h.logs.filter(row => row.fresh === true).every(row => !('searchHash' in row)));
 });
@@ -1256,7 +1296,7 @@ test('no probe for items a list showed in the last 30 min, sold-out or under-$80
     const h = freshHarness(world);
     await h.steps(120);
     assert.equal(probeRecords(h).length, 0);
-    assert.equal(freshAsks(h).some(row => row.what.startsWith('new80:')), false);
+    assert.equal(h.records.some(row => row.kind === 'read' && row.probe), false, 'no probe read');
   }
   // Until every page of the $80+ list has been read since the worker started,
   // the search alone proves nothing (page 3 fails for the first 5 minutes).
@@ -1290,7 +1330,7 @@ test('caps: two probes at once, eight starts an hour, 100 extra reads a day, all
   const daily = freshHarness(freshWorld({ category: '' }), { store: usedReads(98) });
   await daily.steps(40);
   assert.deepEqual(probeRecords(daily).map(row => [row.event, row.reason]), [['skipped', 'daily']]);
-  assert.equal(freshAsks(daily).some(row => row.what.startsWith('new80:')), false);
+  assert.equal(daily.records.some(row => row.kind === 'read' && row.probe), false, 'no probe read');
 
   // 96 used: the 4 planned reads fit, then the cap stops the re-checks of an idle page.
   const late = freshHarness(freshWorld({ price: 80, category: '', list80: IDLE80 }), { store: usedReads(96) });
@@ -1328,13 +1368,14 @@ test('never in the safe period after a bot-check sign; a block mid-probe ends it
   assert.equal(probeRecords(safe).length, 0);
   assert.equal(safe.records.some(row => row.probe), false);
 
-  // Only probes read sort=new&min_price=79: the bot-check sign comes on a probe read.
-  const blocked = freshHarness(freshWorld({ blockOn: 'new80:1', category: '' }));
+  // The bot-check sign comes on a probe read: the item's department page 1
+  // (department reads otherwise fill only spare slots, 4044 first).
+  const blocked = freshHarness(freshWorld({ blockOn: 'department:4044_103150:1' }));
   await blocked.steps(30);
   const [end] = probeRecords(blocked, 'end');
   assert.equal(end.outcome, 'blocked');
   const sign = blocked.records.find(row => row.kind === 'read' && row.outcome === 'blocked');
-  assert.equal(sign.lane, 'new80');
+  assert.deepEqual([sign.lane, sign.catId, Boolean(sign.probe)], ['departments', '4044_103150', true]);
   blocked.advance(6 * 60_000); // past the 5 min back-off, inside the day of gentler reads
   await blocked.steps(200, 3_000);
   assert.ok(freshAsks(blocked).some(row => row.at > sign.at + 6 * 60_000 && row.what === 'search:desk:1'));
@@ -1357,4 +1398,260 @@ test('every read goes to the snapshot log with its shape and products, searches 
   for (const word of ['Desk', 'Lamp', 'lamp', 'desk']) assert.equal(text.includes(word), false, word);
   assert.equal(h.FastReads.queryHash('  Desk   LAMP '), fnv('desk lamp'));
   assert.equal(h.FastReads.queryHash(''), null);
+});
+
+// --- Nov 23 (2.32.8): new80, uploads off the read path, the read budget ----------
+const tick = () => new Promise(resolve => setImmediate(resolve));
+const NEW80 = [offer(5_300_001, 150), offer(5_300_002, 99), offer(5_300_003, 20)];
+const new80Reply = (items = NEW80) => url => describe(url) === 'new80:1'
+  ? { ok: true, status: 200, totalPages: 8, products: 40, items } : value80Reply()(url);
+
+test('new80: sort=new&min_price=79 page 1 is read every 40 s at rank 0 and ingested as its own page', async () => {
+  const h = harness({ respond: new80Reply() });
+  assert.equal(h.FastReads.INTERVALS.new80, 40_000);
+  await h.steps(600, 1_200); // 12 minutes at ~50 reads a minute
+  assert.equal(new URL(h.asked.find(row => row.what === 'new80:1').url).search, '?sort=new&min_price=79');
+  assert.equal(h.asked.some(row => row.what.startsWith('new80:') && row.what !== 'new80:1'), false, 'page 1 only');
+  const late = gaps(h.asked.filter(row => row.at >= 1_000_000 + 60_000), 'new80:1');
+  assert.ok(late.length >= 14 && late.every(gap => gap >= 40_000 && gap <= 46_000), String(late));
+  // Ingested like the other lists, so it can alert: page 1, lane new80 and no
+  // target index, the page identity a held restock must be confirmed by.
+  const sent = h.sent.filter(row => row.lane === 'new80');
+  assert.ok(sent.length >= 1 && sent.every(row => row.page === 1 && !('targetIndex' in row)), JSON.stringify(sent));
+  assert.deepEqual(plain(sent[0].items), NEW80);
+  assert.ok(sent.length <= 4, 'an unchanged page is resent only every 5 minutes');
+  assert.equal(h.logs.find(row => row.lane === 'new80').count, 2, 'logs how many $80+ offers it holds');
+  assert.ok(gaps(h.asked, 'value:1').slice(4).every(gap => gap <= 12_000), 'price_high page 1 stays first, at 10 s');
+});
+
+test('a restock held on new80 page 1 is re-read 10 s later, first among the due $80+ pages', async () => {
+  let holds = 1;
+  let awaiting = false;
+  const h = harness({ respond: new80Reply(),
+    send: (items, page, lane) => {
+      if (lane === 'new80' && holds > 0) { holds -= 1; awaiting = true; return { ok: true, held: 1 }; }
+      if (lane === 'new80') awaiting = false;
+      return { ok: true, summary: { new: 0 } };
+    },
+    mustSend: items => awaiting && items.some(entry => entry.item_id === 'ip-5300001') });
+  await h.steps(300, 1_200);
+  const reads = h.asked.filter(row => row.what === 'new80:1').map(row => row.at);
+  const sends = h.sent.filter(row => row.lane === 'new80').map(row => row.at);
+  const next = reads.find(at => at > sends[0]);
+  assert.ok(next - sends[0] >= 10_000 && next - sends[0] <= 11_200, `re-read ${next - sends[0]} ms after the hold`);
+  assert.equal(sends[1], next, 'the unchanged page is sent again so the hold is settled');
+  const later = reads.filter(at => at > next);
+  assert.ok(later.length >= 3 && later.slice(1).every((at, index) => at - later[index] >= 40_000), 'then 40 s again');
+});
+
+test('the next read starts while the last upload is unanswered; never two Walmart requests at once', async () => {
+  const answers = [];
+  let release = null;
+  let inFlight = 0;
+  let most = 0;
+  let serial = 0;
+  const h = harness({
+    // Every price_high page 1 read shows a new offer, so every read of it is sent.
+    respond: url => {
+      inFlight += 1;
+      most = Math.max(most, inFlight);
+      const reply = describe(url) === 'value:1'
+        ? { ok: true, status: 200, totalPages: 25, products: 40, items: [offer(6_000_000 + serial++, 150)] }
+        : { ok: true, status: 200, items: [] };
+      return new Promise(resolve => { release = () => { inFlight -= 1; resolve(reply); }; });
+    },
+    send: () => new Promise(resolve => answers.push(resolve)) });
+  const first = h.api.run();
+  await tick();
+  assert.equal(h.asked.length, 1);
+  await h.api.run(); // the timer and the alarm can both fire: a read is running, so nothing starts
+  const probe = h.api.probe(`${HOME}?q=lamp&queryNups=lamp&sort=new`);
+  await tick();
+  assert.equal(h.asked.length, 1, 'the probe waits for the running read');
+  h.advance(900);
+  release();
+  await first;
+  assert.deepEqual([h.sent.length, answers.length], [1, 1], 'read 1 handed over, its upload unanswered');
+  h.advance(100);
+  const second = h.api.run(); // the probe, while upload 1 is still unanswered
+  await tick();
+  assert.equal(h.asked.length, 2);
+  assert.equal(h.asked[1].at - h.asked[0].at, 1_000, 'no wait for the upload');
+  release();
+  await second;
+  assert.equal((await probe).ok, true);
+  for (let index = 0; index < 20; index += 1) {
+    answers.splice(0).forEach(answer => answer({ ok: true, summary: { new: 1 } }));
+    h.advance(1_000);
+    release = null;
+    const pending = h.api.run();
+    await tick();
+    release?.();
+    await pending;
+  }
+  assert.ok(h.asked.length >= 15, String(h.asked.length));
+  assert.equal(most, 1, 'one Walmart request in flight at any time');
+});
+
+test('three unanswered uploads hold the next read until the oldest is answered', async () => {
+  const answers = [];
+  let serial = 0;
+  const h = harness({
+    // Every read shows a new offer: every read is sent.
+    respond: () => ({ ok: true, status: 200, totalPages: 25, products: 40, items: [offer(6_400_000 + serial++, 150)] }),
+    send: () => new Promise(resolve => answers.push(resolve)) });
+  assert.equal(h.FastReads.MAX_UPLOADS, 3);
+  for (let index = 0; index < 3; index += 1) {
+    await h.api.run();
+    h.advance(1_200);
+  }
+  assert.deepEqual([h.asked.length, answers.length], [3, 3]);
+  const blocked = h.api.run();
+  await tick();
+  assert.equal(h.asked.length, 3, 'a fourth read waits');
+  h.advance(5_000);
+  await tick();
+  assert.equal(h.asked.length, 3, 'for as long as the oldest upload is unanswered');
+  answers[0]({ ok: true, summary: { new: 1 } });
+  await blocked;
+  assert.deepEqual([h.asked.length, answers.length], [4, 4], 'then it starts');
+});
+
+test('uploads keep read order; while one is unanswered an unchanged page is sent again; answers act as before', async () => {
+  const answers = [];
+  const items = [offer(6_100_001, 150)];
+  const list80 = [offer(6_200_002, 120)];
+  const h = harness({
+    respond: url => describe(url) === 'value:1' ? { ok: true, status: 200, totalPages: 25, products: 40, items }
+      : describe(url) === 'value80:2' ? { ok: true, status: 200, totalPages: 8, products: 40, items: list80 }
+        : { ok: true, status: 200, items: [] },
+    send: (_items, page, lane) => new Promise(resolve => answers.push({ resolve, lane, page })) });
+  const value1 = () => h.sent.filter(row => row.lane === 'value' && row.page === 1).length;
+  const reads = what => h.asked.filter(row => row.what === what).length;
+  await h.steps(1, 1_200); // value:1, sent
+  assert.equal(value1(), 1);
+  // Until value:1 is read again 10 s later, its upload stays unanswered.
+  while (reads('value:1') < 2) await h.steps(1, 1_200);
+  assert.equal(value1(), 2, 'unchanged, but sent: the first upload\'s holds are not known yet');
+  assert.deepEqual(answers.slice(0, 2).map(row => `${row.lane}:${row.page}`), ['value:1', 'value80:2'],
+    'handed to the uploader in read order');
+  h.advance(300);
+  answers.splice(0).forEach((row, index) => row.resolve({ ok: true, summary: { new: 0 },
+    ...(index === 0 ? { requestId: 'b'.repeat(32) } : {}) }));
+  await tick();
+  // Each answer is logged when it comes: its request id and the time from the read's start.
+  const logged = h.logs.find(row => row.requestId === 'b'.repeat(32));
+  assert.deepEqual([logged.lane, logged.page, logged.outcome], ['value', 1, 'items']);
+  assert.ok(logged.durationMs >= 300, String(logged.durationMs));
+  // All answered: the next unchanged read of value:1 is skipped, as before.
+  while (reads('value:1') < 3) await h.steps(1, 1_200);
+  assert.equal(value1(), 2, 'unchanged and nothing unanswered: not sent');
+  // Another page's unanswered upload may hold back a restock this page shows
+  // too, so until it is answered no page counts as unchanged.
+  list80[0] = offer(6_200_003, 125);
+  while (!answers.length) await h.steps(1, 1_200);
+  assert.deepEqual([answers[0].lane, answers[0].page], ['value80', 2]);
+  let count = reads('value:1');
+  while (reads('value:1') === count) await h.steps(1, 1_200);
+  assert.equal(value1(), 3, 'unchanged value:1 is sent while the value80:2 upload is unanswered');
+  answers.splice(0).forEach(row => row.resolve({ ok: true, summary: { new: 0 } }));
+  await tick();
+  count = reads('value:1');
+  while (reads('value:1') === count) await h.steps(1, 1_200);
+  assert.equal(value1(), 3, 'answered: skipped again');
+  // A refused upload leaves the page unsent: its next read is sent again.
+  items[0] = offer(6_100_009, 150);
+  count = reads('value:1');
+  while (reads('value:1') === count) await h.steps(1, 1_200);
+  assert.equal(value1(), 4);
+  answers.splice(0).forEach(row => row.resolve(row.lane === 'value' ? { ok: false, retryable: true }
+    : { ok: true, summary: { new: 0 } }));
+  await tick();
+  count = reads('value:1');
+  while (reads('value:1') === count) await h.steps(1, 1_200);
+  assert.equal(value1(), 5, 'the refused page is sent again');
+});
+
+test('a held answer that comes after later reads still brings its page back 10 s after the answer', async () => {
+  const answers = [];
+  let fresh = false;
+  const h = harness({
+    respond: url => describe(url) === 'value80:2' && fresh
+      ? { ok: true, status: 200, totalPages: 7, products: 40, items: [offer(6_300_001, 130), offer(5_000_020, 142)] }
+      : value80Reply()(url),
+    send: (_items, page, lane) => new Promise(resolve => answers.push({ resolve, lane, page })) });
+  const settle = (keep = () => false) => {
+    for (const row of answers.splice(0)) {
+      if (keep(row)) answers.push(row);
+      else row.resolve({ ok: true, summary: { new: 0 } });
+    }
+  };
+  const isHeld = row => row.lane === 'value80' && row.page === 2;
+  const reads = () => h.asked.filter(row => row.what === 'value80:2').map(row => row.at);
+  for (let step = 0; step < 60; step += 1) {
+    await h.steps(1, 1_200);
+    settle();
+  }
+  fresh = true; // a new offer on value80:2: its next read is sent
+  const before = reads().length;
+  while (reads().length === before) {
+    await h.steps(1, 1_200);
+    settle(isHeld);
+  }
+  const heldAt = reads().at(-1);
+  for (let step = 0; step < 2; step += 1) { // two more reads start before the answer comes
+    await h.steps(1, 1_200);
+    settle(isHeld);
+  }
+  assert.equal(answers.filter(isHeld).length, 1);
+  answers.find(isHeld).resolve({ ok: true, held: 1 });
+  const answeredAt = h.now();
+  await tick();
+  settle();
+  while (reads().length === before + 1) {
+    await h.steps(1, 1_200);
+    settle();
+  }
+  const next = reads().at(-1);
+  assert.ok(next - answeredAt >= 10_000 && next - answeredAt <= 11_200, `re-read ${next - answeredAt} ms after the answer`);
+  assert.ok(next - heldAt < 20_000, `not at its usual 40 s (${next - heldAt} ms after the held read)`);
+});
+
+test('in the gentler day after a bot-check sign neither new80 nor any hot search is read; both return after it', async () => {
+  const start = 1_000_000;
+  const h = harness({ hotSeeds: null, start,
+    respond: url => describe(url).startsWith('search:') ? searchReply([item(9_100_000)]) : new80Reply()(url),
+    store: { reviewerFastReads: { blocks: 0, until: 0, slowUntil: start + 24 * 60 * 60_000 } } });
+  await h.steps(400, 750); // 5 minutes
+  const starts = h.asked.map(row => row.at);
+  assert.ok(starts.length >= 90, String(starts.length));
+  assert.ok(starts.slice(1).every((at, index) => at - starts[index] >= h.FastReads.SAFE_SPACING_MS), 'the old 2.5 s');
+  assert.equal(h.asked.some(row => row.what.startsWith('new80:')), false, 'no new80 read');
+  assert.equal(h.asked.some(row => row.what.startsWith('search:')), false, 'no hot search');
+  assert.ok(gaps(h.asked, 'value:1').slice(2).every(gap => gap <= 13_500), 'price_high page 1 still first');
+  assert.equal(h.sent.some(row => row.lane === 'new80'), false);
+  h.advance(24 * 60 * 60_000);
+  const after = h.asked.length;
+  await h.steps(300, 1_200); // 6 minutes
+  assert.ok(h.asked.slice(after).filter(row => row.what === 'new80:1').length >= 7, 'new80 is back');
+  assert.ok(SEEDS.every(seed => h.asked.slice(after).some(row => row.what === `search:${seed}:1`)), 'hot searches too');
+});
+
+test('never more than 54 reads a minute, however fast Walmart answers', async () => {
+  const h = harness({ departments: [{ catId: '4044', index: 1 }, { catId: '4171', index: 2 }],
+    respond: url => describe(url).startsWith('department:')
+      ? { ok: true, status: 200, items: [item(5_000_000)], products: 1, totalPages: 25, totalItems: 1_000 }
+      : valueReply([120, 95, 85, 70])(url) });
+  assert.deepEqual([h.FastReads.RATE_PER_MINUTE, h.FastReads.RATE_BURST], [54, 10]);
+  await h.steps(6_000, 100); // 10 minutes in 0.1 s ticks; every read takes no time; spare slots read departments
+  const starts = h.asked.map(row => row.at);
+  const within = (from, ms) => starts.filter(at => at >= from && at < from + ms).length;
+  assert.ok(starts.length <= 10 + 540 + 1, `${starts.length} reads in 10 minutes`);
+  assert.ok(starts.length >= 480, `the budget is used while something is due (${starts.length})`);
+  assert.ok(starts.every(at => within(at, 60_000) <= 10 + 54), 'any minute: the budget plus the 10-read lead');
+  // Once the lead is spent, the reads are paced evenly rather than in bursts.
+  assert.ok(starts.filter(at => at >= 1_000_000 + 60_000).every(at => within(at, 60_000) <= 55), 'steady minutes');
+  const spacing = starts.slice(1).map((at, index) => at - starts[index]);
+  assert.ok(spacing.every(gap => gap >= h.FastReads.MIN_SPACING_MS), 'the spacing still holds');
+  assert.ok(gaps(h.asked, 'value:1').slice(2).every(gap => gap <= 12_500), 'price_high page 1 keeps its 10 s');
 });

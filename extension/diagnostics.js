@@ -44,7 +44,7 @@ const DIAGNOSTIC_NUMBERS = [
 const RESTOCK_STAGES = ['returned', 'confirmed', 'rejected', 'followup'];
 const RESTOCK_STOCK_STATES = ['in-stock', 'out-of-stock', 'absent'];
 const RESTOCK_SIGNALS = ['in', 'out', 'other', 'none'];
-// new80: sort=new&min_price=79, read only by freshness probes (fast-reads.js).
+// new80: sort=new&min_price=79 page 1, a regular fast read since 2.32.8 (fast-reads.js).
 const DIAGNOSTIC_LANES = new Set(['home', 'departments', 'keywords', 'brands', 'priority', 'requests',
   'newest', 'value', 'value80', 'research', 'new80']);
 const FAST_READ_OUTCOMES = ['items', 'blocked', 'error', 'unavailable'];

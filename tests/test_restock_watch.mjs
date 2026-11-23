@@ -306,6 +306,26 @@ test('searches and departments: the same lane and page number of another target 
   assert.deepEqual(stages(events), [['returned', 'in-stock'], ['confirmed', 'in-stock']]);
 });
 
+// Nov 23 (2.32.8): sort=new&min_price=79 page 1 (lane new80) is a regular,
+// ingested read. Same list as value80 and same sort as newest, but its own page.
+test('the new80 list is a page of its own: value80 or newest page 1 never confirms its hold', async () => {
+  const { api, events, clock } = watch({ restockWatch: { 'ip-1': 1 } });
+  const new80 = { lane: 'new80', page: 1 };
+  assert.equal((await api.mark([data(1, 199.99, true)], new80))[0].restockHold, true);
+  clock.now += 10_000;
+  for (const other of [{ lane: 'value80', page: 1 }, { lane: 'newest', page: 1 }]) {
+    const [incidental] = await api.mark([data(1, 199.99, true)], other);
+    assert.equal(incidental.restockHold, true, `${other.lane} page 1 only starts its own check`);
+  }
+  // A new80 read missing the offer is not proof it left: a newer listing can push it to page 2.
+  await api.mark([data(2, 99.99, true)], new80);
+  assert.equal(api.awaiting([offer(1, 199.99, true)]), true, 'still held');
+  clock.now += 500;
+  const [confirmed] = await api.mark([data(1, 199.99, true)], new80);
+  assert.equal(confirmed.restocked, true, 'its own re-read, 10.5 s later, confirms');
+  assert.deepEqual(events.map(e => [e.stage, e.lane, e.page]), [['returned', 'new80', 1], ['confirmed', 'new80', 1]]);
+});
+
 test('a held offer gone from one of its pages waits for the others; gone from all, it is rejected', async () => {
   const { api, events, clock } = watch({ restockWatch: { 'ip-1': 1 } });
   await api.mark([data(1, 199.99, true)], { lane: 'value', page: 1 });

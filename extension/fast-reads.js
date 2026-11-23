@@ -1,15 +1,17 @@
 // Direct reads of the reviewer catalogue's own page data. No rendering or
 // scrolling: the server-rendered page already carries its 40 items as data.
-// One read at a time; a read starts 1.05-1.45 s after the previous start and
-// at least 0.1 s after the previous read (and its upload) finished: about 41 a
-// minute at Nov 19's read durations (see hot searches below). Back to 2.5-2.9 s
-// for a day after any bot-check sign.
+// One Walmart request at a time; a read starts 0.5-0.9 s after the previous
+// start and at least 0.1 s after the previous read finished; its upload goes on
+// in the background (since Nov 23, see below). Never more than 54 reads a
+// minute on average: ~50 at Nov 19-23 read durations. Back to 2.5-2.9 s, with
+// no hot search and no new80 read, for a day after any bot-check sign.
 // Each step reads the most important target that is due; a lower rank always
 // goes first:
 //   0  sort=price_high page 1 every 10 s (first of all), every other page holding $80+ items
-//      every 20 s (the owner's two most valuable reads); the min_price=79 list
+//      every 30 s (the owner's two most valuable reads); the min_price=79 list
 //      (about 8 pages), each page holding an $80+ offer every 40 s, the rest
-//      every 3 min; the 6 hot searches (page 1) every 60 s
+//      every 3 min; the same list newest first (new80), page 1 every 40 s; the
+//      12 hot searches (page 1) every 48 s
 //   1  the slow, fixed checks: sort=new page 1 (5 min) and member request
 //      searches that had no products at their last read (30 min)
 //   2  member request searches with products (page 1, every 4 min at best):
@@ -18,7 +20,41 @@
 //      search pages 2-3
 //   4  sort=new pages 2-4
 //   5  department pages, deepest first, only in slots nothing above needs
-// Within a rank, the target most overdue for its own interval goes first.
+// Within a rank, a page re-read to settle a held restock goes first, then the
+// target most overdue for its own interval.
+// Nov 23, the "90% on time" plan (owner-approved; 2.32.8). Page snapshot log,
+// 95 h to Nov 23 (data/freshness-20261119/analysis_96h.txt, delay_bounds.py):
+// 173 new $80+ items; 138 (80%) were surely on time (first sighting minus the
+// previous read of the same page or search <= 60 s). All 98 found first by
+// price_high pages were (worst ~21 s), and 40 of the 42 found first by the
+// min_price=79 list (~43 s). All 33 late ones were found by searches or tabs,
+// from ~15 searches; hot searches at 60 s came 61-64 s late (5 items); and
+// sort=new&min_price=79 page 1 already showed 4 of 23 probed search-first items.
+// 0 bot checks in 95 h at ~49 reads a minute with the tabs (~43 direct).
+// The plan asked for 12 hot searches every 40 s, new80 every 15 s, price_high
+// pages 2-4 every 30 s, uploads off the read path and ~54 direct reads a minute,
+// with member searches no slower. Reads are one at a time and Walmart's answer
+// alone takes ~1 s (snapshot log: search 0.88 s, price_high 1.08 s, min_price=79
+// 1.25 s, new80 1.55 s at the median); the upload added only ~0.2 s, and only to
+// the ~30% of reads that send anything. With the upload off the read path and
+// the spacing out of the way, the 0.1 s pause and the reads themselves cap the
+// rate at ~50 a minute (~54 even with no pause at all). The plan as asked would
+// take ~55 a minute: at ~49 it leaves member searches with products every 12
+// min (6.3 now). So, closest to it within the budget: all 12 hot searches, read
+// every 48 s (still within 60 s: p99 54 s simulated) and new80 every 40 s (like
+// the min_price=79 pages); member searches keep their 6.3 min (simulated, data/
+// plan90-20261123/cadence_sim.mjs: 43.1 -> 50.2 reads a minute). Every $80+
+// catalogue page, new80 and every hot search is now read within 60 s of its last read.
+// Uploads: a read hands its items to the uploader (background.js: one upload at
+// a time, oldest first, with the retries, restock acknowledgements and restock
+// re-sends of 2.32.5) and the next read starts without waiting for the answer;
+// the answer then does what it did before (only an acknowledged page is skipped
+// as unchanged; a held restock brings its page back 10 s later). While any
+// upload is unanswered no page counts as unchanged, as its holds are not known
+// yet. With 3 unanswered, the next read waits for the oldest.
+// Budget: a token bucket of 54 reads a minute, 10 ahead at most, so the rate
+// cannot climb past the owner's budget if Walmart answers faster (it would
+// reach ~66 a minute at 30% faster answers with the 0.5 s spacing alone).
 // Hot searches (Nov 19, owner-approved, about +6 reads a minute): in 72 hours,
 // 46 new $80+ items (29%) showed in a keyword search minutes before the
 // price_high and min_price=79 lists did (median 8.4 min; 19 never reached them).
@@ -31,8 +67,9 @@
 // a member, priority or hot search scores the in-stock $80+ items new to that
 // search (absent from its reads of the last 6 hours; its first read only sets
 // the baseline). Scores halve every 3 days; seeds start at 2. The hot set is the
-// top 6: a newcomer must score above the weakest x 1.25 + 0.5, so ties keep the
-// current members and the set does not flap. A hot member or priority search is
+// top 6 (12 since Nov 23: the six free places fill with the best-scoring
+// searches, at least 0.5): a newcomer must score above the weakest x 1.25 + 0.5,
+// so ties keep the current members and the set does not flap. A hot member or priority search is
 // the same target read sooner, never twice; its later pages keep their cadence.
 // Scores, the set and each search's recent $80+ items persist in storage.local
 // (bounded). Hot reads are rank 0: they share with the $80+ pages by overdue
@@ -72,7 +109,7 @@
 // goes to the page snapshot log (lane, page, sort, min_price, catId, search hash,
 // outcome and each product's id, position, price and stock; no extra reads).
 // When a member, priority or hot search shows an in-stock $80+ item that no
-// catalogue list (price_high, min_price=79, sort=new) showed in the last 30 min,
+// catalogue list (price_high, min_price=79, sort=new, new80) showed in the last 30 min,
 // a freshness probe starts: at once it reads the min_price=79 page whose price
 // range should hold the item (and its neighbour when the price sits near a page
 // edge), sort=new page 1, sort=new&min_price=79 page 1 and the item's department
@@ -87,15 +124,26 @@ const ReviewerFastReads = (() => {
   const HOME = 'https://www.walmart.com/reviews/claim-product';
   const ALARM = 'fastReads';
   const STATE_KEY = 'reviewerFastReads';
-  const STEP_MS = 100; // Pause after each read (250 until Nov 19).
-  const MIN_SPACING_MS = 1_050; // Between read starts, plus up to SPACING_JITTER_MS (1_400 until Nov 19).
+  const STEP_MS = 100; // Pause after each read, never after its upload (250 until Nov 19).
+  // Between read starts, plus up to SPACING_JITTER_MS (1_400 until Nov 19, 1_050 until Nov 23).
+  const MIN_SPACING_MS = 500;
+  // And never more than RATE_PER_MINUTE on average, however fast Walmart answers:
+  // the owner's Nov 23 budget. A token bucket: one token per read, refilled at
+  // that rate, holding at most RATE_BURST, so a run of quick answers may run
+  // ahead a little and a sustained one is paced evenly (reads, not the spacing,
+  // set the pace now: ~50 a minute at Nov 19-23 response times).
+  const RATE_PER_MINUTE = 54;
+  const RATE_BURST = 10;
+  // Uploads still waiting for the notifier's answer; one more read waits for the
+  // oldest (Nov 23: reads no longer wait for their own upload, see the header).
+  const MAX_UPLOADS = 3;
   const SPACING_JITTER_MS = 400; // Irregular starts, not a metronome.
   const SAFE_SPACING_MS = 2_500; // The old rate, kept for a day after any bot-check sign.
   const SAFE_AFTER_BLOCK_MS = 24 * 60 * 60_000;
   // Resend an unchanged page this often so newly added requests still match.
   const RESEND_MS = 5 * 60_000;
   const BACKOFF_MS = [5 * 60_000]; // Flat: direct reads only; the tabs and the bot-check bypasser are unaffected.
-  // new80 (sort=new&min_price=79) is read by freshness probes only.
+  // new80: the min_price=79 list newest first (page 1 every 40 s since Nov 23).
   const SORTS = Object.freeze({ newest: 'new', value: 'price_high', value80: 'price_high', requests: 'new',
     priority: 'new', new80: 'new' });
   const SEARCH_PAGES = 3;
@@ -124,7 +172,7 @@ const ReviewerFastReads = (() => {
   // Hot searches (see the header): seeds, set size, scoring and storage bounds.
   const HOT_SEEDS = Object.freeze(['chair', 'ktaxon', 'sofa', 'tablet', 'trampoline', 'rack']);
   const HOT_KEY = 'reviewerHotSearches';
-  const HOT_SIZE = 6;
+  const HOT_SIZE = 12; // 6 until Nov 23.
   const HOT_HALF_LIFE_MS = 3 * 24 * 60 * MINUTE;
   const HOT_PRIOR = 2; // A seed starts as if it had surfaced two new $80+ items.
   const HOT_SWAP_RATIO = 1.25; // A newcomer must score above the weakest hot search x 1.25 + 0.5,
@@ -135,8 +183,10 @@ const ReviewerFastReads = (() => {
   const HOT_MIN_SCORE = 0.01; // A forgotten search's score below this is dropped.
   const HOT_SAVE_MS = MINUTE; // Memory-only changes are saved at most this often.
   const INTERVALS = Object.freeze({
-    value: Object.freeze([10 * SECOND]), valueHigh: 20 * SECOND, valueDeep: 4 * MINUTE,
-    value80: 40 * SECOND, value80Idle: 3 * MINUTE, hot: MINUTE,
+    // price_high page 1 every 10 s; its other $80+ pages every 30 s (20 s until Nov 23).
+    value: Object.freeze([10 * SECOND]), valueHigh: 30 * SECOND, valueDeep: 4 * MINUTE,
+    // Hot searches every 48 s (60 s until Nov 23); sort=new&min_price=79 page 1 every 40 s.
+    value80: 40 * SECOND, value80Idle: 3 * MINUTE, hot: 48 * SECOND, new80: 40 * SECOND,
     // Searches with products aim at 4 min and get whatever reads are left over;
     // searches empty at their last read (member or priority) wait 30 min.
     member: 4 * MINUTE, memberEmpty: 30 * MINUTE, priority: 12 * MINUTE,
@@ -231,10 +281,17 @@ const ReviewerFastReads = (() => {
     let timer = null;
     let running = false;
     let lastStartAt = 0;
+    const rate = { tokens: RATE_BURST, at: 0 }; // The read budget's bucket (RATE_PER_MINUTE).
     let lastSlowAt = -Infinity; // When the last slow check (rank 1) started.
     let gap = 0; // Required time from the last read start to the next one.
     const lastRead = new Map(); // Target key -> when its last read started.
     const lastSent = new Map();
+    const rechecks = new Set(); // Target keys re-read early to settle a held restock.
+    // Uploads sent and not yet answered, oldest first ({ url, sequence, done }),
+    // and each page's latest upload (url -> sequence).
+    const uploads = [];
+    const newestUpload = new Map();
+    let uploadSequence = 0;
     const searches = new Map(); // Search key -> { totalPages, empty, at } from its last page-1 read.
     // Deepest price_high page of the main $80+ block, and the last page the
     // slower pass reads (the first one without a $40+ item ends it).
@@ -293,6 +350,10 @@ const ReviewerFastReads = (() => {
     const newestTargets = () => INTERVALS.newest.map((interval, index) =>
       ({ key: `newest:${index + 1}`, lane: 'newest', page: index + 1, rank: index ? RANK.newestDeep : RANK.slow,
         interval }));
+
+    // The min_price=79 list newest first, page 1 (Nov 23): a regular $80+ read,
+    // ingested like the other lists. Off in the gentler day after a bot-check sign.
+    const new80Target = () => ({ key: 'new80:1', lane: 'new80', page: 1, rank: RANK.value, interval: INTERVALS.new80 });
 
     const decayed = (entry, now) => entry
       ? entry.score * 2 ** (-Math.max(0, now - entry.at) / HOT_HALF_LIFE_MS) : 0;
@@ -460,6 +521,7 @@ const ReviewerFastReads = (() => {
       for (const key of searches.keys()) if (!candidates.has(key)) searches.delete(key);
       const current = new Set(targets.map(target => target.key));
       for (const key of lastRead.keys()) if (key.startsWith('search:') && !current.has(key)) lastRead.delete(key);
+      for (const key of rechecks) if (key.startsWith('search:') && !current.has(key)) rechecks.delete(key);
       return targets;
     }
 
@@ -483,11 +545,14 @@ const ReviewerFastReads = (() => {
       freshTick(now, slow);
       // A target never read yet counts as twice due: first in line, without
       // letting a large new batch shut out a short-interval target for minutes.
-      const due = [...valueTargets(), ...await searchTargets(now, slow), ...newestTargets()]
+      // A page re-read to settle a held restock goes first within its rank.
+      const due = [...valueTargets(), ...(slow ? [] : [new80Target()]), ...await searchTargets(now, slow),
+        ...newestTargets()]
         .map(target => ({ ...target, overdue: lastRead.has(target.key)
           ? (now - lastRead.get(target.key)) / target.interval : 2 }))
         .filter(target => target.overdue >= 1)
-        .sort((a, b) => a.rank - b.rank || b.overdue - a.overdue);
+        .sort((a, b) => a.rank - b.rank || Number(rechecks.has(b.key)) - Number(rechecks.has(a.key)) ||
+          b.overdue - a.overdue);
       const highDue = due[0] && due[0].rank <= RANK.value;
       // A freshness probe's reads wait for a due price_high page 1 only.
       if (!slow && fresh.active.length && due[0]?.rank !== RANK.valueTop) {
@@ -916,7 +981,7 @@ const ReviewerFastReads = (() => {
         ...(Number.isSafeInteger(reply.products) ? { products: reply.products } : {}),
         ...(lane === 'departments' && Number.isSafeInteger(reply.totalItems) ? { count: reply.totalItems } : {}),
         // For price_high pages and searches: how many $80+ items (in stock or not) the page holds.
-        ...(['value', 'value80'].includes(lane) || (query && lane !== 'departments')
+        ...(['value', 'value80', 'new80'].includes(lane) || (query && lane !== 'departments')
           ? { count: reply.items.filter(item => item.value_usd >= VALUE_FLOOR).length } : {}) };
       const items = reply.items;
       if (probe) {
@@ -926,33 +991,64 @@ const ReviewerFastReads = (() => {
       const signature = items.map(item => `${item.item_id}:${item.available}:${item.value_usd}`).join('|');
       const previous = lastSent.get(url);
       // A page holding a restock awaiting confirmation is sent even when it looks
-      // unchanged: only a sent page can confirm or reject that restock.
-      let awaiting = false;
-      try { awaiting = Boolean(mustSend(items)); } catch { /* Never blocks a read. */ }
+      // unchanged: only a sent page can confirm or reject that restock. While an
+      // earlier upload is still unanswered its holds are not known yet, so then
+      // no page counts as unchanged.
+      let awaiting = uploads.length > 0;
+      try { awaiting ||= Boolean(mustSend(items)); } catch { /* Never blocks a read. */ }
       if (!items.length || (!awaiting && previous?.signature === signature && Date.now() - previous.at < RESEND_MS)) {
         log({ ...base, ...status, ...totals, outcome: 'items', items: items.length, new: 0, ...elapsed() });
         return reply;
       }
+      upload(target, url, signature, items, { ...base, ...status, ...totals }, startedAt);
+      return reply;
+    }
+
+    // Hands a read's items to the uploader without waiting for the answer: the
+    // next read starts while the notifier ingests this one. send() is called at
+    // once, so uploads queue in read order (background.js sends them one at a
+    // time, oldest first, with their retries and restock acknowledgements).
+    // The answer then does what it did when reads waited for it.
+    function upload(target, url, signature, items, fields, startedAt) {
+      const stamp = lastRead.get(target.key);
+      const entry = { url, sequence: ++uploadSequence };
+      newestUpload.set(url, entry.sequence);
+      let pending;
       // The target index tells searches and departments apart: a held restock is
       // confirmed only by a re-read of the very page that held it.
-      const result = await send(items, page, lane, base.targetIndex);
-      // Only a confirmed delivery suppresses the next resend of this page, and
-      // never one that held back a restock: its next read must be sent.
-      if (result?.ok && !result.held) {
-        lastSent.set(url, { signature, at: Date.now() });
-        if (lastSent.size > 2000) lastSent.delete(lastSent.keys().next().value);
-      } else if (result?.held) {
-        lastSent.delete(url);
-        // Read this page again in RECHECK_MS rather than at its usual interval.
-        if (Number.isFinite(target.interval) && target.interval > RECHECK_MS && lastRead.has(target.key)) {
-          lastRead.set(target.key, Date.now() + RECHECK_MS - target.interval);
-        }
+      try { pending = Promise.resolve(send(items, target.page, target.lane, fields.targetIndex)); } catch (error) {
+        pending = Promise.reject(error);
       }
-      // The upload's request id joins this read to the items it delivered.
-      log({ ...base, ...status, ...totals, outcome: result?.ok ? 'items' : 'error', items: items.length,
-        new: result?.summary?.new || 0, duplicates: result?.summary?.duplicates || 0,
-        ...(typeof result?.requestId === 'string' ? { requestId: result.requestId } : {}), ...elapsed() });
-      return reply;
+      entry.done = pending.catch(() => null).then(result => {
+        const newest = newestUpload.get(url) === entry.sequence;
+        if (newest) newestUpload.delete(url);
+        // Only a confirmed delivery suppresses the next resend of this page (and
+        // only the page's latest upload decides), never one that held back a
+        // restock: its next read must be sent.
+        if (result?.ok && !result.held && newest) {
+          lastSent.set(url, { signature, at: Date.now() });
+          if (lastSent.size > 2000) lastSent.delete(lastSent.keys().next().value);
+        } else if (result?.held) {
+          lastSent.delete(url);
+          // Read this page again in RECHECK_MS rather than at its usual interval,
+          // unless it has been read again since.
+          if (Number.isFinite(target.interval) && target.interval > RECHECK_MS && stamp !== undefined &&
+              lastRead.get(target.key) === stamp) {
+            lastRead.set(target.key, Date.now() + RECHECK_MS - target.interval);
+            rechecks.add(target.key);
+          }
+        }
+        // The upload's request id joins this read to the items it delivered;
+        // durationMs runs from the read's start to the notifier's answer.
+        log({ ...fields, outcome: result?.ok ? 'items' : 'error', items: items.length,
+          new: result?.summary?.new || 0, duplicates: result?.summary?.duplicates || 0,
+          ...(typeof result?.requestId === 'string' ? { requestId: result.requestId } : {}),
+          durationMs: Date.now() - startedAt });
+      }).catch(() => {}).finally(() => {
+        const index = uploads.indexOf(entry);
+        if (index >= 0) uploads.splice(index, 1);
+      });
+      uploads.push(entry);
     }
 
     async function run() {
@@ -960,11 +1056,18 @@ const ReviewerFastReads = (() => {
       running = true;
       let delay = STEP_MS;
       try {
-        const wait = lastStartAt + gap - Date.now();
+        const now = Date.now();
+        rate.tokens = Math.min(RATE_BURST, rate.tokens + Math.max(0, now - rate.at) * RATE_PER_MINUTE / MINUTE);
+        rate.at = now;
+        const wait = Math.max(lastStartAt + gap - now,
+          rate.tokens >= 1 ? 0 : Math.ceil((1 - rate.tokens) * MINUTE / RATE_PER_MINUTE));
         if (wait > 0) {
           delay = wait;
           return;
         }
+        // Backpressure: with MAX_UPLOADS answers outstanding, the next read
+        // waits for the oldest. Still one Walmart request at a time.
+        while (uploads.length >= MAX_UPLOADS) await uploads[0].done;
         const state = await readState();
         if (Date.now() < state.until || await paused()) {
           settleProbes(null);
@@ -976,10 +1079,14 @@ const ReviewerFastReads = (() => {
           : await nextTarget(Date.now(), Date.now() < (Number(state.slowUntil) || 0));
         if (!target) return;
         lastStartAt = Date.now();
+        rate.tokens -= 1;
         const slow = lastStartAt < (Number(state.slowUntil) || 0);
         gap = (slow ? SAFE_SPACING_MS : MIN_SPACING_MS) + Math.round(random() * SPACING_JITTER_MS);
         // A freshness read is extra: it never stands in for a page's scheduled read.
-        if (!probe && !target.fresh) lastRead.set(target.key, lastStartAt);
+        if (!probe && !target.fresh) {
+          lastRead.set(target.key, lastStartAt);
+          rechecks.delete(target.key);
+        }
         if (!probe && target.rank === RANK.slow) lastSlowAt = lastStartAt;
         const reply = await readTarget(target, state, Boolean(probe || target.fresh));
         probe?.settle(reply);
@@ -1096,6 +1203,7 @@ const ReviewerFastReads = (() => {
   }
 
   return { create, urlFor, searchHash, queryHash, rowsOf, SORTS, INTERVALS, RECHECK_MS, MIN_SPACING_MS,
-    SAFE_SPACING_MS, STEP_MS, VALUE_FLOOR, VALUE_DEEP_FLOOR, VALUE_MAX_PAGES, HOT_SEEDS, HOT_SIZE, HOT_HALF_LIFE_MS,
+    SAFE_SPACING_MS, STEP_MS, RATE_PER_MINUTE, RATE_BURST, MAX_UPLOADS, SPACING_JITTER_MS,
+    VALUE_FLOOR, VALUE_DEEP_FLOOR, VALUE_MAX_PAGES, HOT_SEEDS, HOT_SIZE, HOT_HALF_LIFE_MS,
     FRESH };
 })();
