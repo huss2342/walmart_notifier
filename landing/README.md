@@ -168,3 +168,34 @@ The page has one job: a tap on the yellow Discord button.
   mode. Not checked on a physical phone.
 - Released to production at https://reviewer-alerts.pages.dev/ with the deploy
   command above plus `--commit-dirty=true`.
+
+## November 24 update: you choose what pings you
+
+Ad visitors assumed joining the Discord meant being pinged for every alert. A
+new section right under the hero, "You choose what pings you.", answers that
+before the second Join button. Every claim was checked against the bot code:
+
+- Price ranges: the six real value channels from `discord_bridge/layout.py`
+  (`💲0-10` to `💲200-plus`), shown as channel chips with two turned on.
+- Categories: the eleven real category channels from `discord_bridge/policy.py`.
+- Item requests: `/request add` with `item` and optional `min_value`, a DM on a
+  match, and `/request listed` (`discord_bridge/request_commands.py`).
+- Auto-claim: labelled "Coming soon" and "Not live yet". Nothing else about it
+  is claimed.
+- Value channels, category channels and requests are Pro-only in the bot (Pro
+  and an active Pro Trial), so each carries a Pro tag, and a line says Free
+  members get every alert 24 hours later in `🆓24h-delayed-alerts`.
+- "Nothing buzzes until you turn a channel on": the server's default
+  notifications are mentions-only (`provision.py`) and alerts never mention
+  anyone (`allowed_mentions` is empty in `messages.py`).
+
+Also changed: the hero join note, the Discord FAQ answer, the Free/Pro tier
+lines and the meta descriptions. A third Join button closes the new section; the
+docked bar hides while it is on screen (`.dock-mid`, same scroll-timeline method).
+
+`tests/content.test.mjs` reads the bot source and fails if the page's channel
+names, command names, Pro tags or the coming-soon label drift from the code, or
+if any page gains a script, inline style or `data:` URL. Checked at 320 and 390
+(iframe harness), about 1000 and 2560 pixel widths, light and dark; CSP served
+by `wrangler pages dev` with zero console errors.
+
