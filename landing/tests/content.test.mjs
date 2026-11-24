@@ -14,53 +14,65 @@ const section = (id) => {
 };
 const picks = section('picks-title');
 const pickBlock = (title) => {
-  const match = picks.match(new RegExp(`<div class="pick[^"]*">\\s*<h3>${title}[\\s\\S]*?</div>`));
+  const match = picks.match(new RegExp(`<li class="pick[^"]*">(?:(?!</li>\\s*<li class="pick)[\\s\\S])*?<h3>${title}[\\s\\S]*?</div>\\s*</li>`));
   assert.ok(match, `missing pick block ${title}`);
   return match[0];
 };
+const chips = (block) => [...block.matchAll(/<li(?: class="on")?>(?:<svg[\s\S]*?<\/svg>)?([^<]+)/g)]
+  .map(([, name]) => name.trim());
 
-test('price channels on the page are the real Discord value channels', () => {
-  const names = [...layout.matchAll(/"price-[^"]+":\s*"([^"]+)"/g)].map(([, name]) => name);
-  assert.equal(names.length, 6);
-  const shown = [...pickBlock('Price ranges').matchAll(/<li[^>]*>(?:<svg[\s\S]*?<\/svg>)?([^<]+)/g)]
-    .map(([, name]) => name.trim());
-  assert.deepEqual(shown, names);
+const priceChannels = [...layout.matchAll(/"price-[^"]+":\s*"([^"]+)"/g)].map(([, name]) => name);
+const categoryChannels = [...policy.match(/PRODUCT_CATEGORY_TOPICS = \(([\s\S]*?)\n\)/)[1]
+  .matchAll(/\(\s*"([a-z-]+)",/g)].map(([, name]) => name);
+
+test('price examples are real value channels and the count matches the bot', () => {
+  assert.equal(priceChannels.length, 6);
+  const block = pickBlock('Price ranges');
+  assert.match(block, /Six value ranges, under \$10 to \$200\+/);
+  const shown = chips(block);
+  assert.ok(shown.length >= 1 && shown.length <= 3, 'keep the phone sample small');
+  for (const name of shown) assert.ok(priceChannels.includes(name), name);
 });
 
-test('category channels on the page are the real Discord category channels', () => {
-  const block = policy.match(/PRODUCT_CATEGORY_TOPICS = \(([\s\S]*?)\n\)/)[1];
-  const names = [...block.matchAll(/\(\s*"([a-z-]+)",/g)].map(([, name]) => name);
-  assert.equal(names.length, 11);
-  const shown = [...pickBlock('Categories').matchAll(/<li[^>]*>(?:<svg[\s\S]*?<\/svg>)?([^<]+)/g)]
-    .map(([, name]) => name.trim());
-  assert.deepEqual(shown, names);
+test('category examples are real category channels and the count matches the bot', () => {
+  assert.equal(categoryChannels.length, 11);
+  assert.ok(categoryChannels.includes('furniture') && categoryChannels.includes('pets'));
+  const block = pickBlock('Categories');
+  assert.match(block, /Eleven, from furniture to pets/);
+  const shown = chips(block);
+  assert.ok(shown.length >= 1 && shown.length <= 3, 'keep the phone sample small');
+  for (const name of shown) assert.ok(categoryChannels.includes(name), name);
 });
 
-test('Pro-only features are labelled Pro and auto-claim is labelled coming soon', () => {
-  for (const title of ['Price ranges', 'Categories', 'Item requests']) {
-    assert.match(pickBlock(title), /<span class="tag">Pro<\/span>/);
-  }
+test('Pro-only features are stated once as Pro and auto-claim is labelled coming soon', () => {
+  assert.match(picks, /<p class="picks-pro">Price, category and request alerts are Pro\./);
+  assert.equal((picks.match(/\bPro\b/g) || []).length, 2, 'one Pro line for the whole section');
   const soon = pickBlock('Auto-claim');
   assert.match(soon, /Coming soon/);
   assert.match(soon, /Not live yet/);
-  // The value and category channel groups really are Pro-only in the bot.
+  // The value and category channel groups and requests really are Pro-only in the bot.
   assert.match(layout, /Category\("pro-price", "PRO - BY VALUE", "pro"\)/);
   assert.match(layout, /Category\("pro-type", "PRO - BY CATEGORY", "pro"\)/);
-  assert.match(layout, /CHANNEL_DISPLAY_NAMES[\s\S]*FREE_ROUTE_KEY: "🆓24h-delayed-alerts"/);
-  assert.match(picks, /🆓24h-delayed-alerts/);
+  assert.match(read('../../discord_bridge/request_commands.py'),
+    /Personal item requests are available to current Pro members only\./);
 });
 
-test('the request example uses the real command and option names', () => {
+test('the request example uses the real command, option and $N+ suffix', () => {
   const commands = read('../../discord_bridge/request_commands.py');
   assert.match(commands, /name="request"/);
   assert.match(commands, /name="add"/);
-  assert.match(commands, /name="listed"/);
-  assert.match(commands, /async def add\(interaction, item: item_query, min_value: minimum_value = None\)/);
+  assert.match(commands, /item="Item keywords \(commas for bulk\), Walmart URL, or item ID; optional \$100\+ suffix"/);
+  assert.match(commands, /min_value="Optional minimum item value in USD/);
   const block = pickBlock('Item requests');
-  assert.match(block, /\/request add/);
-  assert.match(block, /\/request listed/);
-  assert.match(block, /<span>item<\/span>/);
-  assert.match(block, /<span>min_value<\/span>/);
+  assert.match(block, /<b>\/request add<\/b> <span>item:<\/span> couch \$200\+/);
+  assert.match(block, /minimum value/);
+  assert.match(block, /DM/);
+});
+
+test('phone section stays lean: no Join button, no fine print, no long chip walls', () => {
+  assert.doesNotMatch(picks, /data-discord-join/);
+  assert.doesNotMatch(picks, /class="fine"/);
+  assert.ok((picks.match(/<li(?: class="on")?>/g) || []).length <= 4);
 });
 
 test('page keeps the CSP contract: no scripts, inline styles or data: URLs', () => {

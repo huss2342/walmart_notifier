@@ -172,30 +172,39 @@ The page has one job: a tap on the yellow Discord button.
 ## November 24 update: you choose what pings you
 
 Ad visitors assumed joining the Discord meant being pinged for every alert. A
-new section right under the hero, "You choose what pings you.", answers that
-before the second Join button. Every claim was checked against the bot code:
+section right under the hero, "You choose what pings you.", answers that. Every
+claim was checked against the bot code:
 
-- Price ranges: the six real value channels from `discord_bridge/layout.py`
-  (`💲0-10` to `💲200-plus`), shown as channel chips with two turned on.
-- Categories: the eleven real category channels from `discord_bridge/policy.py`.
-- Item requests: `/request add` with `item` and optional `min_value`, a DM on a
-  match, and `/request listed` (`discord_bridge/request_commands.py`).
-- Auto-claim: labelled "Coming soon" and "Not live yet". Nothing else about it
-  is claimed.
+- Price ranges: six value channels in `discord_bridge/layout.py`; the page shows
+  two real ones (`💲200-plus` on, `💲0-10` off) as a sample.
+- Categories: eleven category channels in `discord_bridge/policy.py`; sample
+  `furniture` on, `pets` off.
+- Item requests: `/request add item: couch $200+`. The `$N+` suffix and the
+  `min_value` option are both real (`request_commands.py`, `request_store.py`);
+  a match is sent by DM.
+- Auto-claim: "Coming soon" and "Not live yet". Nothing else about it is claimed.
 - Value channels, category channels and requests are Pro-only in the bot (Pro
-  and an active Pro Trial), so each carries a Pro tag, and a line says Free
-  members get every alert 24 hours later in `🆓24h-delayed-alerts`.
-- "Nothing buzzes until you turn a channel on": the server's default
-  notifications are mentions-only (`provision.py`) and alerts never mention
-  anyone (`allowed_mentions` is empty in `messages.py`).
+  and an active Pro Trial), stated once: "Price, category and request alerts
+  are Pro. Try Pro free for 3 days."
+- "Nothing buzzes until you turn one on": the server's default notifications
+  are mentions-only (`provision.py`) and alerts never mention anyone
+  (`allowed_mentions` is empty in `messages.py`).
+
+Same-day phone cleanup after owner feedback ("cluttered on phones"): the first
+version listed all 17 channels as chips, tagged each feature Pro, repeated the
+plan details in fine print and added a third Join button. The section is now one
+intro line and four compact rows (mark, title, one line, a two-chip sample), with
+no divider rules and no Join button of its own; the dock keeps its original
+behaviour. At 390 px the section went from 1525 to 682 px (320 px: 1814 to 755)
+and the page from 4500 to 3704 px. The Pro tier text is split into four short
+lines, price first.
 
 Also changed: the hero join note, the Discord FAQ answer, the Free/Pro tier
-lines and the meta descriptions. A third Join button closes the new section; the
-docked bar hides while it is on screen (`.dock-mid`, same scroll-timeline method).
+lines and the meta descriptions.
 
-`tests/content.test.mjs` reads the bot source and fails if the page's channel
-names, command names, Pro tags or the coming-soon label drift from the code, or
-if any page gains a script, inline style or `data:` URL. Checked at 320 and 390
-(iframe harness), about 1000 and 2560 pixel widths, light and dark; CSP served
-by `wrangler pages dev` with zero console errors.
-
+`tests/content.test.mjs` reads the bot source and fails if the shown channel
+names, counts, command syntax, the Pro line or the coming-soon label drift from
+the code, if the section regains a Join button, fine print or a long chip wall,
+or if any page gains a script, inline style or `data:` URL. Checked at 320 and
+390 px (iframe harness; the Chrome window cannot be narrowed on this machine)
+and 2560 px, light and dark.
