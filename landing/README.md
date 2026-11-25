@@ -172,7 +172,7 @@ The page has one job: a tap on the yellow Discord button.
 ## November 24 update: you choose what pings you
 
 Ad visitors assumed joining the Discord meant being pinged for every alert. A
-section right under the hero, "You choose what pings you.", answers that. Every
+section right under the hero, "You pick your alerts.", answers that. Every
 claim was checked against the bot code:
 
 - Price ranges: six value channels in `discord_bridge/layout.py`; the page shows
@@ -182,13 +182,14 @@ claim was checked against the bot code:
 - Item requests: `/request add item: couch $200+`. The `$N+` suffix and the
   `min_value` option are both real (`request_commands.py`, `request_store.py`);
   a match is sent by DM.
-- Auto-claim: "Coming soon" and "Not live yet". Nothing else about it is claimed.
+- Auto-claim: a blue teaser card, "Coming soon" and "Not live yet", kept out of
+  the list of live features. Nothing else about it is claimed.
 - Value channels, category channels and requests are Pro-only in the bot (Pro
   and an active Pro Trial), stated once: "Price, category and request alerts
   are Pro. Try Pro free for 3 days."
-- "Nothing buzzes until you turn one on": the server's default notifications
-  are mentions-only (`provision.py`) and alerts never mention anyone
-  (`allowed_mentions` is empty in `messages.py`).
+- The server's default notifications are mentions-only (`provision.py`) and
+  alerts never mention anyone (`allowed_mentions` is empty in `messages.py`), so
+  members only hear from the channels they turn on.
 
 Same-day phone cleanup after owner feedback ("cluttered on phones"): the first
 version listed all 17 channels as chips, tagged each feature Pro, repeated the
@@ -208,3 +209,31 @@ the code, if the section regains a Join button, fine print or a long chip wall,
 or if any page gains a script, inline style or `data:` URL. Checked at 320 and
 390 px (iframe harness; the Chrome window cannot be narrowed on this machine)
 and 2560 px, light and dark.
+
+### Phone pass 2 (same day)
+
+Owner: desktop is good; the phone still read as an information dump, the
+spacing looked off, the line should be "You pick your alerts." and auto-claim
+should look exciting, not greyed out. Changes, phones only (at most 37.49rem)
+unless noted:
+
+- Copy that differs by width uses `wide-only` / `phone-only` spans, so desktop
+  keeps its longer copy. Shared changes: the headline "You pick your alerts.",
+  a positive lead ("Follow only what you want."), the hero note back to "No
+  Walmart login needed.", and the auto-claim teaser card (blue, never yellow).
+- Phone rows show only a title and a small sample. The ledger heading becomes
+  "Two nights. $1,509.97 in free items." without the subtext. Free and Pro are
+  one or two lines each; the founding price, the $30 price after that and the
+  card/cancel terms are kept as one short small line. The footer disclaimer is
+  shortened, with the same three facts.
+- The FAQ is `<details>`/`<summary>` (no JavaScript). Phones show only the
+  questions. Wider screens show every answer as before through
+  `::details-content`, inside `@supports`, so older browsers fall back to the
+  accordion.
+- Sections use 3.5rem vertical padding on phones, and headings sit 1.5rem
+  above their content.
+
+At 390 px (qa-check `visibleWords`): 447 to 268 words (-40%), page 3704 to
+2937 px. At 940 px the hero, ledger, FAQ and pricing heights are unchanged; the
+picks section is 65 px taller because of the teaser card.
+

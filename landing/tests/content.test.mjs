@@ -45,11 +45,22 @@ test('category examples are real category channels and the count matches the bot
 });
 
 test('Pro-only features are stated once as Pro and auto-claim is labelled coming soon', () => {
-  assert.match(picks, /<p class="picks-pro">Price, category and request alerts are Pro\./);
-  assert.equal((picks.match(/\bPro\b/g) || []).length, 2, 'one Pro line for the whole section');
-  const soon = pickBlock('Auto-claim');
-  assert.match(soon, /Coming soon/);
-  assert.match(soon, /Not live yet/);
+  // One Pro line for the whole section, in a desktop and a shorter phone wording.
+  const pro = picks.match(/<p class="picks-pro">([\s\S]*?)<\/p>/);
+  assert.ok(pro, 'one Pro line');
+  assert.equal((picks.match(/class="picks-pro"/g) || []).length, 1);
+  assert.match(pro[1], /<span class="wide-only">Price, category and request alerts are Pro\./);
+  assert.match(pro[1], /<span class="phone-only">All three are Pro\./);
+  assert.equal((picks.match(/\bPro\b/g) || []).length, 4, 'Pro appears only in that line');
+  // "All three" on phones refers to exactly three live rows.
+  assert.equal((picks.match(/<li class="pick">/g) || []).length, 3);
+  const soon = picks.match(/<div class="soon">[\s\S]*?<\/div>\s*<\/div>/);
+  assert.ok(soon, 'auto-claim teaser card');
+  assert.match(soon[0], /<p class="soon-badge">Coming soon<\/p>/);
+  assert.match(soon[0], /<h3>Auto-claim<\/h3>/);
+  assert.match(soon[0], /Not live yet\./);
+  // Auto-claim is not a live feature, so it must never sit among the live rows.
+  assert.doesNotMatch(picks.match(/<ul class="picks-list">[\s\S]*?<\/ul>\s*<p class="picks-pro">/)[0], /Auto-claim/);
   // The value and category channel groups and requests really are Pro-only in the bot.
   assert.match(layout, /Category\("pro-price", "PRO - BY VALUE", "pro"\)/);
   assert.match(layout, /Category\("pro-type", "PRO - BY CATEGORY", "pro"\)/);
@@ -73,6 +84,29 @@ test('phone section stays lean: no Join button, no fine print, no long chip wall
   assert.doesNotMatch(picks, /data-discord-join/);
   assert.doesNotMatch(picks, /class="fine"/);
   assert.ok((picks.match(/<li(?: class="on")?>/g) || []).length <= 4);
+});
+
+test('headline leads with choice and phone copy keeps the desktop copy', () => {
+  assert.match(picks, /<h2 id="picks-title">You pick your alerts\.<\/h2>/);
+  assert.doesNotMatch(html, /Nothing (buzzes|pings)/);
+  // Every phone-only variant sits beside a wide-only original.
+  const phone = (html.match(/class="[^"]*\bphone-only\b/g) || []).length;
+  const wide = (html.match(/class="[^"]*\bwide-only\b/g) || []).length;
+  assert.ok(phone >= 4 && wide >= phone, `${phone} phone-only vs ${wide} wide-only`);
+  const css = read('../public/styles.css');
+  assert.match(css, /@media\(max-width:37\.49rem\)\{\s*\.wide-only\{display:none!important\}/);
+  assert.match(css, /@media\(min-width:37\.5rem\)\{\s*\.phone-only\{display:none!important\}/);
+  // Pro disclosures survive on phones in short form.
+  assert.match(html, /class="phone-only tier-small">\$15 for the first 25 members, then \$30\. Trial needs a card; cancel before it ends to pay nothing\./);
+  assert.match(html, /class="phone-only">Timing varies\. Walmart RR access needed to claim\. Independent, not affiliated with Walmart or Discord\./);
+});
+
+test('FAQ is a no-JS accordion that keeps all three questions', () => {
+  const asks = section('asks-title');
+  const questions = [...asks.matchAll(/<summary>([^<]+)<\/summary>/g)].map(([, q]) => q);
+  assert.deepEqual(questions, ['Do you need my Walmart login?', "I've never used Discord.",
+    'Does an alert hold the item for me?']);
+  assert.equal((asks.match(/<details>/g) || []).length, 3);
 });
 
 test('page keeps the CSP contract: no scripts, inline styles or data: URLs', () => {
