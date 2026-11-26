@@ -30,10 +30,13 @@ from .observations import validate_batch as validate_batch
 from .policy import (
     FREE_DELAY_SECONDS,
     FREE_ROUTE_KEY,
+    HIGH_VALUE_JOB_LIFETIME_SECONDS,
+    HIGH_VALUE_MIN_CENTS,
     RESTOCK_AWAY_SECONDS,
     RESTOCK_COOLDOWN_SECONDS,
     RESTOCK_MIN_CENTS,
     RETIRED_ROUTE_KEYS,
+    job_lifetime_seconds,
 )
 from .policy import FREE_JOB_LIFETIME_SECONDS as FREE_JOB_LIFETIME_SECONDS
 from .policy import JOB_LIFETIME_SECONDS as JOB_LIFETIME_SECONDS
@@ -129,6 +132,21 @@ class JobStore:
                     "WHERE route=? AND state IN ('pending','leased')",
                     (route,),
                 )
+            # $80+ jobs still alive from before the longer lifetime (for
+            # example queued just before an upgrade restart) get it too.
+            db.execute(
+                """UPDATE jobs SET expires=due+? WHERE state IN ('pending','leased')
+                AND route!=? AND expires>? AND expires<due+?
+                AND item_id IN (SELECT item_id FROM items
+                    WHERE COALESCE(json_extract(payload,'$.value_cents'),0)>=?)""",
+                (
+                    HIGH_VALUE_JOB_LIFETIME_SECONDS,
+                    FREE_ROUTE_KEY,
+                    time.time(),
+                    HIGH_VALUE_JOB_LIFETIME_SECONDS,
+                    HIGH_VALUE_MIN_CENTS,
+                ),
+            )
 
     @contextmanager
     def _connect(self):
@@ -215,6 +233,11 @@ class JobStore:
                         if historical
                         else first_seen + JOB_LIFETIME_SECONDS
                     )
+                    if not historical and expires > now:
+                        # A fresh $80+ alert survives an outage and goes out
+                        # late. A job already past the normal lifetime when
+                        # queued (an old item gaining a route) keeps it.
+                        expires = first_seen + job_lifetime_seconds(item["value_cents"])
                     key = hashlib.sha256(f"v1:{item['item_id']}:{route}".encode()).hexdigest()[:25]
                     inserted = db.execute(
                         """INSERT INTO jobs
@@ -243,6 +266,7 @@ class JobStore:
                     if restock and not historical:
                         # Re-arm this route's finished job (one row per item and
                         # route), at most once per cooldown. `due` marks the restock.
+                        lifetime = job_lifetime_seconds(item["value_cents"])
                         back = db.execute(
                             "UPDATE jobs SET state='pending',due=?,next_attempt=?,expires=?,"
                             "attempts=0,reason=NULL,message_id=NULL,sent_at=NULL,"
@@ -250,31 +274,43 @@ class JobStore:
                             "WHERE item_id=? AND route=? AND due<=? AND (state IN "
                             "('sent','expired','failed','skipped') OR "
                             "(state='pending' AND expires<=?))",
-                            (now, now, now + JOB_LIFETIME_SECONDS, item["item_id"], route,
+                            (now, now, now + lifetime, item["item_id"], route,
                              now - RESTOCK_COOLDOWN_SECONDS, now),
                         )
                         if back.rowcount:
                             added = True
-                            due, expires, transition = now, now + JOB_LIFETIME_SECONDS, "restocked"
+                            due, expires, transition = now, now + lifetime, "restocked"
                     if routed is not None and transition:
                         routed.append({"phase": "intake", "route": route,
                                        "item_ids": [item["item_id"]], "job_ids": [key],
                                        "transition": transition, "due": due, "expires": expires})
                 queued += int(added)
-            match_requests(
-                db, items, now=now, seed_only=seed_only, activity=activity,
-                search_queries=search_queries,
-            )
-            if not seed_only:
-                db.execute(
-                    """UPDATE jobs SET next_attempt=MAX(next_attempt,?)
-                    WHERE state='pending' AND attempts=0 AND batch_id IS NULL AND route!=?
-                    AND item_id IN (SELECT a.item_id FROM personal_request_alerts a
-                        JOIN personal_request_users u USING(user_id)
-                        WHERE a.created=? AND a.state='pending' AND a.backlog=0
-                        AND u.dm_status='ready')""",
-                    (now + DM_FIRST_HOLD_SECONDS, FREE_ROUTE_KEY, now),
+            # Personal request matching shares this transaction but is not
+            # channel alert logic: if it fails, only its own writes roll back
+            # and the channel jobs above still commit.
+            request_failure = None
+            db.execute("SAVEPOINT personal_requests")
+            try:
+                match_requests(
+                    db, items, now=now, seed_only=seed_only, activity=activity,
+                    search_queries=search_queries,
                 )
+                if not seed_only:
+                    db.execute(
+                        """UPDATE jobs SET next_attempt=MAX(next_attempt,?)
+                        WHERE state='pending' AND attempts=0 AND batch_id IS NULL AND route!=?
+                        AND item_id IN (SELECT a.item_id FROM personal_request_alerts a
+                            JOIN personal_request_users u USING(user_id)
+                            WHERE a.created=? AND a.state='pending' AND a.backlog=0
+                            AND u.dm_status='ready')""",
+                        (now + DM_FIRST_HOLD_SECONDS, FREE_ROUTE_KEY, now),
+                    )
+            except Exception as exc:
+                db.execute("ROLLBACK TO personal_requests")
+                request_failure = exc
+                if activity is not None:
+                    activity.clear()
+            db.execute("RELEASE personal_requests")
         # Receipts describe durable work only; a later transaction failure must
         # never leave logs claiming a route was queued when it was rolled back.
         groups = {}
@@ -297,6 +333,12 @@ class JobStore:
                        observation_job_ids=fields["job_ids"], items=len(fields["item_ids"]))
         for fields in (activity or {}).values():
             emit_event(request_event_sink, "request_match", audience="personal", **fields)
+        if request_failure is not None:
+            emit_event(
+                event_sink if event_sink is not None else request_event_sink,
+                "component_failed", component="personal", phase="intake",
+                error_type=type(request_failure).__name__,
+            )
         return {"accepted": len(items), "new": new, "duplicates": duplicates, "queued": queued}
 
     def claim(self, *, now: float | None = None) -> dict | None:
@@ -925,6 +967,20 @@ class JobStore:
                 **{state + "_items": count for state, count in terminal_counts.items()},
                 "recent_delivery_latency_seconds": latency,
             }
+
+    def stall_snapshot(self, *, now: float) -> dict:
+        """Due channel work and the latest confirmed send, for the watchdog.
+
+        Two indexed aggregates; never expires, claims or writes anything.
+        """
+        with self._connect() as db:
+            due = db.execute(
+                "SELECT COUNT(*),MIN(due) FROM jobs WHERE state IN ('pending','leased') "
+                "AND due<=? AND expires>?",
+                (now, now),
+            ).fetchone()
+            sent = db.execute("SELECT MAX(sent_at) FROM jobs WHERE state='sent'").fetchone()
+        return {"due_items": due[0] or 0, "oldest_due_at": due[1], "last_sent_at": sent[0]}
 
     def has_due(self, *, now: float) -> bool:
         """Expire stale work and avoid polling Discord while no delivery is due."""

@@ -20,6 +20,7 @@ from discord_bridge.api import DiscordClient, DiscordError
 from discord_bridge.audit_guard import AuditGuard
 from discord_bridge.classification import classify_product
 from discord_bridge.core import JobStore, normalize_item
+from discord_bridge.delivery_watchdog import STALL_SECONDS, DeliveryWatchdog
 from discord_bridge.elite_signal import EliteSignal
 from discord_bridge.monitoring import (
     AsyncEventSink,
@@ -163,9 +164,16 @@ class DiscordNotifier:
         )
         self._stop = threading.Event()
         self._wake = threading.Event()
+        # Optional components that failed to build or start: name -> error type.
+        # None of them may stop channel alerts (see _optional).
+        self.component_errors = {}
+        self._pending_failures = []
+        self._on_sent = None
         # Old sent dispatch envelopes (most of the queue file) are pruned off the
         # hot path; items and jobs, which dedupe relies on, are kept.
-        self.pruner = CollectorPruner(self.store.path, stop_event=self._stop) if live else None
+        self.pruner = self._optional(
+            "pruner", lambda: CollectorPruner(self.store.path, stop_event=self._stop)
+        ) if live else None
         self._thread = None
         self._last_delivery = None
         self._lock = threading.Lock()
@@ -185,6 +193,10 @@ class DiscordNotifier:
             private, entry_point="collector_worker",
             background=live and isinstance(client, DiscordClient),
         )
+        for name, error_type in self._pending_failures:
+            emit_event(self.monitor.emit, "component_failed", component=name,
+                       phase="construct", error_type=error_type)
+        self._pending_failures = None
         # Discord roles and channel overwrites are the access control. The
         # permission audit only warns the owner (privacy_warning, /health
         # discord.privacy) and never blocks any worker: on 2026-11-25 a
@@ -202,41 +214,52 @@ class DiscordNotifier:
         # (off unless ELITE_SIGNAL_URL/KEY are set). Posting runs on its own thread.
         self.elite_signal = elite_signal
         if self.elite_signal is None and live:
-            self.elite_signal = EliteSignal.from_env(self.monitor.emit)
+            self.elite_signal = self._optional(
+                "elite-signal", lambda: EliteSignal.from_env(self.monitor.emit)
+            )
         self._api_events = None
         if live and isinstance(self.client, DiscordClient):
             # Every Discord REST call is logged (delivery.jsonl, event
             # discord_api) through a background writer.
-            self._api_events = AsyncEventSink(self.monitor.emit)
-            self.client.observer = self._api_events
+            self._api_events = self._optional(
+                "log-writer", lambda: AsyncEventSink(self.monitor.emit)
+            )
+            if self._api_events is not None:
+                self.client.observer = self._api_events
         self.welcome = None
         if live and welcome_enabled:
-            from discord_bridge.welcome import WelcomeWorker
+            def welcome_worker():
+                from discord_bridge.welcome import WelcomeWorker
 
-            self.welcome = WelcomeWorker(
-                self.client,
-                self.state,
-                welcome_path or self.store.path.parent / "welcome.sqlite3",
-                enabled=True,
-                auditor=self.audit_guard,
-                stop_event=self._stop,
-                paid_due=self._paid_due,
-                event_sink=self.monitor.emit,
-            )
+                return WelcomeWorker(
+                    self.client,
+                    self.state,
+                    welcome_path or self.store.path.parent / "welcome.sqlite3",
+                    enabled=True,
+                    auditor=self.audit_guard,
+                    stop_event=self._stop,
+                    paid_due=self._paid_due,
+                    event_sink=self.monitor.emit,
+                )
+
+            self.welcome = self._optional("welcome", welcome_worker)
         self.membership = None
         if live and membership_enabled:
-            from discord_bridge.membership import MembershipWorker
+            def membership_worker():
+                from discord_bridge.membership import MembershipWorker
 
-            self.membership = MembershipWorker(
-                self.client,
-                self.state,
-                membership_path or self.store.path.parent / "membership.sqlite3",
-                enabled=True,
-                auditor=self.audit_guard,
-                stop_event=self._stop,
-                paid_due=self._paid_due,
-                event_sink=self.monitor.emit,
-            )
+                return MembershipWorker(
+                    self.client,
+                    self.state,
+                    membership_path or self.store.path.parent / "membership.sqlite3",
+                    enabled=True,
+                    auditor=self.audit_guard,
+                    stop_event=self._stop,
+                    paid_due=self._paid_due,
+                    event_sink=self.monitor.emit,
+                )
+
+            self.membership = self._optional("membership", membership_worker)
         self.referrals = None
         self._referral_error = None
         if live and referrals_enabled:
@@ -251,8 +274,9 @@ class DiscordNotifier:
                     event_sink=self.monitor.emit,
                     discord_client=self.client,
                 )
-            except (ValueError, OSError) as exc:
-                # Referral setup errors cannot disable the existing item feeds.
+            except Exception as exc:
+                # Referral setup errors (bad config, Whop key, billing database
+                # copy) cannot disable the existing item feeds.
                 self._referral_error = "configuration"
                 emit_event(self.monitor.emit, "referral_error", component="referrals",
                            phase="prepare",
@@ -261,23 +285,69 @@ class DiscordNotifier:
             self.membership.referrals_enabled = self.referrals is not None
         self.requests = None
         if live and requests_enabled:
-            from discord_bridge.request_runtime import RequestRuntime
+            def request_runtime():
+                from discord_bridge.request_runtime import RequestRuntime
 
-            self.requests = RequestRuntime(
-                self.client,
-                self.state,
-                self.store.path,
-                token=requests_token or "",
-                auditor=self.audit_guard,
-                stop_event=self._stop,
+                return RequestRuntime(
+                    self.client,
+                    self.state,
+                    self.store.path,
+                    token=requests_token or "",
+                    auditor=self.audit_guard,
+                    stop_event=self._stop,
+                    event_sink=self.monitor.emit,
+                    release_hook=self._wake.set,
+                    **(
+                        {"referral_handler": self.referrals.handler}
+                        if self.referrals is not None
+                        else {}
+                    ),
+                )
+
+            self.requests = self._optional("request-runtime", request_runtime)
+        # Owner alarm when due channel alerts stop going out (5 minutes), and
+        # revival of the sender thread; started with delivery.
+        self.watchdog = None
+        if live:
+            self.watchdog = self._optional("watchdog", lambda: DeliveryWatchdog(
+                self.store,
                 event_sink=self.monitor.emit,
-                release_hook=self._wake.set,
-                **(
-                    {"referral_handler": self.referrals.handler}
-                    if self.referrals is not None
-                    else {}
-                ),
-            )
+                stall_seconds=max(60.0, _env_seconds("DISCORD_STALL_SECONDS", STALL_SECONDS)),
+                notify=self._notify_stall,
+                revive=self._revive_delivery,
+                heartbeat=lambda: self.monitor.heartbeat(self.store),
+                stop_event=self._stop,
+            ))
+
+    def _optional(self, name, factory):
+        """Build one optional component; a failure disables only that component."""
+        try:
+            return factory()
+        except Exception as exc:
+            self.component_errors[name] = type(exc).__name__
+            log.error("Discord %s disabled (%s); channel alerts continue.",
+                      name, type(exc).__name__)
+            if self._pending_failures is not None:  # monitor not built yet
+                self._pending_failures.append((name, type(exc).__name__))
+            else:
+                emit_event(self.monitor.emit, "component_failed", component=name,
+                           phase="construct", **error_fields(exc))
+            return None
+
+    def _guarded(self, name, phase, call, *args, **kwargs):
+        """Run an optional step; report and swallow its failure."""
+        try:
+            return call(*args, **kwargs)
+        except Exception as exc:
+            self._report_failure(name, phase, exc)
+            return None
+
+    def _report_failure(self, name, phase, exc):
+        self.component_errors[name] = type(exc).__name__
+        log.error("Discord %s failed during %s (%s); channel alerts continue.",
+                  name, phase, type(exc).__name__)
+        emit_event(self.monitor.emit, "component_failed", component=name, phase=phase,
+                   **error_fields(exc))
 
     def _paid_due(self):
         return self.store.has_due_paid(now=time.time())
@@ -297,12 +367,18 @@ class DiscordNotifier:
             state = read_state(Path(os.environ.get("DISCORD_STATE_PATH", PRIVATE / "server.json")))
         store = JobStore(os.environ.get("DISCORD_QUEUE_PATH", PRIVATE / "collector.sqlite3"))
         back_again = None
+        back_again_error = None
         if os.environ.get("DISCORD_BACK_AGAIN_ENABLED", "true").strip().lower() != "false":
-            from back_again import BackAgain
+            try:
+                from back_again import BackAgain
 
-            # Next to the queue database (the fast container volume).
-            back_again = BackAgain(store.path.parent / "back-again.json", store.path)
-        return cls(
+                # Next to the queue database (the fast container volume).
+                back_again = BackAgain(store.path.parent / "back-again.json", store.path)
+            except Exception as exc:
+                # Comeback confirmation is optional; every other alert still flows.
+                back_again_error = type(exc).__name__
+                log.error("Back-again disabled (%s); channel alerts continue.", back_again_error)
+        notifier = cls(
             store,
             client=client,
             state=state,
@@ -322,6 +398,11 @@ class DiscordNotifier:
             private_dir=os.environ.get("DISCORD_PRIVATE_DIR"),
             back_again=back_again,
         )
+        if back_again_error is not None:
+            notifier.component_errors["back-again"] = back_again_error
+            emit_event(notifier.monitor.emit, "component_failed", component="back-again",
+                       phase="construct", error_type=back_again_error)
+        return notifier
 
     def ingest(self, items: list[Item], *, seed_only=False) -> DiscordSummary:
         # Validate the whole public projection before queueing anything. An
@@ -364,7 +445,13 @@ class DiscordNotifier:
         if back_again is not None:
             # An $80+ offer unseen for an hour is held until a second sighting
             # 9+ s later, which is then recorded as a restock ("Back in stock").
-            held, confirmed, summary.back_again = back_again.plan(public, flagged)
+            try:
+                held, confirmed, summary.back_again = back_again.plan(public, flagged)
+            except Exception as exc:
+                # A fault in comeback bookkeeping must not refuse the batch:
+                # record it as a plain sighting (extension restock flags apply).
+                self._report_failure("back-again", "plan", exc)
+                back_again, held, confirmed = None, set(), set()
             if held:
                 summary.confirming = len(held)
                 kept = [(row, item) for row, item in zip(public, accepted, strict=True)
@@ -388,22 +475,29 @@ class DiscordNotifier:
                     announced.update(fields.get("item_ids") or ())
                 return _emit(event, **fields)
         if self.elite_signal is not None and not seed_only:
-            sink, routed = self.elite_signal.capture(sink)
+            # The auto-claim hand-off is not channel alert logic: if it fails,
+            # intake goes on with the plain sink.
+            captured = self._guarded("elite-signal", "intake", self.elite_signal.capture, sink)
+            if captured is not None:
+                sink, routed = captured
         result = self.store.record(
             public, seed_only=seed_only, request_event_sink=self.monitor.emit,
             event_sink=sink, search_queries=searches, restocked=restocked,
             restock_any_value=confirmed,
         )
+        # Committed: from here on nothing may turn this intake into an error.
+        self._wake.set()
         if back_again is not None:
-            back_again.settle(confirmed, announced)
+            self._guarded("back-again", "settle", back_again.settle, confirmed, announced)
         if routed:
             # Hand off before Discord delivery; the signal thread never blocks intake.
             with suppress(Exception):
                 self.elite_signal.offer(public, routed)
-        self.monitor.intake(result, seed_only=seed_only, items=public, searched=len(searches))
-        self._wake.set()
+        with suppress(Exception):
+            self.monitor.intake(result, seed_only=seed_only, items=public,
+                                searched=len(searches))
         if self.requests is not None and not seed_only:
-            self.requests.wake()
+            self._guarded("request-runtime", "intake", self.requests.wake)
         summary.new = result["new"]
         summary.duplicates = result["duplicates"]
         summary.seeded = result["new"] if seed_only else 0
@@ -420,7 +514,11 @@ class DiscordNotifier:
         return summary
 
     def deliver_once(self):
-        self.monitor.heartbeat(self.store)
+        # The queue heartbeat (about 15 queries) runs on the watchdog thread
+        # when that runs, so it never delays a send.
+        inline_heartbeat = self.watchdog is None or not self.watchdog.is_alive()
+        if inline_heartbeat:
+            self.monitor.heartbeat(self.store)
         try:
             result = deliver_due(
                 self.store,
@@ -432,11 +530,15 @@ class DiscordNotifier:
                 event_sink=self.monitor.emit,
             )
         finally:
-            self.monitor.heartbeat(self.store)
-        privacy = self.audit_guard.status()
+            if inline_heartbeat:
+                self.monitor.heartbeat(self.store)
+        try:
+            privacy = self.audit_guard.status()
+        except Exception:
+            privacy = {"findings_count": 0}
         with self._lock:
             self._last_delivery = result
-            if self.live and privacy["findings_count"]:
+            if self.live and privacy.get("findings_count"):
                 self.last_diagnostic = (
                     "Discord delivery enabled; privacy audit warning "
                     "(see /health discord.privacy)."
@@ -448,85 +550,123 @@ class DiscordNotifier:
     def start(self, *, on_sent=None):
         if not self.live or self._thread is not None:
             return
+        self._on_sent = on_sent
+        # Channel delivery first; every other component starts afterwards and
+        # on its own, so none of them can keep alerts from going out.
+        self._start_delivery_thread()
+        for name, component in (
+            ("watchdog", self.watchdog),
+            ("welcome", self.welcome),
+            ("membership", self.membership),
+            ("request-runtime", self.requests),
+            ("referrals", self.referrals),
+            ("pruner", self.pruner),
+        ):
+            if component is not None:
+                self._guarded(name, "start", component.start)
 
-        def work():
-            emit_event(self.monitor.emit, "worker_lifecycle", component="channel",
-                       transition="started")
-            while not self._stop.is_set():
-                self._wake.clear()
-                wait_seconds = 5
-                with self._lock:
-                    self._worker_status["poll_started_at"] = time.time()
-                    self._poll_started_monotonic = time.monotonic()
-                try:
-                    result = self.deliver_once()
-                    wait_seconds = result["wait_seconds"]
-                    if result["sent"]:
-                        with self._lock:
-                            self._worker_status["last_success"] = time.time()
-                    if result["sent"] and on_sent is not None:
-                        on_sent()
-                    recovered = False
-                    with self._lock:
-                        checked_at = time.time()
-                        self._worker_status["last_poll_status"] = (
-                            "blocked" if result["blocked"] else "ok"
-                        )
-                        if not result["blocked"]:
-                            if self._worker_status["last_error"] is not None:
-                                self._worker_status["recovered_at"] = checked_at
-                                recovered = True
-                            self._worker_status["last_error"] = None
-                    if recovered:
-                        emit_event(self.monitor.emit, "worker_recovered", component="channel",
-                                   transition="recovered")
-                except Exception as exc:
-                    with self._lock:
-                        self.last_diagnostic = "Discord worker error; queued items retained."
-                        self._worker_status.update(
-                            last_poll_status="error",
-                            last_failure_at=time.time(),
-                            last_error=type(exc).__name__,
-                        )
-                    emit_event(
-                        self.monitor.emit,
-                        "worker_error",
-                        phase="worker",
-                        component="channel",
-                        **error_fields(exc),
-                    )
-                finally:
-                    with self._lock:
-                        self._worker_status["last_poll_at"] = time.time()
-                        self._poll_started_monotonic = None
-                self._wake.wait(min(5, max(0.01, wait_seconds)))
-            emit_event(self.monitor.emit, "worker_lifecycle", component="channel",
-                       transition="stopped")
-
-        self._thread = threading.Thread(target=work, name="discord-delivery", daemon=True)
+    def _start_delivery_thread(self):
+        self._thread = threading.Thread(
+            target=self._delivery_loop, name="discord-delivery", daemon=True
+        )
         self._thread.start()
-        if self.welcome is not None:
-            self.welcome.start()
-        if self.membership is not None:
-            self.membership.start()
-        if self.requests is not None:
-            self.requests.start()
-        if self.referrals is not None:
-            self.referrals.start()
-        if self.pruner is not None:
-            self.pruner.start()
+
+    def _revive_delivery(self):
+        """Watchdog hook: restart the sender thread if it died. True if restarted."""
+        thread = self._thread
+        if self._stop.is_set() or thread is None or thread.is_alive():
+            return False
+        self._start_delivery_thread()
+        emit_event(self.monitor.emit, "worker_lifecycle", component="channel",
+                   transition="restarted")
+        return True
+
+    def _notify_stall(self, *, due_items, oldest_due_age_seconds, last_sent_age_seconds):
+        """One private notice per stall to the owner's collector-health channel."""
+        since = (
+            f"{last_sent_age_seconds / 60:.0f} min ago" if last_sent_age_seconds is not None
+            else "not since the queue began"
+        )
+        item = Item(
+            item_id="delivery-stalled",
+            title=(
+                f"Channel alerts stalled: {due_items} due, oldest waiting "
+                f"{oldest_due_age_seconds / 60:.0f} min; last channel post {since}. "
+                "Queued alerts are kept ($80+ for 3 h). See /health discord.watchdog."
+            ),
+            url="https://discord.com",
+            source="diagnostic",
+        )
+        return self.send(item, priority="high")
+
+    def _delivery_loop(self):
+        on_sent = self._on_sent
+        emit_event(self.monitor.emit, "worker_lifecycle", component="channel",
+                   transition="started")
+        while not self._stop.is_set():
+            self._wake.clear()
+            wait_seconds = 5
+            with self._lock:
+                self._worker_status["poll_started_at"] = time.time()
+                self._poll_started_monotonic = time.monotonic()
+            try:
+                result = self.deliver_once()
+                wait_seconds = result["wait_seconds"]
+                if result["sent"]:
+                    with self._lock:
+                        self._worker_status["last_success"] = time.time()
+                if result["sent"] and on_sent is not None:
+                    # Status bookkeeping only; never a delivery failure.
+                    self._guarded("runtime-status", "settle", on_sent)
+                recovered = False
+                with self._lock:
+                    checked_at = time.time()
+                    self._worker_status["last_poll_status"] = (
+                        "blocked" if result["blocked"] else "ok"
+                    )
+                    if not result["blocked"]:
+                        if self._worker_status["last_error"] is not None:
+                            self._worker_status["recovered_at"] = checked_at
+                            recovered = True
+                        self._worker_status["last_error"] = None
+                if recovered:
+                    emit_event(self.monitor.emit, "worker_recovered", component="channel",
+                               transition="recovered")
+            except Exception as exc:
+                with self._lock:
+                    self.last_diagnostic = "Discord worker error; queued items retained."
+                    self._worker_status.update(
+                        last_poll_status="error",
+                        last_failure_at=time.time(),
+                        last_error=type(exc).__name__,
+                    )
+                emit_event(
+                    self.monitor.emit,
+                    "worker_error",
+                    phase="worker",
+                    component="channel",
+                    **error_fields(exc),
+                )
+            finally:
+                with self._lock:
+                    self._worker_status["last_poll_at"] = time.time()
+                    self._poll_started_monotonic = None
+            self._wake.wait(min(5, max(0.01, wait_seconds)))
+        emit_event(self.monitor.emit, "worker_lifecycle", component="channel",
+                   transition="stopped")
 
     def stop(self):
         self._stop.set()
         self._wake.set()
-        if self.welcome is not None:
-            self.welcome.stop()
-        if self.membership is not None:
-            self.membership.stop()
-        if self.requests is not None:
-            self.requests.stop()
-        if self.referrals is not None:
-            self.referrals.stop()
+        for name, component in (
+            ("watchdog", self.watchdog),
+            ("welcome", self.welcome),
+            ("membership", self.membership),
+            ("request-runtime", self.requests),
+            ("referrals", self.referrals),
+        ):
+            if component is not None:
+                self._guarded(name, "stop", component.stop)
         if self._thread is not None:
             self._thread.join(timeout=12)
         if (
@@ -563,16 +703,29 @@ class DiscordNotifier:
                 if in_progress
                 else 0,
             )
+        def part(component, read, fallback):
+            # One failing optional component never breaks /health.
+            if component is None:
+                return fallback
+            try:
+                return read()
+            except Exception as exc:
+                return {**fallback, "health_error": type(exc).__name__}
+
+        disabled = {"enabled": False, "configured": False}
+        rate_budget = getattr(self.client, "priority_status", None)
         return {
             "live_sending": self.live,
             "worker": worker,
             "jobs": self.store.counts(),
             "last_delivery": last_delivery,
             "personal_filters_applied": False,
-            "requests": self.requests.health() if self.requests is not None else {"enabled": False},
-            "referrals": self.referrals.health()
-            if self.referrals is not None
-            else {
+            "requests": part(self.requests, lambda: self.requests.health(), {"enabled": False}),
+            "referrals": part(self.referrals, lambda: self.referrals.health(), {
+                "enabled": bool(self._referral_error),
+                "configured": False,
+                "last_error": self._referral_error,
+            }) if self.referrals is not None else {
                 "enabled": bool(self._referral_error),
                 "configured": False,
                 "last_error": self._referral_error,
@@ -582,18 +735,19 @@ class DiscordNotifier:
                 **self.monitor.status(),
                 "api_events_dropped": self._api_events.dropped if self._api_events else 0,
             },
-            "welcome": self.welcome.health()
-            if self.welcome is not None
-            else {"enabled": False, "configured": False},
-            "membership": self.membership.health()
-            if self.membership is not None
-            else {"enabled": False, "configured": False},
-            "back_again": self.back_again.health()
-            if self.back_again is not None
-            else {"enabled": False},
-            "pruning": self.pruner.health() if self.pruner is not None else {"enabled": False},
+            "welcome": part(self.welcome, lambda: self.welcome.health(), disabled),
+            "membership": part(self.membership, lambda: self.membership.health(), disabled),
+            "back_again": part(self.back_again, lambda: self.back_again.health(),
+                               {"enabled": False}),
+            "pruning": part(self.pruner, lambda: self.pruner.health(), {"enabled": False}),
             # Advisory permission audit: current findings, never a send gate.
-            "privacy": self.audit_guard.status(),
+            "privacy": part(self.audit_guard, lambda: self.audit_guard.status(), {}),
+            # Owner alarm: due channel alerts unsent for DISCORD_STALL_SECONDS.
+            "watchdog": part(self.watchdog, lambda: self.watchdog.status(), {"enabled": False}),
+            # Optional components that failed and were switched off.
+            "components": {"failed": dict(self.component_errors)},
+            # Channel sends own the Discord budget; background gets a share.
+            "rate_budget": part(rate_budget, rate_budget, {}) if callable(rate_budget) else {},
         }
 
     def send(self, item: Item, priority="normal") -> bool:
@@ -601,7 +755,8 @@ class DiscordNotifier:
         if (
             not self.live
             or item.source != "diagnostic"
-            or item.item_id not in {"notifier-test", "bot-check", "relay-stale"}
+            or item.item_id not in {"notifier-test", "bot-check", "relay-stale",
+                                    "delivery-stalled"}
         ):
             return False
         try:

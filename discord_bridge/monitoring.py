@@ -60,6 +60,10 @@ _EVENTS = {
     "pro_access_dm_failed",
     "discord_api",
     "elite_signal",
+    # Delivery watchdog (delivery_watchdog.py) and isolated optional parts.
+    "delivery_stalled",
+    "delivery_recovered",
+    "component_failed",
 }
 _STATES = {
     "pending",
@@ -167,12 +171,17 @@ _NUMBERS = {
     "value_missing",
     "searched",
     "findings_count",
+    "stalled_seconds",
+    "last_sent_age_seconds",
+    "oldest_due_age_seconds",
+    "due_items",
 }
 _ENUMS = {
     "component": {"channel", "personal", "request-runtime", "gateway", "welcome", "membership",
-                  "referrals", "trials"},
+                  "referrals", "trials", "elite-signal", "back-again", "pruner", "log-writer",
+                  "watchdog", "runtime-status"},
     "transition": {"started", "stopped", "ready", "disconnected", "error", "recovered", "queued",
-                   "rearmed", "restocked"},
+                   "rearmed", "restocked", "restarted"},
     "outcome": {"not_submitted", "rejected", "accepted", "unknown", "watch_loaded",
                 "watch_unavailable"},
     "rate_limit_source": {source.value for source in RateLimitSource},
@@ -212,6 +221,11 @@ _ENUMS = {
         "reconcile",
         "apply",
         "lookup",
+        "watchdog",
+        "construct",
+        "start",
+        "stop",
+        "plan",
     },
     "reason": _REASONS,
     "caller": {"channel", "personal", "welcome", "membership", "trials", "gateway",
@@ -514,6 +528,7 @@ class DeliveryMonitor:
                     "baseline",
                     "throttled",
                     "global_limit",
+                    "resumed",
                 }
                 and type(value) is bool
             ):
@@ -582,7 +597,8 @@ class DeliveryMonitor:
         if self.console:
             level = logging.INFO
             if event in {"worker_error", "dispatch_failed", "privacy_blocked", "welcome_error",
-                         "referral_error", "pro_access_error", "free_role_error"}:
+                         "referral_error", "pro_access_error", "free_role_error",
+                         "delivery_stalled", "component_failed"}:
                 level = logging.ERROR
             elif event in {"dispatch_retry", "dispatch_throttled", "audit_throttled",
                            "privacy_warning"}:

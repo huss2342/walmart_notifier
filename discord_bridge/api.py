@@ -185,6 +185,28 @@ def _caller():
     return next((label for prefix, label in _CALLERS if name.startswith(prefix)), "other")
 
 
+# Channel alert sends own the Discord budget. Background workers (role syncs,
+# welcomes, trials, request DMs, billing, the privacy audit, monitoring) get a
+# capped share of it, a smaller one while channel alerts are due, and a
+# Discord global 429 they trigger pauses only them. Everything else (member
+# interactions, the CLI, tests) keeps the standard behaviour.
+_PRIORITY_THREADS = ("discord-route", "discord-delivery")
+_BACKGROUND_THREADS = (
+    "discord-welcome", "discord-membership", "discord-trials", "discord-request-runtime",
+    "discord-requests", "discord-privacy-audit", "pro-access", "free-role",
+    "membership-referrals", "delivery-watchdog",
+)
+
+
+def _caller_class():
+    name = threading.current_thread().name
+    if name.startswith(_PRIORITY_THREADS):
+        return "priority"
+    if name.startswith(_BACKGROUND_THREADS):
+        return "background"
+    return "standard"
+
+
 class _RequestDeadline:
     """Bound socket work by elapsed time, including a dribbling HTTP peer.
 
@@ -239,7 +261,17 @@ class DiscordClient:
     # limit. Route-specific limits are learned from Discord, never guessed.
     _GLOBAL_REQUESTS = 25
     _GLOBAL_WINDOW = 1.0
-    _MAX_CONNECTIONS = 4
+    # Sockets: channel sends always keep four (delivery concurrency); other
+    # callers share four with them; background callers add at most two.
+    _MAX_CONNECTIONS = 10
+    _STANDARD_CONNECTIONS = 4
+    _BACKGROUND_CONNECTIONS = 2
+    _BACKGROUND_DEMAND_CONNECTIONS = 1
+    # Background share of the global window, normally and while channel
+    # alerts are due (see prioritize()).
+    _BACKGROUND_REQUESTS = 15
+    _BACKGROUND_DEMAND_REQUESTS = 5
+    _MAX_DEMAND_SECONDS = 60.0
     # Idle keep-alive sockets are silently dropped upstream; reusing one turns
     # a POST into an ambiguous RemoteDisconnected. A fresh TLS handshake is
     # far cheaper than that retry (and its duplicate/review risk).
@@ -261,11 +293,20 @@ class DiscordClient:
         self._connection_count = 0
         self._closed = False
         self._inflight: set[tuple[tuple[str, str], tuple[str, ...]]] = set()
-        self._pending_limits: set[tuple[tuple[str, str], tuple[str, ...]]] = set()
+        # 429 responses whose body (and so their scope) is still being read,
+        # mapped to the caller class that received them.
+        self._pending_limits: dict[tuple[tuple[str, str], tuple[str, ...]], str] = {}
         self._started: deque[float] = deque()
+        self._background_started: deque[float] = deque()
+        self._active = {"priority": 0, "standard": 0, "background": 0}
         self._blocked: dict[tuple, float] = {}
         self._route_buckets: dict[tuple[str, str], str] = {}
         self._global_until = 0.0
+        # A Discord global 429 returned to a background caller pauses only
+        # background callers; channel sends find out for themselves.
+        self._background_until = 0.0
+        self._demand_until = 0.0
+        self.background_deferrals = 0
         # Optional per-call observer (event, **fields); see _observe.
         self.observer = None
         self._call = threading.local()
@@ -325,8 +366,10 @@ class DiscordClient:
             self._global_until,
         )
 
-    def _wait_until(self, route, major, now):
+    def _wait_until(self, route, major, now, caller_class=None):
         """Read gates under the lock without changing state."""
+        caller_class = caller_class or _caller_class()
+        background = caller_class == "background"
         key = self._limit_key(route, major)
         blocked = self._cooldown_until(route, major)
         global_limit = self._global_until > now
@@ -334,11 +377,35 @@ class DiscordClient:
         if len(recent) >= self._GLOBAL_REQUESTS:
             blocked = max(blocked, recent[-self._GLOBAL_REQUESTS] + self._GLOBAL_WINDOW)
             global_limit = True
-        if self._pending_limits:
+        if any(background or owner != "background" for owner in self._pending_limits.values()):
             # A 429 can declare its global scope in the JSON body. Stop new
             # reservations until that bounded response has been interpreted.
+            # A background caller's pending 429 never holds a channel send.
             blocked = max(blocked, now + self._BUSY_DELAY)
             global_limit = True
+        if background:
+            if self._background_until > now:
+                blocked = max(blocked, self._background_until)
+                global_limit = True
+            demand = self._demand_until > now
+            share = self._BACKGROUND_DEMAND_REQUESTS if demand else self._BACKGROUND_REQUESTS
+            mine = [
+                started for started in self._background_started
+                if started > now - self._GLOBAL_WINDOW
+            ]
+            if len(mine) >= share:
+                blocked = max(blocked, mine[-share] + self._GLOBAL_WINDOW)
+            sockets = (
+                self._BACKGROUND_DEMAND_CONNECTIONS if demand else self._BACKGROUND_CONNECTIONS
+            )
+            if self._active["background"] >= sockets:
+                blocked = max(blocked, now + self._BUSY_DELAY)
+        elif self._active["priority"] + (
+            self._active["standard"] if caller_class == "standard" else 0
+        ) >= self._STANDARD_CONNECTIONS:
+            # Channel sends always keep their four sockets; other callers
+            # share what channel sends leave free.
+            blocked = max(blocked, now + self._BUSY_DELAY)
         # Serializing a major resource prevents two responses for the same
         # channel from racing rate headers. Other channels remain independent.
         for active_route, active_major in self._inflight:
@@ -384,6 +451,34 @@ class DiscordClient:
                     "Discord client is closed", outcome=DeliveryOutcome.NOT_SUBMITTED
                 )
             return max(0.0, self._cooldown_until(route, major) - time.monotonic())
+
+    def prioritize(self, seconds: float = 10.0):
+        """Channel alerts are due: shrink the background share for ``seconds``.
+
+        Called by channel delivery whenever it has due work. Background
+        callers then get a smaller share of the window and sockets; channel
+        sends are never slowed by it. Bounded so a stuck caller cannot pin it.
+        """
+        if type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds <= 0:
+            return
+        with self._lock:
+            self._demand_until = max(
+                self._demand_until,
+                time.monotonic() + min(float(seconds), self._MAX_DEMAND_SECONDS),
+            )
+
+    def priority_status(self) -> dict:
+        """Bounded scheduling counters for /health; no routes or IDs."""
+        with self._lock:
+            now = time.monotonic()
+            return {
+                "channel_demand": self._demand_until > now,
+                "background_inflight": self._active["background"],
+                "channel_inflight": self._active["priority"],
+                "background_paused_seconds": round(max(0.0, self._background_until - now), 3),
+                "global_wait_seconds": round(max(0.0, self._global_until - now), 3),
+                "background_deferrals": self.background_deferrals,
+            }
 
     def close(self):
         """Close idle connections; active requests close theirs on completion."""
@@ -533,14 +628,17 @@ class DiscordClient:
             "Content-Type": "application/json",
             "User-Agent": "ReviewerAlerts/1.0 (https://discord.com/developers/docs)",
         }
+        caller_class = _caller_class()
         with self._lock:
             if self._closed:
                 raise DiscordError(
                     "Discord client is closed", outcome=DeliveryOutcome.NOT_SUBMITTED
                 )
             now = time.monotonic()
-            wait, global_limit = self._wait_until(route, major, now)
+            wait, global_limit = self._wait_until(route, major, now, caller_class)
             if wait:
+                if caller_class == "background":
+                    self.background_deferrals += 1
                 raise DiscordError(
                     "Discord rate limit",
                     status=429,
@@ -552,6 +650,14 @@ class DiscordClient:
             while self._started and self._started[0] <= now - self._GLOBAL_WINDOW:
                 self._started.popleft()
             self._started.append(now)
+            if caller_class == "background":
+                while (
+                    self._background_started
+                    and self._background_started[0] <= now - self._GLOBAL_WINDOW
+                ):
+                    self._background_started.popleft()
+                self._background_started.append(now)
+            self._active[caller_class] += 1
             self._inflight.add((route, major))
             connection, stale = None, []
             while self._connections:
@@ -608,7 +714,7 @@ class DiscordClient:
             with self._lock:
                 key = self._learn_bucket(route, major, response_headers)
                 if status == 429:
-                    self._pending_limits.add((route, major))
+                    self._pending_limits[(route, major)] = caller_class
                 if (
                     status != 429
                     and str(response_headers.get("X-RateLimit-Remaining", "")).strip() == "0"
@@ -661,7 +767,11 @@ class DiscordClient:
                     # Recompute after another channel may have learned an alias.
                     key = self._limit_key(route, major)
                     cooldown_until = time.monotonic() + retry_after
-                    if global_limit:
+                    if global_limit and caller_class == "background":
+                        # Background work tripped it: pause background only.
+                        # A channel send that also meets it learns it itself.
+                        self._background_until = max(self._background_until, cooldown_until)
+                    elif global_limit:
                         self._global_until = max(self._global_until, cooldown_until)
                     else:
                         self._block_route(route, major, key, cooldown_until)
@@ -699,7 +809,8 @@ class DiscordClient:
                 reusable = False
             with self._lock:
                 self._inflight.discard((route, major))
-                self._pending_limits.discard((route, major))
+                self._pending_limits.pop((route, major), None)
+                self._active[caller_class] -= 1
                 if connection is not None and reusable and not self._closed:
                     connection._idle_since = time.monotonic()
                     self._connections.append(connection)

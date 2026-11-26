@@ -494,6 +494,13 @@ NUMBERS |= {"status", "provider_code", "retry_after_seconds", "ratelimit_remaini
 LABELS["caller"] = {"channel", "personal", "welcome", "membership", "trials", "gateway",
                     "request-runtime", "other"}
 LABELS["method"] = {"GET", "POST", "PATCH", "PUT", "DELETE"}
+# Delivery watchdog and isolated optional components (discord_bridge, 2026-11-26).
+EVENTS |= {"delivery_stalled", "delivery_recovered", "component_failed"}
+LABELS["component"] |= {"trials", "elite-signal", "back-again", "pruner", "log-writer",
+                        "watchdog", "runtime-status"}
+LABELS["phase"] |= {"watchdog", "construct", "start", "stop", "plan"}
+LABELS["transition"] |= {"restarted"}
+NUMBERS |= {"stalled_seconds", "last_sent_age_seconds", "oldest_due_age_seconds", "due_items"}
 ENDPOINT = re.compile(r"(?:/(?:[a-z@-]{1,32}|\{[a-z_]{1,20}\}))+")
 NUMBERS |= {
     "tabId",
@@ -726,7 +733,7 @@ def _safe_event(row, source):
         if _number(row.get(field)):
             clean[field] = row[field]
     for field in ("ok", "pressSent", "pressConfirmed", "releaseConfirmed", "cleanupConfirmed",
-                  "global_limit", "signalOos", "variant", "conflict"):
+                  "global_limit", "signalOos", "variant", "conflict", "resumed"):
         if type(row.get(field)) is bool:
             clean[field] = row[field]
     # Delivery request_id is an integer watch ID. Only HTTP IDs join HTTP traces.

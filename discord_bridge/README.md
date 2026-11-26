@@ -286,8 +286,40 @@ on recovery) and appear in `/health` under `discord.privacy`. One shared guard
 caches the result, pass or fail, for `DISCORD_AUDIT_TTL_SECONDS` (default 300,
 minimum 60) and audits on its own thread. Extra roles holding only reader bits,
 Add Reactions or bits `@everyone` already has are not findings. The CLI
-`audit` command still reports every finding and exits 2. Shutdown is
-checked before sending; the HTTP transport has a total
+`audit` command still reports every finding and exits 2.
+
+Channel alerts come first (2026-11-26). Nothing outside alert logic (value
+routing, dedupe, restock rules, payload limits, Discord's own 429s on the alert
+path) may stop, starve or silently drop them:
+
+- Budget: channel sends (`discord-route`/`discord-delivery` threads) own the
+  shared client. Background workers (`api._BACKGROUND_THREADS`: welcome,
+  membership, trials, request runtime and DMs, privacy audit, pro-access,
+  free-role, referrals, watchdog) get at most 15 of the 25 requests a second
+  and 2 sockets, 5 a second and 1 socket while channel alerts are due
+  (`DiscordClient.prioritize`). Channel sends always keep 4 sockets. A Discord
+  global 429 met by a background caller pauses background only; one met by a
+  channel send still gates everyone. A local refusal (nothing sent) never
+  writes a persisted global delivery gate.
+- $80+ alerts (`HIGH_VALUE_MIN_CENTS`) that were fresh when queued live 3 h
+  (`HIGH_VALUE_JOB_LIFETIME_SECONDS`) instead of 30 min and are exempt from the
+  10-attempt retry limit, so an outage sends them late instead of dropping
+  them. Cheaper alerts keep 30 minutes.
+- Isolation: optional components (welcome, membership, request runtime,
+  referrals, auto-claim hand-off, back-again, pruner, log writer) are built,
+  started, stopped and read for `/health` on their own; a failure switches off
+  only that part (`component_failed`, `/health` `discord.components.failed`).
+  Personal request matching runs under a SAVEPOINT inside intake. Delivery
+  starts before every unrelated startup step.
+- Watchdog (`delivery_watchdog.py`, 30 s): due channel jobs waiting
+  `DISCORD_STALL_SECONDS` (default 300) with no channel post for as long emit
+  `delivery_stalled` (repeated every 15 min), send one private notice to
+  `collector-health` (no mentions, never a member DM), and `delivery_recovered`
+  on recovery. It also restarts a dead sender thread and runs the queue
+  heartbeat off the delivery thread. `/health` `discord.watchdog` and
+  `discord.rate_budget` show the state.
+
+Shutdown is checked before sending; the HTTP transport has a total
 request deadline and never automatically resubmits a write. `/health` separates
 queued item destinations from message count, audit/delivery timing, queue age,
 throttles and recent confirmed delivery. Future tier-delayed work is normal.

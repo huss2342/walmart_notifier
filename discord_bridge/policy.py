@@ -18,6 +18,18 @@ RESTOCK_MIN_CENTS = 8000
 RESTOCK_AWAY_SECONDS = 900
 RESTOCK_COOLDOWN_SECONDS = 3600
 FREE_JOB_LIFETIME_SECONDS = 7 * 86400
+# $80+ alerts are never dropped by an outage (bot, network or Discord): a job
+# that was fresh when queued may go out late, up to this long after its due
+# time. Cheaper alerts keep JOB_LIFETIME_SECONDS.
+HIGH_VALUE_MIN_CENTS = 8000
+HIGH_VALUE_JOB_LIFETIME_SECONDS = 3 * 3600
+
+
+def job_lifetime_seconds(value_cents) -> int:
+    """How long a fresh, non-Free channel job may wait before it expires."""
+    if type(value_cents) is int and value_cents >= HIGH_VALUE_MIN_CENTS:
+        return HIGH_VALUE_JOB_LIFETIME_SECONDS
+    return JOB_LIFETIME_SECONDS
 
 PRODUCT_CATEGORY_TOPICS = (
     ("furniture", "Furniture alerts. Immediate after detection."),

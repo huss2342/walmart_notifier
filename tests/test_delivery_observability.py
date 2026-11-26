@@ -82,15 +82,37 @@ def test_failed_intake_emits_no_committed_routing_receipt(tmp_path, monkeypatch)
     store = JobStore(tmp_path / "queue.sqlite3")
     events = []
 
-    def fail_match(*_args, **_kwargs):
+    def fail_routing(*_args, **_kwargs):
         raise sqlite3.OperationalError("Private storage failure")
 
-    monkeypatch.setattr(core, "match_requests", fail_match)
+    monkeypatch.setattr(core, "route_keys", fail_routing)
     with pytest.raises(sqlite3.OperationalError):
         store.record([product()], now=1000, event_sink=lambda *args, **kwargs: events.append(args))
     assert not events
     with sqlite3.connect(store.path) as db:
         assert db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+
+
+def test_failed_personal_matching_still_commits_and_receipts_channel_jobs(tmp_path, monkeypatch):
+    import discord_bridge.core as core
+
+    store = JobStore(tmp_path / "queue.sqlite3")
+    events = []
+
+    def fail_match(*_args, **_kwargs):
+        raise sqlite3.OperationalError("Private storage failure")
+
+    monkeypatch.setattr(core, "match_requests", fail_match)
+    item = product()
+    store.record([item], now=1000,
+                 event_sink=lambda event, **fields: events.append((event, fields)))
+    routed = [fields for event, fields in events if event == "observation_routed"]
+    assert {fields["route"] for fields in routed} == set(route_keys(item))
+    assert ("component_failed", {"component": "personal", "phase": "intake",
+                                 "error_type": "OperationalError"}) in events
+    assert "Private" not in json.dumps(events)
+    with sqlite3.connect(store.path) as db:
+        assert db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == len(route_keys(item))
 
 
 def test_transport_metadata_preserves_outcome_without_exception_text(tmp_path):

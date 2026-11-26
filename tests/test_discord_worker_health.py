@@ -144,7 +144,10 @@ def test_callback_error_does_not_erase_the_confirmed_send(tmp_path, monkeypatch)
         raise ValueError("PRIVATE callback")
 
     (worker,) = run_cycles(notifier, monkeypatch, [2], on_sent=broken_callback)
-    assert worker["last_success"] == worker["last_failure_at"] == 100.5
-    assert worker["last_poll_status"] == "error"
-    assert worker["last_error"] == "ValueError"
-    assert "PRIVATE" not in json.dumps(worker)
+    # Status bookkeeping is not delivery: the send stands and the worker stays
+    # healthy; the failing callback is reported as its own component.
+    assert worker["last_success"] == 100.5
+    assert worker["last_poll_status"] == "ok"
+    assert worker["last_error"] is None
+    assert notifier.component_errors == {"runtime-status": "ValueError"}
+    assert "PRIVATE" not in json.dumps(worker) + json.dumps(notifier.component_errors)

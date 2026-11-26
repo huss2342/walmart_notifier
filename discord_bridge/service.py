@@ -104,7 +104,9 @@ def make_server(
             routed = None
             sink = event_sink
             if elite_signal is not None:
-                sink, routed = elite_signal.capture(event_sink)
+                # The auto-claim hand-off never decides whether alerts queue.
+                with suppress(Exception):
+                    sink, routed = elite_signal.capture(event_sink)
             try:
                 result = (store.record(items, event_sink=sink, request_event_sink=event_sink)
                           if sink is not None else store.record(items))
@@ -116,7 +118,8 @@ def make_server(
                 with suppress(Exception):
                     elite_signal.offer(items, routed)
             if on_queued is not None:
-                on_queued()
+                with suppress(Exception):
+                    on_queued()
             if on_accepted is not None:
                 # A monitoring failure cannot undo the commit or ask the
                 # extension to retry an observation already accepted.

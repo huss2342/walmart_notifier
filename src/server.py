@@ -1318,6 +1318,11 @@ def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
     Handler.token = token
     Handler.notifier = build_notifier()
     Handler.runtime_status = RuntimeStatus(Handler.store)
+    notifier = Handler.notifier
+    # Channel delivery starts before every unrelated store, watchdog and
+    # banner step below, so none of them can hold alerts back.
+    if isinstance(notifier, DiscordNotifier):
+        notifier.start(on_sent=Handler.runtime_status.record_notification)
     Handler.browser_diagnostics = BrowserDiagnosticsStore(
         Handler.store.path.with_name("browser-diagnostics.json")
         if Handler.store.path else ":memory:"
@@ -1340,12 +1345,18 @@ def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
     )
     Handler.telegram_commands = None
 
-    notifier = Handler.notifier
-    if isinstance(notifier, DiscordNotifier):
-        notifier.start(on_sent=Handler.runtime_status.record_notification)
-    watchdog = RelayWatchdog.from_env(Handler.runtime_status, notifier, dict(os.environ))
-    watchdog.start()
-    rules = load_rules()
+    watchdog = None
+    try:
+        watchdog = RelayWatchdog.from_env(Handler.runtime_status, notifier, dict(os.environ))
+        watchdog.start()
+    except Exception as exc:
+        # The stale-relay reminder is optional; alerts never depend on it.
+        log.error("Relay watchdog disabled (%s); alerts remain enabled.", type(exc).__name__)
+    try:
+        rules = load_rules()
+    except Exception as exc:
+        log.error("Could not read rules for the banner (%s).", type(exc).__name__)
+        rules = []
 
     httpd = ThreadingHTTPServer((host, port), Handler)
     httpd.daemon_threads = True
@@ -1410,7 +1421,8 @@ def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
         # finish, later ones get a 503 and are retried by the extension.
         if not Handler.intake_gate.close(timeout=5):
             log.warning("Stopping with an ingest request still running.")
-        watchdog.stop()
+        if watchdog is not None:
+            watchdog.stop()
         if isinstance(notifier, DiscordNotifier):
             notifier.stop()
         if command_poller is not None:

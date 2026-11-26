@@ -8,11 +8,22 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import suppress
 
-from .api import DiscordError, retry_local_contention
+from .api import DiscordError, RateLimitSource, retry_local_contention
 from .audit_guard import AuditGuard
 from .monitoring import emit_event, error_fields
-from .policy import RETIRED_ROUTE_KEYS
+from .policy import FREE_ROUTE_KEY, HIGH_VALUE_MIN_CENTS, RETIRED_ROUTE_KEYS
+
+# Seconds of background-budget priority claimed per check while alerts are due.
+PRIORITY_SECONDS = 10.0
+
+
+def _high_value(batch):
+    """An $80+ product alert: kept through outages until its (longer) expiry."""
+    return batch["route"] != FREE_ROUTE_KEY and any(
+        (job["item"].get("value_cents") or 0) >= HIGH_VALUE_MIN_CENTS for job in batch["jobs"]
+    )
 
 
 class _AuditClient:
@@ -90,6 +101,13 @@ def deliver_due(
                 # the actual HTTP reservation still rechecks every limit.
                 store.defer_route(route, until=current() + wait)
 
+    def claim_priority():
+        # Background Discord callers shrink to a small share while alerts are due.
+        prioritize = getattr(client, "prioritize", None)
+        if callable(prioritize):
+            with suppress(Exception):  # scheduling hint only
+                prioritize(PRIORITY_SECONDS)
+
     def event(name, batch=None, **fields):
         if batch is not None:
             jobs = batch["jobs"]
@@ -127,6 +145,7 @@ def deliver_due(
     if not store.has_due(now=current()) or next_wait() > 0:
         result["wait_seconds"] = max(0.01, next_wait())
         return result
+    claim_priority()
     guard = AuditGuard.wrap(auditor, event_sink=event_sink)
 
     def send_batch(batch):
@@ -188,7 +207,10 @@ def deliver_due(
                 return {counter: count}
             limited = exc.status == 429
             attempts = max(job["attempts"] for job in batch["jobs"])
-            if exc.status in {400, 401, 403, 404} or (not limited and attempts >= 10):
+            # An outage (5xx, timeouts, network) must not drop an $80+ alert:
+            # it keeps retrying (backoff capped at 300 s) until it expires.
+            exhausted = not limited and attempts >= 10 and not _high_value(batch)
+            if exc.status in {400, 401, 403, 404} or exhausted:
                 store.finish_batch(
                     batch,
                     "failed",
@@ -209,10 +231,14 @@ def deliver_due(
                 delay = 5
             delay = max(0.01, delay)
             if limited:
-                if exc.global_limit:
+                local = exc.rate_limit_source is RateLimitSource.LOCAL
+                if exc.global_limit and not local:
                     store.defer_global(until=current() + delay)
-                else:
+                elif not exc.global_limit:
                     store.defer_route(batch["route"], until=current() + delay)
+                # A local global-scope refusal (shared window, another
+                # worker's pending 429) sent nothing to Discord: never persist
+                # it as a gate that pauses every route; this batch alone waits.
             store.retry_batch(
                 batch,
                 now=current(),
@@ -253,6 +279,7 @@ def deliver_due(
             defer_learned_routes()
             if next_wait() > 0 or not store.has_due(now=current()):
                 break
+            claim_priority()
             # Never gates sending: on 2026-11-25 a fail-closed audit stopped
             # every alert for ~80 min over a harmless Server Booster role.
             audit_started = time.monotonic()
