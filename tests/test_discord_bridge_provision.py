@@ -8,6 +8,8 @@ import json
 import pytest
 from discord_bridge.api import DiscordError
 from discord_bridge.layout import (
+    MODERATOR_CHANNEL_ALLOW,
+    MODERATOR_PERMISSIONS,
     ATTACH_FILES,
     BOT_RUNTIME_PERMISSIONS,
     BYPASS_SLOWMODE,
@@ -591,7 +593,7 @@ def test_simple_welcome_area_and_read_only_updates_do_not_expose_operator_guides
     for memberships in ([], [state["roles"]["starter"]], [state["roles"]["pro"]]):
         updates = client.permissions(state["channels"]["feed-status"], memberships)
         assert updates & VIEW and not updates & SEND
-        for key in ("plans-and-help", "audit", "collector-health"):
+        for key in ("delivery-errors", "audit", "collector-health"):
             assert not client.permissions(state["channels"][key], memberships) & VIEW
     assert audit(client, GUILD, state)["ok"]
 
@@ -754,7 +756,7 @@ def test_channel_creation_obeys_discord_nonadministrator_overwrite_restrictions(
     client = DiscordOverwriteRules()
     client.roles[1]["permissions"] = str(PROVISION_PERMISSIONS)
     result = provision(client, GUILD, BOT, tmp_path / "state.json", apply=True)
-    assert len(result["state"]["channels"]) == 31
+    assert len(result["state"]["channels"]) == 29
     assert len(result["state"]["categories"]) == 7
     client.roles[1]["permissions"] = "0"
     assert audit(client, GUILD, result["state"])["ok"]
@@ -799,9 +801,9 @@ def test_definitive_rate_limit_during_creation_resumes_without_duplicates(tmp_pa
     result = provision(client, GUILD, BOT, path, apply=True)
     finish_setup(client, result)
     assert preserved <= set(result["state"]["categories"].values())
-    assert len(client.channels) == 38
-    assert len({channel["id"] for channel in client.channels}) == 38
-    assert len({channel["name"] for channel in client.channels}) == 38
+    assert len(client.channels) == 36
+    assert len({channel["id"] for channel in client.channels}) == 36
+    assert len({channel["name"] for channel in client.channels}) == 36
 
 
 def install_membership_bot(client, state):
@@ -1044,3 +1046,45 @@ def test_extra_role_may_repeat_everyone_bits_but_setup_cannot_rely_on_them(tmp_p
     snapshot = _snapshot(client, GUILD, BOT)
     blockers = _role_findings(snapshot, state, allow_setup=True, ignore_everyone=True)
     assert any("300000000000000009" in finding for finding in blockers)
+
+
+def _add_mod_role(client, state, permissions):
+    mod = {"id": "300000000000000011", "name": "Mod", "permissions": str(permissions)}
+    client.roles.append(mod)
+    state["roles"]["moderator"] = mod["id"]
+    feedback = next(c for c in client.channels if c["id"] == state["channels"]["delivery-errors"])
+    feedback["permission_overwrites"].append(
+        {"id": mod["id"], "type": 0, "allow": str(MODERATOR_CHANNEL_ALLOW), "deny": "0"}
+    )
+    return mod, feedback
+
+
+def test_mod_role_with_moderation_bits_and_feedback_access_passes_audit(tmp_path):
+    client, _, state = apply_server(tmp_path)
+    mod, feedback = _add_mod_role(client, state, MODERATOR_PERMISSIONS)
+    assert audit(client, GUILD, state) == {**audit(client, GUILD, state), "ok": True}
+    # Mod reads #mod-feedback but no other private channel.
+    assert client.permissions(feedback["id"], [mod["id"]]) & VIEW
+    for key in ("audit", "collector-health", "pro-all"):
+        assert not client.permissions(state["channels"][key], [mod["id"]]) & VIEW
+
+
+@pytest.mark.parametrize("extra", [1 << 2, 1 << 28, 1 << 4, 1 << 3])  # ban, roles, channels, admin
+def test_mod_role_beyond_moderation_bits_is_a_finding(tmp_path, extra):
+    client, _, state = apply_server(tmp_path)
+    mod, _ = _add_mod_role(client, state, MODERATOR_PERMISSIONS | extra)
+    result = audit(client, GUILD, state)
+    assert not result["ok"]
+    assert any(mod["id"] in finding for finding in result["findings"])
+
+
+def test_mod_overwrite_on_any_other_private_channel_is_a_finding(tmp_path):
+    client, _, state = apply_server(tmp_path)
+    mod, _ = _add_mod_role(client, state, MODERATOR_PERMISSIONS)
+    health = next(c for c in client.channels if c["id"] == state["channels"]["collector-health"])
+    health["permission_overwrites"].append(
+        {"id": mod["id"], "type": 0, "allow": str(VIEW), "deny": "0"}
+    )
+    result = audit(client, GUILD, state)
+    assert not result["ok"]
+    assert any("collector-health" in finding for finding in result["findings"])

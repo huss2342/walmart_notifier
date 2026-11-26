@@ -19,6 +19,7 @@ from .policy import STARTER_DELAY_SECONDS as STARTER_DELAY_SECONDS
 from .policy import STARTER_MAX_PRICE_CENTS as STARTER_MAX_PRICE_CENTS
 
 CREATE_INVITE = 1 << 0
+KICK_MEMBERS = 1 << 1
 ADMINISTRATOR = 1 << 3
 MANAGE_CHANNELS = 1 << 4
 MANAGE_GUILD = 1 << 5
@@ -43,6 +44,7 @@ SEND_POLLS = 1 << 49
 USE_EXTERNAL_APPS = 1 << 50
 PIN_MESSAGES = 1 << 51
 BYPASS_SLOWMODE = 1 << 52
+MODERATE_MEMBERS = 1 << 40  # timeout
 
 READER_PERMISSIONS = VIEW_CHANNEL | READ_MESSAGE_HISTORY
 BOT_RUNTIME_PERMISSIONS = READER_PERMISSIONS | SEND_MESSAGES | EMBED_LINKS
@@ -61,9 +63,15 @@ MEMBER_ACTION_DENY = SEND_MESSAGES | EMBED_LINKS
 # Sole guild-wide grant on @everyone (set by the owner; the bot never holds it).
 # Channel overwrites never deny it, so members react wherever they can read.
 EVERYONE_PERMISSIONS = ADD_REACTIONS
+# Community moderator (added 2026-11-25): timeout, kick and delete messages in
+# channels the mod can already read. No ban, roles, channels or invites; Pro
+# access still comes only from the Pro role, never from Mod.
+MODERATOR_PERMISSIONS = KICK_MEMBERS | MANAGE_MESSAGES | MODERATE_MEMBERS
+# What Mod may do in #mod-feedback, the one private channel it can read.
+MODERATOR_CHANNEL_ALLOW = READER_PERMISSIONS | SEND_MESSAGES | EMBED_LINKS | ATTACH_FILES
 
 ROLE_NAMES = {"starter": "Starter", "pro": "Pro"}
-OPTIONAL_ROLE_NAMES = {"trial": "Pro Trial"}
+OPTIONAL_ROLE_NAMES = {"trial": "Pro Trial", "moderator": "Mod"}
 CHANNEL_DISPLAY_NAMES = {
     "welcome": "💳-welcome",
     "how-it-works": "how-to-use",
@@ -76,6 +84,8 @@ CHANNEL_DISPLAY_NAMES = {
     "price-200-plus": "💲200-plus",
     FREE_ROUTE_KEY: "🆓24h-delayed-alerts",
     "starter-items": "retired-starter-feed",
+    # Repurposed 2026-11-25; nothing ever posted delivery errors here.
+    "delivery-errors": "mod-feedback",
 }
 
 
@@ -136,14 +146,6 @@ CHANNELS = (
         "the server owner can post updates directly.",
     ),
     Channel(
-        "plans-and-help",
-        "operations",
-        "Free: historical alerts after 24 hours. "
-        f"Pro: ${PLAN_PRICES_CENTS['pro'] / 100:g}/month, "
-        "all observed values, category feeds and personal item requests. "
-        "Subscribe, manage or cancel through Whop. Starter is retired.",
-    ),
-    Channel(
         "yesterday-recap",
         "public-info",
         f"Free: every detected item, released at least {FREE_DELAY_SECONDS / 3600:g} hours "
@@ -186,10 +188,8 @@ CHANNELS = (
     Channel(
         "delivery-errors",
         "operations",
-        "Private delivery failures. Sanitized diagnostic summaries only.",
-    ),
-    Channel(
-        "classification-review", "operations", "Private review of uncertain item classifications."
+        "Mods + owner only. Forward member feedback, bugs and questions here, one per "
+        "message. Owner reacts ✅ when handled. No credentials or payment data.",
     ),
     Channel(
         "audit",
@@ -225,6 +225,7 @@ def permission_overwrites(
     application_commands: bool = False,
     public_commands: bool = False,
     pro_media: bool = False,
+    moderator_access: bool = False,
 ) -> list[dict]:
     """Explicit ACLs avoid role-combination leaks and public creation windows."""
     public = category.audience == "everyone"
@@ -235,6 +236,8 @@ def permission_overwrites(
         raise ValueError("Public commands require a community chat channel")
     if pro_media and not chat:
         raise ValueError("Pro media requires a community chat channel")
+    if moderator_access and category.audience != "operations":
+        raise ValueError("Moderator access is only for a private operations channel")
     reader_allow = (READER_PERMISSIONS | (SEND_MESSAGES if chat else 0)) if public else 0
     if public_commands:
         reader_allow |= USE_APPLICATION_COMMANDS
@@ -260,6 +263,11 @@ def permission_overwrites(
                 # Discord requires Send Messages even for private slash replies.
                 role_allow |= USE_APPLICATION_COMMANDS | SEND_MESSAGES
             result.append({"id": roles[role], "type": 0, "allow": str(role_allow), "deny": "0"})
+    if moderator_access and "moderator" in roles:
+        result.append({
+            "id": roles["moderator"], "type": 0,
+            "allow": str(MODERATOR_CHANNEL_ALLOW), "deny": "0",
+        })
     result.append(
         {"id": bot_user_id, "type": 1, "allow": str(BOT_RUNTIME_PERMISSIONS), "deny": "0"}
     )

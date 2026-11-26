@@ -24,6 +24,7 @@ from .layout import (
     CREATE_INVITE,
     EVERYONE_PERMISSIONS,
     MANAGE_ROLES,
+    MODERATOR_PERMISSIONS,
     OPTIONAL_CHANNELS,
     OPTIONAL_ROLE_NAMES,
     PROVISION_PERMISSIONS,
@@ -241,7 +242,8 @@ def _role_findings(
 ) -> list[str]:
     findings = []
     bot_roles = set(snapshot["member"].get("roles", []))
-    paid_roles = set(state["roles"].values())
+    moderator_role = state["roles"].get("moderator")
+    paid_roles = {v for k, v in state["roles"].items() if k != "moderator"}
     membership_role_id, membership_findings = _membership_role(snapshot, state)
     findings.extend(membership_findings)
     # An extra role (e.g. Discord's managed Server Booster role, created with
@@ -278,6 +280,14 @@ def _role_findings(
                 )
             if role.get("mentionable"):
                 findings.append(f"Role {role_id}: role is mentionable.")
+            continue
+        if role_id == moderator_role:
+            if role.get("mentionable"):
+                findings.append(f"Role {role_id}: role is mentionable.")
+            if permissions & ~(MODERATOR_PERMISSIONS | harmless):
+                findings.append(
+                    f"Mod role {role_id}: only Kick, Timeout and Manage Messages are permitted."
+                )
             continue
         if role_id == membership_role_id:
             if not permissions & MANAGE_ROLES:
@@ -444,6 +454,7 @@ def _resource_findings(
             application_commands=spec.key in {"item-requests", "trial-management"},
             public_commands=spec.key == "general",
             pro_media=spec.key == "general",
+            moderator_access=spec.key == "delivery-errors",
         )
         try:
             if _acl(channel.get("permission_overwrites")) != _acl(expected_acl):
@@ -719,6 +730,7 @@ def provision(
                     guild_id, bot_user_id, state["roles"], category,
                     public_commands=not is_category and action["key"] == "general",
                     pro_media=not is_category and action["key"] == "general",
+                    moderator_access=not is_category and action["key"] == "delivery-errors",
                 ),
             }
             if not is_category:

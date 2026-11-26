@@ -65,7 +65,7 @@ def grant_record(service, user, *, seconds=3600, now=None):
 def test_general_allows_member_commands_without_opening_pro_or_owner_channels(tmp_path):
     client, _, state = apply_server(tmp_path)
     assert client.permissions(state["channels"]["general"]) & USE_APPLICATION_COMMANDS
-    assert not client.permissions(state["channels"]["plans-and-help"]) & (1 << 10)
+    assert not client.permissions(state["channels"]["collector-health"]) & (1 << 10)
     assert not client.permissions(state["channels"]["pro-all"]) & (1 << 10)
 
 
