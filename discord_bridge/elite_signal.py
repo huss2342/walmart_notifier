@@ -4,54 +4,37 @@ Optional and off unless ELITE_SIGNAL_URL and ELITE_SIGNAL_KEY are set. Delivery 
 its own thread so Discord intake/delivery latency is unaffected; every attempt is logged
 through the bridge monitor as an `elite_signal` event.
 
-The Elite service publishes what its members want (`/v2/signals/watch`): only items that
-match one of those watches are forwarded, and the watches' searches join the scanner's
-request lane so Elite requests get dedicated Walmart searches like Pro requests. Until the
-first watch loads (or if it goes stale) every candidate is forwarded; Elite matches again.
+Every new/restocked in-stock priced item is forwarded: Elite keeps them all for request
+previews ("what would this request have claimed?") and turns only items a member's request
+matches into claim opportunities, so matching lives in one place. The Elite watch
+(`/v2/signals/watch`) still supplies its requests' searches for the scanner's request lane,
+so Elite requests get dedicated Walmart searches like Pro requests.
 """
 
 from __future__ import annotations
 
 import contextlib
+import http.client
 import json
 import os
 import queue
-import re
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
-import unicodedata
 
 SIGNAL_TRANSITIONS = {"queued", "rearmed", "restocked"}
 SIGNAL_ROUTE = "pro-all"  # Every available item has this route; FREE-only items are out of stock.
 MAX_QUEUE = 1000
+BATCH_ITEMS = 100  # Elite accepts at most 100 items per POST
 TIMEOUT_SECONDS = 3
+# The Elite service is remote (~150 ms away): a fresh HTTPS connection costs ~3 round trips before the
+# request is even sent. Deliveries reuse one kept-alive connection, pinged while idle so it stays open.
+KEEPALIVE_SECONDS = 45
 ATTEMPTS = 3
 WATCH_REFRESH_SECONDS = 15
 WATCH_STALE_SECONDS = 120
-
-
-def _normalized(value: str) -> str:
-    # Same as reviewer_alerts_elite/elite_service/rules.py so both sides agree on a match.
-    return " ".join(re.findall(r"[^\W_]+", unicodedata.normalize("NFKC", value).casefold()))
-
-
-def _contains(title: str, phrase: str) -> bool:
-    return f" {_normalized(phrase)} " in f" {_normalized(title)} "
-
-
-def watch_matches(watch: dict, item: dict, category_map: dict) -> bool:
-    """Mirror of Elite's rules.matches for one published watch."""
-    value, title = item.get("value_cents"), item.get("title") or ""
-    if type(value) is not int or value < watch["minValueCents"] or not title.strip():
-        return False
-    if any(_contains(title, word) for word in watch["excludeKeywords"]):
-        return False
-    words = watch["keywords"]
-    hits = [_contains(title, word) for word in words]
-    word_match = bool(words) and (all(hits) if watch["keywordMode"] == "all" else any(hits))
-    return category_map.get(item.get("category", "other"), "other") in watch["categoryIds"] or word_match
 
 
 class EliteSignal:
@@ -62,6 +45,8 @@ class EliteSignal:
             raise ValueError("ELITE_SIGNAL_KEY must be 32-256 non-space characters")
         self.url, self.key, self.event_sink = url, key, event_sink
         self.opener = opener or urllib.request.urlopen
+        self.persistent = opener is None
+        self._conn: http.client.HTTPConnection | None = None
         self.queue: queue.Queue = queue.Queue(MAX_QUEUE)
         self.watch_url = url.rsplit("/", 1)[0] + "/watch"
         self._watch: dict | None = None
@@ -117,13 +102,6 @@ class EliteSignal:
             return None
         return self._watch
 
-    def wanted(self, item: dict) -> bool:
-        """True if an Elite request could match; with no current watch, forward everything."""
-        watch = self._fresh_watch()
-        if watch is None:
-            return True
-        return any(watch_matches(w, item, watch["categoryMap"]) for w in watch["watches"])
-
     def search_queries(self) -> list[str]:
         """Elite requests' searches for the scanner's request lane (empty if the watch is stale)."""
         watch = self._fresh_watch()
@@ -151,7 +129,7 @@ class EliteSignal:
         for item in items:
             if item.get("item_id") not in routed or not item.get("available"):
                 continue
-            if item.get("value_cents") is None or not self.wanted(item):
+            if item.get("value_cents") is None:
                 continue
             payload.append({
                 "itemId": item["item_id"].removeprefix("ip-"),
@@ -163,24 +141,71 @@ class EliteSignal:
             })
         if not payload:
             return 0
-        try:
-            self.queue.put_nowait((time.time(), payload))
-        except queue.Full:
-            self._emit(outcome="rejected", error_type="QueueFull", items=len(payload),
-                       item_ids=["ip-" + p["itemId"] for p in payload])
-            return 0
-        return len(payload)
+        sent = 0
+        for start in range(0, len(payload), BATCH_ITEMS):
+            batch = payload[start:start + BATCH_ITEMS]
+            try:
+                self.queue.put_nowait((time.time(), batch))
+                sent += len(batch)
+            except queue.Full:
+                self._emit(outcome="rejected", error_type="QueueFull", items=len(batch),
+                           item_ids=["ip-" + p["itemId"] for p in batch])
+        return sent
+
+    def _request(self, method, path, body=None, headers=None):
+        """One request on the kept-alive connection; a stale connection is reopened once, at once."""
+        for fresh in (False, True):
+            if self._conn is None or fresh:
+                self._close()
+                parts = urllib.parse.urlsplit(self.url)
+                kind = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+                self._conn = kind(parts.netloc, timeout=TIMEOUT_SECONDS)
+                fresh = True
+            try:
+                self._conn.request(method, path, body=body, headers=headers or {})
+                response = self._conn.getresponse()
+                return response.status, response.reason, response.headers, response.read()
+            except (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError):
+                self._close()
+                if fresh:
+                    raise
+            except Exception:
+                self._close()
+                raise
+        raise ConnectionError("unreachable")
+
+    def _close(self):
+        if self._conn is not None:
+            with contextlib.suppress(Exception):
+                self._conn.close()
+            self._conn = None
 
     def _post(self, payload):
         body = json.dumps({"items": payload}).encode()
-        request = urllib.request.Request(self.url, data=body, method="POST", headers={
-            "Content-Type": "application/json", "Authorization": "Bearer " + self.key})
+        headers = {"Content-Type": "application/json", "Authorization": "Bearer " + self.key}
+        if self.persistent:
+            status, reason, response_headers, data = self._request(
+                "POST", urllib.parse.urlsplit(self.url).path, body, headers)
+            if status >= 400:
+                raise urllib.error.HTTPError(self.url, status, reason, response_headers, None)
+            return status, json.loads(data or b"{}")
+        request = urllib.request.Request(self.url, data=body, method="POST", headers=headers)
         with self.opener(request, timeout=TIMEOUT_SECONDS) as response:
             return response.status, json.loads(response.read() or b"{}")
 
+    def _keepalive(self):
+        with contextlib.suppress(Exception):
+            self._request("GET", "/health")
+
     def _run(self):
+        if self.persistent:
+            self._keepalive()
         while True:
-            queued_at, payload = self.queue.get()
+            try:
+                queued_at, payload = self.queue.get(timeout=KEEPALIVE_SECONDS if self.persistent else None)
+            except queue.Empty:
+                self._keepalive()
+                continue
             ids = ["ip-" + p["itemId"] for p in payload]
             for attempt in range(1, ATTEMPTS + 1):
                 started = time.time()

@@ -48,6 +48,49 @@ def post(server, items):
     return request(server, "POST", "/v1/observations", {"items": items}, headers)
 
 
+def test_default_delivery_reuses_one_kept_alive_connection():
+    import http.server
+
+    connections, received = [], []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def setup(self):
+            super().setup()
+            connections.append(self.client_address)
+
+        def do_GET(self):
+            self._reply(b'{"watches":[],"searches":[]}' if "watch" in self.path else b"{}")
+
+        def do_POST(self):
+            received.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            self._reply(b'{"accepted":["x"]}')
+
+        def _reply(self, body):
+            self.send_response(202 if self.command == "POST" else 200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        signal = EliteSignal(f"http://127.0.0.1:{server.server_port}/v2/signals/items", KEY)
+        for n in range(3):
+            signal.queue.put((time.time(), [{"itemId": str(n)}]))
+        deadline = time.time() + 3
+        while time.time() < deadline and len(received) < 3:
+            time.sleep(0.02)
+        assert [r["items"][0]["itemId"] for r in received] == ["0", "1", "2"]
+        assert len(connections) == 1  # warm-up ping + three deliveries on one connection
+    finally:
+        server.shutdown()
+
+
 def test_new_in_stock_item_is_signalled_once_with_review_url(tmp_path):
     opener, events = Opener(), []
     signal = EliteSignal("http://host.docker.internal:8899/v2/signals/items", KEY,
@@ -156,30 +199,41 @@ def candidate(item_id, title, cents, category="electronics"):
             "category": category, "review_url": f"https://www.walmart.com/ip/{item_id[3:]}?x"}
 
 
-def test_only_items_an_elite_request_wants_are_forwarded():
+def test_every_available_priced_item_is_forwarded_and_elite_decides():
+    # Elite keeps every scanned item for request previews and matches requests itself.
     opener = Opener()
     signal = EliteSignal("http://x/v2/signals/items", KEY, opener=opener)
     signal.set_watch(WATCH)
     items = [candidate("ip-100000001", "Gaming Laptop 16GB", 45000),
              candidate("ip-100000002", "Gaming laptop refurbished", 45000),
-             candidate("ip-100000003", "Gaming laptop", 1000),
-             candidate("ip-100000004", "Office chair", 30000, "furniture"),
-             candidate("ip-100000005", "Desk lamp", 30000)]
+             candidate("ip-100000005", "Desk lamp", 30000),
+             candidate("ip-100000006", "Unpriced", None),
+             candidate("ip-100000007", "Sold out", 30000) | {"available": False}]
     routed = {item["item_id"]: "queued" for item in items}
-    assert signal.offer(items, routed) == 2
+    assert signal.offer(items, routed) == 3
     assert opener.done.wait(3)
-    assert [i["itemId"] for i in opener.calls[0][2]["items"]] == ["100000001", "100000004"]
+    assert [i["itemId"] for i in opener.calls[0][2]["items"]] == ["100000001", "100000002", "100000005"]
     assert signal.search_queries() == ["gaming laptop"]
 
 
-def test_stale_or_missing_watch_forwards_everything():
+def test_large_waves_are_split_into_batches_elite_accepts():
+    opener = Opener()
+    signal = EliteSignal("http://x/v2/signals/items", KEY, opener=opener)
+    items = [candidate(f"ip-{200000000 + n}", f"Item {n}", 30000) for n in range(150)]
+    assert signal.offer(items, {item["item_id"]: "queued" for item in items}) == 150
+    deadline = time.time() + 3
+    while time.time() < deadline and len(opener.calls) < 2:
+        time.sleep(0.02)
+    assert [len(call[2]["items"]) for call in opener.calls] == [100, 50]
+
+
+def test_stale_or_missing_watch_adds_no_searches():
     signal = EliteSignal("http://x/v2/signals/items", KEY, opener=Opener())
-    lamp = candidate("ip-100000005", "Desk lamp", 30000)
-    assert signal.wanted(lamp) and signal.search_queries() == []
+    assert signal.search_queries() == []
     signal.set_watch(WATCH, now=time.time() - 3600)
-    assert signal.wanted(lamp) and signal.search_queries() == []
+    assert signal.search_queries() == []
     signal.set_watch(WATCH)
-    assert not signal.wanted(lamp)
+    assert signal.search_queries() == ["gaming laptop"]
 
 
 def test_watch_loop_loads_watch_from_elite():

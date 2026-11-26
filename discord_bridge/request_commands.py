@@ -16,6 +16,7 @@ import uuid
 import weakref
 from contextlib import suppress
 
+from .copy_link import CopyLinkHandler
 from .api import DiscordError
 from .monitoring import emit_event, error_fields
 from .payload_limits import DESCRIPTION, text_length
@@ -1059,6 +1060,7 @@ class RequestGateway:
         self._stop = stop_event if stop_event is not None else threading.Event()
         self._events = event_sink
         self._referral_handler = referral_handler
+        self._copy_link = CopyLinkHandler()
         self._trial_service = trial_service
         self._thread, self._loop, self._gateway = None, None, None
         self._connected, self._last_error = False, None
@@ -1212,6 +1214,10 @@ class RequestGateway:
                         await trial_handler.error(interaction)
                     elif view is None or view.is_finished():
                         await trial_handler.expired_controls(interaction)
+                return
+            if self._copy_link.accepts(interaction):
+                if not interaction.response.is_done():
+                    await self._copy_link.handle(interaction)
                 return
             if self._referral_handler is not None and self._referral_handler.accepts(interaction):
                 if self._connected and not self._stop.is_set():
