@@ -264,10 +264,12 @@ const item = id => ({ item_id: `ip-${id}`, available: true, value_usd: 10 });
 
 // A clock-driven harness: every reply comes from respond(url), and steps()
 // advances time between runs the way the worker's timer chain would. Hot
-// searches are off unless a test passes hotSeeds (null: the built-in seeds), so
-// the older cadence tests keep proving the schedule they were written for.
+// searches are off unless a test passes hotSeeds (null: the built-in seeds,
+// pinned and excluded searches too), so the older cadence tests keep proving
+// the schedule they were written for.
 function harness({ respond = () => ({ ok: true, status: 200, items: [] }), searches = [], departments = [],
   onBlocked = async () => {}, paused = async () => false, send = null, mustSend = undefined, hotSeeds = [],
+  hotPinned = hotSeeds === null ? null : [], hotExcluded = hotSeeds === null ? null : [],
   store = {}, start = 1_000_000 } = {}) {
   let now = start;
   const clock = class extends Date { static now() { return now; } };
@@ -294,6 +296,7 @@ function harness({ respond = () => ({ ok: true, status: 200, items: [] }), searc
     paused, diagnostic: details => logs.push(details),
     queries: async () => searches, departments: async () => departments, onBlocked,
     ...(mustSend ? { mustSend } : {}), ...(hotSeeds ? { hotSeeds } : {}),
+    ...(hotPinned ? { hotPinned } : {}), ...(hotExcluded ? { hotExcluded } : {}),
     setTimer: (_fn, delay) => { delays.push(delay); return 1; }, clearTimer: () => {}, random: () => 0.5,
     snapshot: record => records.push(JSON.parse(JSON.stringify(record)))
   });
@@ -349,9 +352,9 @@ test('research reads wait only for due $80+ pages, are never ingested and log as
   assert.equal(await h.api.research('https://www.walmart.com/ip/123'), null);
 });
 
-test('price_high page 1 is read every 10 s and every other $80+ page every 30 s', async () => {
+test('price_high page 1 is read every 10 s, every other $80+ page every 30 s, the page after them every 2 min', async () => {
   const h = harness({ respond: valueReply([120, 95, 85, 70, 55, 45, 35]) });
-  await h.steps(180);
+  await h.steps(360);
   assert.deepEqual(h.asked.slice(0, 4).map(row => row.what), ['value:1', 'value:2', 'value:3', 'value:4']);
   const page1 = gaps(h.asked, 'value:1');
   assert.ok(page1.length >= 20);
@@ -360,12 +363,37 @@ test('price_high page 1 is read every 10 s and every other $80+ page every 30 s'
     const fast = gaps(h.asked, `value:${page}`).slice(1); // after the start-up burst of first reads
     assert.ok(fast.length >= 10 && fast.every(gap => gap >= 30_000 && gap <= 35_000), `page ${page}: ${fast}`);
   }
-  // Page 3 is all $80+, so page 4 is checked at the fast cadence too, in case a
-  // new listing spills an $80+ item onto it; pages after that wait for the pass.
-  assert.ok(gaps(h.asked, 'value:4').slice(1).every(gap => gap <= 35_000), 'boundary page checked fast');
+  // Page 3 is all $80+, so page 4 is checked too, in case a new listing spills
+  // an $80+ item onto it: every 2 min while it holds none (30 s until Nov 26;
+  // the min_price=79 list shows every $80+ offer at 40 s anyway). Pages after
+  // that wait for the pass.
+  const page4 = gaps(h.asked, 'value:4');
+  assert.ok(page4.length >= 5 && page4.every(gap => gap >= 120_000 && gap <= 125_000), `boundary page: ${page4}`);
+  assert.equal(h.FastReads.INTERVALS.valueSpill, 120_000);
   assert.ok(gaps(h.asked, 'value:5').every(gap => gap >= 240_000), 'page 5 waits for the pass');
   assert.ok(h.asked.some(row => row.what === 'value:8'), 'the first page without a $40+ item ends the pass');
   assert.equal(h.asked.some(row => row.what === 'value:9'), false);
+});
+
+test('the page after the $80+ block is read every 2 min while it holds none, every 30 s once it holds one', async () => {
+  // Nov 26 (2.32.9): page 4 (max $79.99 in production) showed no new $80+ item
+  // first in 147 h at 30 s; the min_price=79 list holds every $80+ offer at 40 s.
+  const lasts = [120, 95, 85, 70, 55, 45, 35];
+  const h = harness({ respond: url => valueReply(lasts)(url) });
+  await h.steps(360); // 15 minutes: page 4 holds $75 and $70
+  const switchAt = h.now();
+  const before = gaps(h.asked, 'value:4');
+  assert.ok(before.length >= 5 && before.every(gap => gap >= 120_000 && gap <= 125_000), `spill check: ${before}`);
+  lasts[3] = 85; // a new listing puts $90 and $85 offers on page 4
+  await h.steps(360);
+  const after = h.asked.filter(row => row.at > switchAt);
+  const firstHolding = after.find(row => row.what === 'value:4').at;
+  const page4 = gaps(after.filter(row => row.at >= firstHolding), 'value:4');
+  assert.ok(page4.length >= 8 && page4.every(gap => gap >= 30_000 && gap <= 35_000), `now an $80+ page: ${page4}`);
+  // Page 4 is all $80+ now, so page 5 is the check after the block, every 2 min.
+  const page5 = gaps(after, 'value:5').slice(1);
+  // (Up to 135 s: it waits behind batches of due $80+ pages at times.)
+  assert.ok(page5.length >= 2 && page5.every(gap => gap >= 120_000 && gap <= 135_000), `page 5: ${page5}`);
 });
 
 test('a page counts as $80+ by any item on it, not by the cheaper items Walmart puts last', async () => {
@@ -544,15 +572,17 @@ test('a lone $80+ offer far below the block no longer pulls the pages between in
 
 // Nov 19: sort=new page 1 found no $80+ item first in Nov 10-19; its reads
 // went to searches with products (owner-approved, same read load).
-test('sort=new page 1 is read every 5 minutes and later new pages rarely', async () => {
+test('sort=new page 1 is read every 30 minutes and later new pages rarely', async () => {
+  // Every 5 min until Nov 26: in 147 h it showed no new $80+ item first.
   const h = harness({ respond: valueReply([120, 95, 85, 70]) });
-  await h.steps(480); // 20 minutes
+  await h.steps(2_200); // ~92 minutes
   const page1 = gaps(h.asked, 'newest:1');
   // A rank-1 check: it waits behind a batch of due $80+ pages (here all eight
   // idle min_price=79 pages fall due together every 3 minutes).
-  assert.ok(page1.length >= 3 && page1.every(gap => gap >= 300_000 && gap <= 330_000), String(page1));
-  assert.ok(h.asked.filter(row => row.what === 'newest:2').length <= 2);
-  assert.ok(h.asked.filter(row => row.what === 'newest:4').length <= 2);
+  assert.ok(page1.length >= 2 && page1.every(gap => gap >= 1_800_000 && gap <= 1_830_000), String(page1));
+  assert.deepEqual([...h.FastReads.INTERVALS.newest], [1_800_000, 1_800_000, 1_800_000, 1_800_000]);
+  assert.ok(h.asked.filter(row => row.what === 'newest:2').length <= 4);
+  assert.ok(h.asked.filter(row => row.what === 'newest:4').length <= 4);
 });
 
 test('read starts stay at least 0.5 seconds apart, plus jitter', async () => {
@@ -638,7 +668,7 @@ test('a page with no $80+ item leaves the fast zone until $80+ items return', as
   assert.ok(h.asked.slice(-30).filter(row => row.what === 'value:2').length >= 3, 'page 2 is fast again');
 });
 
-test('member searches outrank priority searches; empty ones wait thirty minutes', async () => {
+test('member and priority searches share rank 2: members every 4 min, priority every 12; empty ones wait 30', async () => {
   const h = harness({ searches: { members: ['sofa', 'lamp'], priority: ['desk', 'Sofa'] },
     respond: url => {
       const what = describe(url);
@@ -816,8 +846,14 @@ test('at production scale every rank keeps its cadence within the fixed read bud
   assert.ok(lateGaps('value80:6').every(gap => gap <= 50_000), 'pages of the $80+ list');
   const new80 = lateGaps('new80:1');
   assert.ok(new80.length >= 50 && new80.every(gap => gap >= 40_000 && gap <= 50_000), `new80: ${new80}`);
-  const newest = lateGaps('newest:1');
-  assert.ok(newest.length >= 6 && newest.every(gap => gap >= 300_000 && gap <= 390_000), `newest every ~5 min: ${newest}`);
+  const newest = gaps(h.asked, 'newest:1');
+  assert.ok(newest.length >= 1 && newest.every(gap => gap >= 1_800_000 && gap <= 1_900_000),
+    `newest every ~30 min: ${newest}`);
+  // Priority searches share rank 2 with the member searches (Nov 26; at rank 3
+  // they were never read once member searches took every spare read).
+  const owner = priority.map(query => gaps(h.asked, `search:${query}:1`));
+  assert.ok(owner.every(reads => reads.length >= 3 && reads.every(gap => gap >= 720_000 && gap <= 780_000)),
+    `priority searches every ~12 min: ${owner}`);
   // Searches with products share every read the ranks above leave; with 26 of
   // them that is about every 4 minutes.
   const productive = members.filter((_, index) => index % 2 === 0).flatMap(query => lateGaps(`search:${query}:1`));
@@ -836,10 +872,11 @@ test('at production scale every rank keeps its cadence within the fixed read bud
 
 // Hot searches (Nov 19): searches read at rank 0, chosen by how many new
 // in-stock $80+ items their page-1 reads surface. Nov 23: 12 of them every 48 s
-// (6 every 60 s before); the six built-in seeds are unchanged.
-const SEEDS = ['chair', 'ktaxon', 'sofa', 'tablet', 'trampoline', 'rack'];
-// A full hot set of 12 for the tests that need one (only the first six are built in).
-const TWELVE = [...SEEDS, 'desk', 'bike', 'grill', 'tent', 'kayak', 'mower'];
+// (6 every 60 s before). Nov 26: 13, 'furniture' a seventh seed and pinned
+// (always hot), 'bicycle' never hot.
+const SEEDS = ['chair', 'ktaxon', 'sofa', 'tablet', 'trampoline', 'rack', 'furniture'];
+// A full hot set of 13 for the tests that need one (only the first seven are built in).
+const FULL = [...SEEDS, 'desk', 'bike', 'grill', 'tent', 'kayak', 'mower'];
 const plain = value => JSON.parse(JSON.stringify(value));
 const offer = (id, value, available = true) => ({ item_id: `ip-${id}`, available, value_usd: value });
 const searchReply = items => ({ ok: true, status: 200, items, products: items.length, totalPages: 3 });
@@ -854,7 +891,9 @@ test('the hot seeds are read every 48 s, page 1 only, while the $80+ pages keep 
   const h = harness({ hotSeeds: null, respond: url => describe(url).startsWith('search:')
     ? searchReply([item(9_100_000)]) : value80Reply()(url) });
   assert.deepEqual([...h.FastReads.HOT_SEEDS], SEEDS);
-  assert.equal(h.FastReads.HOT_SIZE, 12);
+  assert.equal(h.FastReads.HOT_SIZE, 13);
+  assert.deepEqual([...h.FastReads.HOT_PINNED], ['furniture']);
+  assert.deepEqual([...h.FastReads.HOT_EXCLUDED], ['bicycle']);
   assert.equal(h.FastReads.INTERVALS.hot, 48_000);
   await h.steps(700, 1_200); // 14 minutes at ~50 reads a minute (Nov 23)
   const late = h.asked.filter(row => row.at >= 1_000_000 + 2 * 60_000);
@@ -873,13 +912,15 @@ test('the hot seeds are read every 48 s, page 1 only, while the $80+ pages keep 
   assert.equal(new URL(h.asked.find(row => row.what === 'search:chair:1').url).search,
     '?q=chair&queryNups=chair&sort=new');
   assert.ok(gaps(late, 'value:1').every(gap => gap <= 12_000), 'price_high page 1 stays first, at 10 s');
-  for (const page of [2, 3, 4]) {
+  for (const page of [2, 3]) {
     const reads = gaps(late, `value:${page}`);
     const median = [...reads].sort((x, y) => x - y)[reads.length >> 1];
     assert.ok(median <= 31_500 && reads.every(gap => gap <= 36_000), `value page ${page} stays at 30 s: ${reads}`);
   }
+  assert.ok(gaps(late, 'value:4').every(gap => gap >= 120_000 && gap <= 126_000), 'the boundary page keeps its 2 min');
+  // (Within 48 s: with seven seeds and the 48-a-minute budget a read is held a few seconds at most.)
   for (const page of [1, 2, 3, 4, 6]) {
-    assert.ok(gaps(late, `value80:${page}`).every(gap => gap <= 46_000), `min_price=79 page ${page} stays at 40 s`);
+    assert.ok(gaps(late, `value80:${page}`).every(gap => gap <= 48_000), `min_price=79 page ${page} stays at 40 s`);
   }
   // price_high page 1 is still the most frequent read.
   const count = what => late.filter(row => row.what === what).length;
@@ -943,14 +984,14 @@ test('scores count in-stock $80+ items new to a search, from its second page-1 r
 
 test('a newcomer must beat the weakest hot search by 25% plus 0.5; ties keep the set, nothing flaps', async () => {
   let lamp = [offer(1_099_999, 20)]; // products, so it is read every 4 minutes
-  const h = harness({ hotSeeds: TWELVE, searches: { members: ['lamp'] }, respond: url => {
+  const h = harness({ hotSeeds: FULL, searches: { members: ['lamp'] }, respond: url => {
     const what = describe(url);
     if (what === 'search:lamp:1') return searchReply(lamp);
     return what.startsWith('search:') ? searchReply([item(9_100_000)]) : valueReply([30])(url);
   } });
   const hotSet = async () => plain((await h.api.hotSearches()).hot);
   await h.steps(10, 1_200);
-  assert.deepEqual(await hotSet(), TWELVE, 'the seeds start hot, at their prior of 2, and fill all 12 places');
+  assert.deepEqual(await hotSet(), FULL, 'the seeds start hot, at their prior of 2, and fill all 13 places');
   let id = 1_100_000;
   const fresh = count => Array.from({ length: count }, () => offer(id++, 150));
   const lampReads = () => h.asked.filter(row => row.what === 'search:lamp:1').length;
@@ -962,9 +1003,9 @@ test('a newcomer must beat the weakest hot search by 25% plus 0.5; ties keep the
   };
   await nextRead([]); // baseline
   await nextRead(fresh(2)); // 2 against the seeds' ~2: not enough
-  assert.deepEqual(await hotSet(), TWELVE);
+  assert.deepEqual(await hotSet(), FULL);
   await nextRead(fresh(2)); // ~4 > 2 x 1.25 + 0.5
-  const swapped = [...TWELVE.slice(0, 11), 'lamp'];
+  const swapped = [...FULL.slice(0, 12), 'lamp'];
   assert.deepEqual(await hotSet(), swapped, 'replaces the latest seed to join among the tied weakest');
   const swappedAt = h.now();
   await h.steps(500, 1_200); // 10 minutes
@@ -977,7 +1018,7 @@ test('a newcomer must beat the weakest hot search by 25% plus 0.5; ties keep the
   assert.deepEqual(await hotSet(), swapped);
 });
 
-test('the hot set holds 12: six built-in seeds, then the best-scoring searches fill the free places', async () => {
+test('the hot set holds 13: the pinned search, seven built-in seeds, then the best-scoring searches', async () => {
   const start = 5_000_000;
   const members = Array.from({ length: 10 }, (_, index) => `member ${index}`);
   // Members 0-7 scored (one new $80+ item or more); 8 and 9 below the 0.5 needed for a free place.
@@ -986,16 +1027,17 @@ test('the hot set holds 12: six built-in seeds, then the best-scoring searches f
   const h = harness({ store, start, hotSeeds: null, searches: { members }, respond: valueReply([30]) });
   await h.steps(1);
   const hot = plain((await h.api.hotSearches()).hot);
-  assert.equal(hot.length, 12);
-  assert.deepEqual(hot.slice(0, 1), ['chair'], 'members of the stored set keep their place');
+  assert.equal(hot.length, 13);
+  assert.deepEqual(hot.slice(0, 2), ['chair', 'furniture'],
+    'members of the stored set keep their place; the pinned search takes one');
   // The other five seeds (prior 2) and the six best members fill the free places, best first.
-  assert.deepEqual(hot.slice(1), ['ktaxon', 'sofa', 'tablet', 'trampoline', 'rack',
+  assert.deepEqual(hot.slice(2), ['ktaxon', 'sofa', 'tablet', 'trampoline', 'rack',
     'member 7', 'member 6', 'member 5', 'member 4', 'member 3', 'member 2']);
 });
 
 test('the swap margin is exact: weakest x 1.25 + 0.5 stays out, just above gets in; a free place needs 0.5', async () => {
   const start = 5_000_000;
-  const full = TWELVE;
+  const full = FULL;
   for (const [challenger, expected] of [[3, false], [3.001, true]]) {
     const store = { reviewerHotSearches: { v: 1, hot: full,
       scores: [...full.map(key => [key, 2, start]), ['lamp', challenger, start]], memory: [] } };
@@ -1003,7 +1045,7 @@ test('the swap margin is exact: weakest x 1.25 + 0.5 stays out, just above gets 
     await h.steps(1);
     const { hot } = await h.api.hotSearches();
     assert.equal(hot.includes('lamp'), expected, `challenger ${challenger}`);
-    assert.equal(hot.length, 12);
+    assert.equal(hot.length, 13);
   }
   for (const [score, expected] of [[0.49, false], [0.5, true]]) {
     const store = { reviewerHotSearches: { v: 1, hot: ['chair'], scores: [['chair', 2, start], ['lamp', score, start]],
@@ -1056,7 +1098,47 @@ test('scores, the hot set and each search\'s recent items survive a reload; stor
     hotSeeds: null, respond: valueReply([30]) });
   assert.deepEqual(plain((await broken.api.hotSearches()).hot), []);
   await broken.steps(1);
-  assert.deepEqual(plain((await broken.api.hotSearches()).hot), SEEDS);
+  assert.deepEqual(plain((await broken.api.hotSearches()).hot), ['furniture', ...SEEDS.slice(0, 6)],
+    'the pinned search first, then the seeds by their prior');
+});
+
+test('a pinned search always holds a hot place; an excluded one never gets one and keeps its member cadence', async () => {
+  // Nov 26 (2.32.9): 'furniture' pinned, 'bicycle' excluded (it showed the same
+  // $80+ items as 'bike' every time).
+  const start = 5_000_000;
+  const members = ['Bicycle', 'bike', ...Array.from({ length: 14 }, (_, index) => `member ${index}`)];
+  const stored = scores => ({ reviewerHotSearches: { v: 1, hot: ['bicycle', ...members.slice(2, 14)], scores,
+    memory: [] } });
+  const respond = url => describe(url).startsWith('search:') ? searchReply([item(3_000_000)]) : valueReply([30])(url);
+  const options = { start, hotSeeds: [], hotPinned: [' Furniture '], hotExcluded: ['BICYCLE'], respond,
+    searches: { members, priority: ['furniture'] } };
+  // Every member scores far above the pinned search, which has no score at all.
+  const even = members.map(key => [key.toLowerCase(), 10, start]);
+  const h = harness({ ...options, store: stored(even) });
+  await h.steps(1);
+  let hot = plain((await h.api.hotSearches()).hot);
+  assert.equal(hot.length, 13, JSON.stringify(hot));
+  assert.ok(hot.includes('furniture'), 'pinned: in the set without any score');
+  assert.equal(hot.includes('bicycle'), false, 'excluded: dropped from the stored set');
+  assert.equal(hot.includes('bike'), false, 'a tie with the weakest does not get in');
+  // A newcomer that clears the margin takes the weakest unpinned place, never the
+  // pinned one; the excluded search stays out whatever it scores.
+  const others = even.filter(([key]) => !['member 13', 'bicycle'].includes(key));
+  const strong = harness({ ...options, store: stored([...others, ['member 13', 100, start], ['bicycle', 1_000, start]]) });
+  await strong.steps(1);
+  hot = plain((await strong.api.hotSearches()).hot);
+  assert.equal(hot.length, 13);
+  assert.ok(hot.includes('furniture') && hot.includes('member 13') && !hot.includes('bicycle'), JSON.stringify(hot));
+  // Reads: the pinned search every 48 s as a hot priority search; the excluded one on the member cadence.
+  await strong.steps(1_000, 1_200); // 20 minutes
+  const late = strong.asked.filter(row => row.at >= start + 2 * 60_000);
+  const furniture = gaps(late, 'search:furniture:1');
+  assert.ok(furniture.length >= 15 && furniture.every(gap => gap >= 48_000 && gap <= 58_000), `pinned: ${furniture}`);
+  const pinnedLogs = strong.logs.filter(row => row.searchHash === fnv('furniture') && row.page === 1);
+  assert.ok(pinnedLogs.length >= 15 && pinnedLogs.every(row => row.hot === true && row.lane === 'priority'));
+  const bicycle = gaps(strong.asked, 'search:Bicycle:1');
+  assert.ok(bicycle.length >= 1 && bicycle.every(gap => gap >= 240_000), `excluded, member cadence: ${bicycle}`);
+  assert.equal(strong.logs.some(row => row.searchHash === fnv('bicycle') && row.hot), false);
 });
 
 test('during the gentler day after a bot-check sign no search is hot; the hot set returns after it', async () => {
@@ -1072,8 +1154,8 @@ test('during the gentler day after a bot-check sign no search is hot; the hot se
   const logsBefore = h.logs.length;
   await h.steps(600, 2_800); // 28 minutes at the gentler pace (2.7 s with this harness's jitter)
   const slow = h.asked.filter(row => row.at >= from);
-  assert.equal(slow.some(row => ['chair', 'ktaxon', 'tablet', 'trampoline', 'rack']
-    .some(seed => row.what === `search:${seed}:1`)), false, 'the seeds pause');
+  assert.equal(slow.some(row => ['chair', 'ktaxon', 'tablet', 'trampoline', 'rack', 'furniture']
+    .some(seed => row.what === `search:${seed}:1`)), false, 'the seeds and the pinned search pause');
   const sofa = gaps(slow, 'search:Sofa:1');
   assert.ok(sofa.length >= 4 && sofa.every(gap => gap >= 240_000), `sofa back on the member cadence: ${sofa}`);
   assert.equal(h.logs.slice(logsBefore).some(row => row.hot), false);
@@ -1108,13 +1190,15 @@ test('search reads log a hash of the normalised query, the hot flag, the $80+ co
   for (const word of ['chair', 'Desk', 'Lamp', 'lamp', 'café']) assert.equal(text.includes(word), false, word);
 });
 
-test('at production scale with 12 hot searches, new80 and the Nov 23 budget, member searches keep their revisit', async () => {
+test('at production scale with 13 hot searches, new80, priority searches at rank 2 and the budget, members keep their revisit', async () => {
   // 2.32.7 (6 hot searches every 60 s, other $80+ price_high pages every 20 s,
   // no new80) on this same workload at its ~41 reads a minute (a start every
   // 1.47 s): productive member searches every 251.4 s at the median, 286.7 s at
   // worst. 2.32.8 reads ~50 a minute (data/plan90-20261123/cadence_sim.mjs on
-  // the Nov 19-23 read durations): a start every ~1.2 s. Here the 12 hot
-  // searches are extra searches, not members (the harder case).
+  // the Nov 19-23 read durations): a start every ~1.2 s. Here the hot searches
+  // (13 since Nov 26) are extra searches, not members (the harder case), and
+  // the 27 priority searches share rank 2 with the members (Nov 26); the price_high
+  // page after the $80+ block (2 min) and sort=new (30 min) pay for them.
   const members = Array.from({ length: 52 }, (_, index) => `member ${index}`);
   const priority = Array.from({ length: 27 }, (_, index) => `priority ${index}`);
   const respond = url => {
@@ -1139,7 +1223,7 @@ test('at production scale with 12 hot searches, new80 and the Nov 23 budget, mem
     const sorted = [...productive].sort((x, y) => x - y);
     return { h, late, median: sorted[sorted.length >> 1], max: sorted.at(-1) };
   };
-  const after = await simulate(TWELVE, 1_200);
+  const after = await simulate(FULL, 1_200);
   assert.ok(after.median <= 251_370 * 1.05, `members: ${after.median} vs 251370 in 2.32.7`);
   assert.ok(after.max <= Math.max(286_650 * 1.1, 6.5 * 60_000), `members worst: ${after.max} vs 286650 in 2.32.7`);
   const lateGaps = what => gaps(after.late, what);
@@ -1147,13 +1231,15 @@ test('at production scale with 12 hot searches, new80 and the Nov 23 budget, mem
   assert.ok(lateGaps('value:2').every(gap => gap <= 36_000), 'other $80+ pages');
   assert.ok(lateGaps('value80:6').every(gap => gap <= 48_000), 'pages of the $80+ list');
   assert.ok(lateGaps('new80:1').every(gap => gap <= 48_000), 'new80 page 1');
-  for (const seed of TWELVE) {
+  for (const seed of FULL) {
     const reads = lateGaps(`search:${seed}:1`);
     // Every hot read within 60 s of the last: an item new there is never later than that.
     assert.ok(reads.length >= 40 && reads.every(gap => gap <= 56_000), `${seed}: ${reads}`);
   }
-  const newest = lateGaps('newest:1');
-  assert.ok(newest.length >= 6 && newest.every(gap => gap >= 300_000 && gap <= 390_000), `newest: ${newest}`);
+  const newest = gaps(after.h.asked, 'newest:1');
+  assert.ok(newest.length >= 1 && newest.every(gap => gap >= 1_800_000 && gap <= 1_900_000), `newest: ${newest}`);
+  const owner = priority.map(query => gaps(after.h.asked, `search:${query}:1`));
+  assert.ok(owner.every(reads => reads.length >= 2 && reads.every(gap => gap <= 20 * 60_000)), `priority: ${owner}`);
   const empty = members.filter((_, index) => index % 2).flatMap(query => gaps(after.h.asked, `search:${query}:1`));
   assert.ok(empty.length >= 20 && empty.every(gap => gap >= 1_800_000 && gap <= 35 * 60_000), `empty: ${empty}`);
 });
@@ -1637,20 +1723,21 @@ test('in the gentler day after a bot-check sign neither new80 nor any hot search
   assert.ok(SEEDS.every(seed => h.asked.slice(after).some(row => row.what === `search:${seed}:1`)), 'hot searches too');
 });
 
-test('never more than 54 reads a minute, however fast Walmart answers', async () => {
+test('never more than 48 reads a minute, however fast Walmart answers', async () => {
   const h = harness({ departments: [{ catId: '4044', index: 1 }, { catId: '4171', index: 2 }],
     respond: url => describe(url).startsWith('department:')
       ? { ok: true, status: 200, items: [item(5_000_000)], products: 1, totalPages: 25, totalItems: 1_000 }
       : valueReply([120, 95, 85, 70])(url) });
-  assert.deepEqual([h.FastReads.RATE_PER_MINUTE, h.FastReads.RATE_BURST], [54, 10]);
+  // 54 from Nov 23; 48 since Nov 26, so 2.32.9's shorter search reads cannot raise the load.
+  assert.deepEqual([h.FastReads.RATE_PER_MINUTE, h.FastReads.RATE_BURST], [48, 10]);
   await h.steps(6_000, 100); // 10 minutes in 0.1 s ticks; every read takes no time; spare slots read departments
   const starts = h.asked.map(row => row.at);
   const within = (from, ms) => starts.filter(at => at >= from && at < from + ms).length;
-  assert.ok(starts.length <= 10 + 540 + 1, `${starts.length} reads in 10 minutes`);
-  assert.ok(starts.length >= 480, `the budget is used while something is due (${starts.length})`);
-  assert.ok(starts.every(at => within(at, 60_000) <= 10 + 54), 'any minute: the budget plus the 10-read lead');
+  assert.ok(starts.length <= 10 + 480 + 1, `${starts.length} reads in 10 minutes`);
+  assert.ok(starts.length >= 430, `the budget is used while something is due (${starts.length})`);
+  assert.ok(starts.every(at => within(at, 60_000) <= 10 + 48), 'any minute: the budget plus the 10-read lead');
   // Once the lead is spent, the reads are paced evenly rather than in bursts.
-  assert.ok(starts.filter(at => at >= 1_000_000 + 60_000).every(at => within(at, 60_000) <= 55), 'steady minutes');
+  assert.ok(starts.filter(at => at >= 1_000_000 + 60_000).every(at => within(at, 60_000) <= 49), 'steady minutes');
   const spacing = starts.slice(1).map((at, index) => at - starts[index]);
   assert.ok(spacing.every(gap => gap >= h.FastReads.MIN_SPACING_MS), 'the spacing still holds');
   assert.ok(gaps(h.asked, 'value:1').slice(2).every(gap => gap <= 12_500), 'price_high page 1 keeps its 10 s');

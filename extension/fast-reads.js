@@ -2,26 +2,45 @@
 // scrolling: the server-rendered page already carries its 40 items as data.
 // One Walmart request at a time; a read starts 0.5-0.9 s after the previous
 // start and at least 0.1 s after the previous read finished; its upload goes on
-// in the background (since Nov 23, see below). Never more than 54 reads a
-// minute on average: ~50 at Nov 19-23 read durations. Back to 2.5-2.9 s, with
-// no hot search and no new80 read, for a day after any bot-check sign.
+// in the background (since Nov 23, see below). Never more than 48 reads a
+// minute on average (54 until Nov 26): ~48 at Nov 23-25 read durations. Back to
+// 2.5-2.9 s, with no hot search and no new80 read, for a day after any bot-check sign.
 // Each step reads the most important target that is due; a lower rank always
 // goes first:
 //   0  sort=price_high page 1 every 10 s (first of all), every other page holding $80+ items
-//      every 30 s (the owner's two most valuable reads); the min_price=79 list
-//      (about 8 pages), each page holding an $80+ offer every 40 s, the rest
-//      every 3 min; the same list newest first (new80), page 1 every 40 s; the
-//      12 hot searches (page 1) every 48 s
-//   1  the slow, fixed checks: sort=new page 1 (5 min) and member request
+//      every 30 s (the owner's two most valuable reads), the page after them
+//      while it holds none every 2 min; the min_price=79 list (about 8 pages),
+//      each page holding an $80+ offer every 40 s, the rest every 3 min; the
+//      same list newest first (new80), page 1 every 40 s; the 13 hot searches
+//      (page 1) every 48 s
+//   1  the slow, fixed checks: sort=new page 1 (30 min) and member or priority
 //      searches that had no products at their last read (30 min)
-//   2  member request searches with products (page 1, every 4 min at best):
+//   2  member request searches with products (page 1, every 4 min at best) and
+//      the owner's priority searches with products (every 12 min at best):
 //      they take every read the ranks above leave
-//   3  price_high pages down to $40 (one top-down pass), priority searches,
-//      search pages 2-3
+//   3  price_high pages down to $40 (one top-down pass), search pages 2-3
 //   4  sort=new pages 2-4
 //   5  department pages, deepest first, only in slots nothing above needs
 // Within a rank, a page re-read to settle a held restock goes first, then the
 // target most overdue for its own interval.
+// Nov 26 (2.32.9, owner-approved, same read load; data/opt-20261126/REPORT.md).
+// Page snapshot log, 52 h after the 2.32.8 reload: 90 of 96 new $80+ items surely
+// on time (93.8%); every item a catalogue list showed within 60 s was. The 6 late
+// ones came from slow member searches and tabs while every list lagged 3-31 min,
+// so no faster list read would have saved them; a replay of the hot-search rule
+// on the log gives 90/96 at 12, 18 or 22 places (the misses are one-off words).
+// Four changes: (1) priority searches share rank 2 with member searches (at rank
+// 3 they had no read at all from Nov 22 23:45; in Nov 19-22 they had the best
+// at-risk $80+ yield per read of any search group); (2) 'furniture', an owner
+// priority word, is a pinned hot seed and HOT_SIZE is 13 (its page 1 held ~50%
+// of what 17 narrower furniture searches showed; furniture was 10 of the 38 late
+// $80+ items in 147 h); (3) the price_high page after the $80+ block (page 4,
+// max $79.99) every 2 min, not 30 s (no new $80+ item first there in 147 h; the
+// min_price=79 list holds every $80+ offer at 40 s) and sort=new every 30 min,
+// not 5 (no $80+ item first in 147 h); (4) 'bicycle' is never hot (it showed
+// the same $80+ items as 'bike' every time). Read budget 54 -> 48 a minute, so
+// the shorter search reads that replace price_high reads cannot raise the load:
+// simulated 48.3 -> 48.0 direct reads a minute (data/opt-20261126/cadence_sim.mjs).
 // Nov 23, the "90% on time" plan (owner-approved; 2.32.8). Page snapshot log,
 // 95 h to Nov 23 (data/freshness-20261119/analysis_96h.txt, delay_bounds.py):
 // 173 new $80+ items; 138 (80%) were surely on time (first sighting minus the
@@ -52,9 +71,9 @@
 // as unchanged; a held restock brings its page back 10 s later). While any
 // upload is unanswered no page counts as unchanged, as its holds are not known
 // yet. With 3 unanswered, the next read waits for the oldest.
-// Budget: a token bucket of 54 reads a minute, 10 ahead at most, so the rate
-// cannot climb past the owner's budget if Walmart answers faster (it would
-// reach ~66 a minute at 30% faster answers with the 0.5 s spacing alone).
+// Budget: a token bucket of 54 reads a minute (48 since Nov 26), 10 ahead at
+// most, so the rate cannot climb past the owner's budget if Walmart answers
+// faster (it would reach ~66 a minute at 30% faster answers with the 0.5 s spacing alone).
 // Hot searches (Nov 19, owner-approved, about +6 reads a minute): in 72 hours,
 // 46 new $80+ items (29%) showed in a keyword search minutes before the
 // price_high and min_price=79 lists did (median 8.4 min; 19 never reached them).
@@ -128,11 +147,12 @@ const ReviewerFastReads = (() => {
   // Between read starts, plus up to SPACING_JITTER_MS (1_400 until Nov 19, 1_050 until Nov 23).
   const MIN_SPACING_MS = 500;
   // And never more than RATE_PER_MINUTE on average, however fast Walmart answers:
-  // the owner's Nov 23 budget. A token bucket: one token per read, refilled at
-  // that rate, holding at most RATE_BURST, so a run of quick answers may run
-  // ahead a little and a sustained one is paced evenly (reads, not the spacing,
-  // set the pace now: ~50 a minute at Nov 19-23 response times).
-  const RATE_PER_MINUTE = 54;
+  // the owner's budget (54 from Nov 23; 48 since Nov 26, so 2.32.9's shorter
+  // search reads cannot raise the load above 2.32.8's ~48). A token bucket: one
+  // token per read, refilled at that rate, holding at most RATE_BURST, so a run
+  // of quick answers may run ahead a little and a sustained one is paced evenly
+  // (reads, not the spacing, set the pace: ~48 a minute at Nov 23-25 response times).
+  const RATE_PER_MINUTE = 48;
   const RATE_BURST = 10;
   // Uploads still waiting for the notifier's answer; one more read waits for the
   // oldest (Nov 23: reads no longer wait for their own upload, see the header).
@@ -170,9 +190,15 @@ const ReviewerFastReads = (() => {
   const SECOND = 1_000;
   const MINUTE = 60_000;
   // Hot searches (see the header): seeds, set size, scoring and storage bounds.
-  const HOT_SEEDS = Object.freeze(['chair', 'ktaxon', 'sofa', 'tablet', 'trampoline', 'rack']);
+  // 'furniture' since Nov 26 (the owner's priority word; data/opt-20261126/REPORT.md).
+  const HOT_SEEDS = Object.freeze(['chair', 'ktaxon', 'sofa', 'tablet', 'trampoline', 'rack', 'furniture']);
+  // Pinned: always hot, whatever its score (never swapped out); counts toward HOT_SIZE.
+  const HOT_PINNED = Object.freeze(['furniture']);
+  // Never hot (still read on its normal member cadence): 'bicycle' showed the same
+  // $80+ items as 'bike' every time, Nov 19-25, so it only doubled those reads.
+  const HOT_EXCLUDED = Object.freeze(['bicycle']);
   const HOT_KEY = 'reviewerHotSearches';
-  const HOT_SIZE = 12; // 6 until Nov 23.
+  const HOT_SIZE = 13; // 6 until Nov 23, 12 until Nov 26.
   const HOT_HALF_LIFE_MS = 3 * 24 * 60 * MINUTE;
   const HOT_PRIOR = 2; // A seed starts as if it had surfaced two new $80+ items.
   const HOT_SWAP_RATIO = 1.25; // A newcomer must score above the weakest hot search x 1.25 + 0.5,
@@ -183,17 +209,21 @@ const ReviewerFastReads = (() => {
   const HOT_MIN_SCORE = 0.01; // A forgotten search's score below this is dropped.
   const HOT_SAVE_MS = MINUTE; // Memory-only changes are saved at most this often.
   const INTERVALS = Object.freeze({
-    // price_high page 1 every 10 s; its other $80+ pages every 30 s (20 s until Nov 23).
-    value: Object.freeze([10 * SECOND]), valueHigh: 30 * SECOND, valueDeep: 4 * MINUTE,
+    // price_high page 1 every 10 s; its other $80+ pages every 30 s (20 s until Nov 23);
+    // the page after them, read only in case an $80+ item spills onto it, every
+    // 2 min while it holds none (30 s until Nov 26).
+    value: Object.freeze([10 * SECOND]), valueHigh: 30 * SECOND, valueSpill: 2 * MINUTE, valueDeep: 4 * MINUTE,
     // Hot searches every 48 s (60 s until Nov 23); sort=new&min_price=79 page 1 every 40 s.
     value80: 40 * SECOND, value80Idle: 3 * MINUTE, hot: 48 * SECOND, new80: 40 * SECOND,
-    // Searches with products aim at 4 min and get whatever reads are left over;
-    // searches empty at their last read (member or priority) wait 30 min.
+    // Searches with products aim at 4 min (priority searches 12 min, both rank 2
+    // since Nov 26) and get whatever reads are left over; searches empty at their
+    // last read (member or priority) wait 30 min.
     member: 4 * MINUTE, memberEmpty: 30 * MINUTE, priority: 12 * MINUTE,
     // Later pages of a search: members 12 min, broad priority searches 24 min
     // (pages 2-3 found no item worth $40 or more on Nov 10-12).
     memberPages: 12 * MINUTE, priorityPages: 24 * MINUTE,
-    newest: Object.freeze([5 * MINUTE, 15 * MINUTE, 15 * MINUTE, 15 * MINUTE])
+    // sort=new: every 30 min (page 1 every 5 min until Nov 26: no $80+ item first in 147 h).
+    newest: Object.freeze([30 * MINUTE, 30 * MINUTE, 30 * MINUTE, 30 * MINUTE])
   });
   // Ranks; a lower rank always goes first (see the list above).
   const RANK = Object.freeze({ valueTop: -1, value: 0, slow: 1, member: 2, deep: 3, newestDeep: 4, department: 5 });
@@ -277,7 +307,8 @@ const ReviewerFastReads = (() => {
 
   function create(chrome, { tabIds, send, paused, diagnostic, queries = async () => [], departments = async () => [],
     onBlocked = async () => {}, mustSend = () => false, setTimer = setTimeout, clearTimer = clearTimeout,
-    random = Math.random, hotSeeds = HOT_SEEDS, snapshot = () => {} }) {
+    random = Math.random, hotSeeds = HOT_SEEDS, hotPinned = HOT_PINNED, hotExcluded = HOT_EXCLUDED,
+    snapshot = () => {} }) {
     let timer = null;
     let running = false;
     let lastStartAt = 0;
@@ -296,6 +327,8 @@ const ReviewerFastReads = (() => {
     // Deepest price_high page of the main $80+ block, and the last page the
     // slower pass reads (the first one without a $40+ item ends it).
     const value = { high: 4, deep: 4 };
+    // price_high pages whose last read held no $80+ item (the spill check after the block).
+    const valueSpill = new Set();
     // The min_price=79 list: its page count, and the pages holding an $80+ offer
     // (in stock or awaiting a restock) at their last read.
     const value80 = { pages: 8, hot: new Set([1, 2, 3, 4, 5, 6, 7, 8]) };
@@ -312,7 +345,12 @@ const ReviewerFastReads = (() => {
     // in the order they joined) and when the state was last saved.
     const hot = { loading: null, scores: new Map(), memory: new Map(), set: [], dirty: false, savedAt: 0,
       candidates: null };
-    const seeds = (Array.isArray(hotSeeds) ? hotSeeds : []).filter(query => typeof query === 'string' && query.trim());
+    const queryList = list => (Array.isArray(list) ? list : [])
+      .filter(query => typeof query === 'string' && query.trim());
+    const seeds = queryList(hotSeeds);
+    // Pinned searches are candidates like seeds; excluded ones are never hot.
+    const pinned = [...new Set(queryList(hotPinned).map(query => searchKey(query)))];
+    const excluded = new Set(queryList(hotExcluded).map(query => searchKey(query)));
     // Freshness probes: when a catalogue list last showed each item, each
     // min_price=79 page's core price span and last read, the running probes and
     // the persisted caps (extra-read and start times of the last day, items probed).
@@ -332,7 +370,8 @@ const ReviewerFastReads = (() => {
       // Page 1 has a rank of its own: nothing, not even a batch of new targets, goes ahead of it.
       const targets = Array.from({ length: value.high }, (_, index) => ({ key: `value:${index + 1}`,
         lane: 'value', page: index + 1, rank: index ? RANK.value : RANK.valueTop,
-        interval: INTERVALS.value[index] ?? INTERVALS.valueHigh }));
+        interval: INTERVALS.value[index] ??
+          (valueSpill.has(index + 1) ? INTERVALS.valueSpill : INTERVALS.valueHigh) }));
       for (let page = 1; page <= value80.pages; page += 1) {
         targets.push({ key: `value80:${page}`, lane: 'value80', page, rank: RANK.value,
           interval: value80.hot.has(page) ? INTERVALS.value80 : INTERVALS.value80Idle });
@@ -439,14 +478,33 @@ const ReviewerFastReads = (() => {
     // weakest place only when it scores above HOT_SWAP_RATIO x that + HOT_SWAP_MARGIN
     // (ties keep the current members); a free place needs HOT_SWAP_MARGIN. All
     // scores decay alike, so the order changes only when a search finds something.
+    // Pinned searches always hold a place (never the weakest); excluded ones never get one.
     function reviewHot(candidates, now) {
       hot.candidates = candidates;
       const score = key => decayed(hot.scores.get(key), now);
-      const kept = hot.set.filter(key => candidates.has(key));
-      let changed = kept.length !== hot.set.length;
+      const pins = pinned.filter(key => candidates.has(key) && !excluded.has(key)).slice(0, HOT_SIZE);
+      const allowed = key => candidates.has(key) && !excluded.has(key);
+      const kept = hot.set.filter(allowed);
+      for (const key of pins) if (!kept.includes(key)) kept.push(key);
+      // Weakest place a newcomer could take (pinned ones excepted); on a tie, the latest to join.
+      const weakest = () => {
+        let index = -1;
+        let low = Infinity;
+        kept.forEach((member, at) => {
+          if (pins.includes(member)) return;
+          const current = score(member);
+          if (current <= low) { low = current; index = at; }
+        });
+        return { index, low };
+      };
+      while (kept.length > HOT_SIZE) {
+        const { index } = weakest();
+        if (index < 0) break;
+        kept.splice(index, 1);
+      }
       const others = [];
       for (const key of candidates.keys()) {
-        if (!hot.scores.has(key) || kept.includes(key)) continue;
+        if (!hot.scores.has(key) || kept.includes(key) || !allowed(key)) continue;
         const value = score(key);
         if (value >= HOT_SWAP_MARGIN) others.push({ key, value });
       }
@@ -454,20 +512,14 @@ const ReviewerFastReads = (() => {
       for (const { key, value } of others) {
         if (kept.length < HOT_SIZE) {
           kept.push(key);
-          changed = true;
           continue;
         }
-        let weakest = 0;
-        let low = Infinity;
-        kept.forEach((member, index) => {
-          const current = score(member);
-          if (current <= low) { low = current; weakest = index; } // On a tie, the latest to join.
-        });
-        if (!(value > low * HOT_SWAP_RATIO + HOT_SWAP_MARGIN)) break; // Later ones score lower still.
-        kept.splice(weakest, 1);
+        const { index, low } = weakest();
+        if (index < 0 || !(value > low * HOT_SWAP_RATIO + HOT_SWAP_MARGIN)) break; // Later ones score lower still.
+        kept.splice(index, 1);
         kept.push(key);
-        changed = true;
       }
+      const changed = kept.length !== hot.set.length || kept.some((key, index) => key !== hot.set[index]);
       if (changed) {
         hot.set = kept;
         hot.dirty = true;
@@ -477,9 +529,10 @@ const ReviewerFastReads = (() => {
     }
 
     // Member searches first: they become personal DMs. A query in both lists
-    // counts as a member search. A hot seed in neither list is read only while
-    // hot, page 1, as a priority search numbered after the owner's list. A hot
-    // search keeps its target (and so its last read): it is read sooner, never twice.
+    // counts as a member search. A hot seed (or pinned search) in neither list is
+    // read only while hot, page 1, as a priority search numbered after the
+    // owner's list. A hot search keeps its target (and so its last read): it is
+    // read sooner, never twice.
     // While the gentler pace after a bot-check sign is on, no search is hot.
     async function searchTargets(now, slow = false) {
       await loadHot();
@@ -496,6 +549,7 @@ const ReviewerFastReads = (() => {
       members.forEach((query, index) => add(query, index + 1, 'requests'));
       priority.forEach((query, index) => add(query, index + 1, 'priority'));
       seeds.forEach((query, index) => add(query, priority.length + index + 1, 'priority', true));
+      pinned.forEach((query, index) => add(query, priority.length + seeds.length + index + 1, 'priority', true));
       const hotKeys = reviewHot(candidates, now);
       const targets = [];
       for (const [key, { query, index, lane, seed }] of candidates) {
@@ -505,10 +559,12 @@ const ReviewerFastReads = (() => {
           targets.push({ key: `search:${key}:1`, lane, page: 1, query, index, hot: true, rank: RANK.value,
             interval: INTERVALS.hot });
         } else if (!seed) {
-          // An empty member search keeps its slow 30-minute check ahead of the
-          // searches with products, which share every read left after it.
+          // An empty member or priority search keeps its slow 30-minute check
+          // ahead of the searches with products, which share every read left
+          // after it (priority searches at rank 3 until Nov 26: starved, no
+          // read at all from Nov 22 23:45 to the 2.32.9 reload).
           targets.push({ key: `search:${key}:1`, lane, page: 1, query, index,
-            rank: !member ? RANK.deep : info?.empty ? RANK.slow : RANK.member,
+            rank: info?.empty ? RANK.slow : RANK.member,
             interval: info?.empty ? INTERVALS.memberEmpty : member ? INTERVALS.member : INTERVALS.priority });
         }
         if (seed) continue;
@@ -584,6 +640,8 @@ const ReviewerFastReads = (() => {
       if (reply.items.length && !values.length) return; // No prices to judge by.
       const holds = floor => values.some(price => price >= floor);
       const high = values.filter(price => price >= VALUE_FLOOR).length;
+      if (high) valueSpill.delete(page);
+      else valueSpill.add(page);
       // A lone $80+ offer far below the block does not drag the pages between
       // into the fast zone: the min_price=80 list carries such offers.
       if (page <= value.high + 1) {
@@ -1204,6 +1262,6 @@ const ReviewerFastReads = (() => {
 
   return { create, urlFor, searchHash, queryHash, rowsOf, SORTS, INTERVALS, RECHECK_MS, MIN_SPACING_MS,
     SAFE_SPACING_MS, STEP_MS, RATE_PER_MINUTE, RATE_BURST, MAX_UPLOADS, SPACING_JITTER_MS,
-    VALUE_FLOOR, VALUE_DEEP_FLOOR, VALUE_MAX_PAGES, HOT_SEEDS, HOT_SIZE, HOT_HALF_LIFE_MS,
+    VALUE_FLOOR, VALUE_DEEP_FLOOR, VALUE_MAX_PAGES, HOT_SEEDS, HOT_PINNED, HOT_EXCLUDED, HOT_SIZE, HOT_HALF_LIFE_MS,
     FRESH };
 })();

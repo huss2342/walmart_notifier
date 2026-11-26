@@ -2,6 +2,26 @@
 
 Updated November 12, 2026 (America/Chicago).
 
+## Search optimisation (November 26; extension 2.32.9 reload pending, no backend change)
+
+Study (read-only, data/opt-20261126/REPORT.md): since the 2.32.8 reload 90/96
+new $80+ items surely on time (93.8%). The 6 late ones came from slow member
+searches and tabs while every list lagged 3-31 min; a replay of the hot rule
+gives 90/96 at 12, 18 or 22 places. This commit, at equal load: (1) priority
+searches share rank 2 with member searches (rank 3 starved them: no read since
+Nov 22 23:45); (2) 'furniture' is a seed and pinned hot (HOT_PINNED), HOT_SIZE
+13; (3) the price_high page after the $80+ block (page 4, max $79.99) every 2
+min and sort=new every 30 min; (4) 'bicycle' never hot (HOT_EXCLUDED, same
+items as 'bike'). RATE_PER_MINUTE 54 -> 48 so shorter search reads cannot raise
+the load: simulated 48.3 -> 48.0 direct reads/min (data/opt-20261126/
+cadence_sim.mjs, cadence_sim_2329_out.txt). Costs: member searches with products
+6.5 -> 7.1 min p50; priority searches ~22 min. Expected ~95-96% on time
+(estimate). Owner must reload the extension. 48 h after the reload run
+`python data/opt-20261126/load.py`, then items.py, marginal.py and searches.py
+in the same folder: check furniture finds, priority reads > 0, page 4 still 0
+first finds. Rollback: revert this commit (old scheduler copy in
+data/opt-20261126/before/).
+
 ## General alert forwarding (November 21, 2026; live)
 
 General allows embeds and uploads only for Pro and Pro Trial; Free keeps
