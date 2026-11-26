@@ -10,6 +10,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .api import DiscordError, retry_local_contention
+from .audit_guard import AuditGuard
 from .monitoring import emit_event, error_fields
 from .policy import RETIRED_ROUTE_KEYS
 
@@ -39,13 +40,16 @@ def deliver_due(
     stop_event=None,
     event_sink=None,
     correlation_id=None,
-    audit_cache=None,
-    audit_ttl=0.0,
 ):
     """Send up to `limit` messages; counters distinguish items from messages.
 
-    No fill delay, security cache, timer backdating or provider-limit bypass.
-    The executor never holds more than one active envelope per channel.
+    No fill delay, timer backdating or provider-limit bypass. The executor
+    never holds more than one active envelope per channel.
+
+    The privacy audit is advisory (audit_guard.py): findings and audit errors
+    emit ``privacy_warning`` and sending continues. Pass a shared AuditGuard
+    as ``auditor`` to cache it across calls; a plain auditor (or None) gets a
+    guard for this call, so it runs at most once per call.
     """
     result = {
         "sent": 0,
@@ -123,10 +127,7 @@ def deliver_due(
     if not store.has_due(now=current()) or next_wait() > 0:
         result["wait_seconds"] = max(0.01, next_wait())
         return result
-    if auditor is None:
-        from .provision import audit
-
-        auditor = audit
+    guard = AuditGuard.wrap(auditor, event_sink=event_sink)
 
     def send_batch(batch):
         count = len(batch["jobs"])
@@ -252,46 +253,19 @@ def deliver_due(
             defer_learned_routes()
             if next_wait() > 0 or not store.has_due(now=current()):
                 break
-            # Optional: reuse a recent passing audit (the owner's choice; it
-            # costs ~0.8s of Discord reads per wave). Failures are never cached.
-            if audit_cache is not None and audit_cache.get("until", 0) > time.monotonic():
-                assessment = {"ok": True}
-            else:
-                assessment = None
+            # Never gates sending: on 2026-11-25 a fail-closed audit stopped
+            # every alert for ~80 min over a harmless Server Booster role.
             audit_started = time.monotonic()
             try:
-                if assessment is None:
-                    assessment = auditor(
-                        _AuditClient(client, stopping), state.get("guild_id"), state
-                    )
-                    if audit_cache is not None:
-                        audit_cache.pop("until", None)
-                        if audit_ttl > 0 and assessment.get("ok") is True:
-                            audit_cache["until"] = time.monotonic() + audit_ttl
-            except DiscordError as exc:
-                if exc.status == 429:
-                    delay = exc.retry_after
-                    delay = delay if delay is not None and math.isfinite(delay) else 5
-                    store.defer_global(until=current() + max(0.01, delay))
-                    result["throttled"] += 1
-                    event(
-                        "audit_throttled",
-                        scope="audit",
-                        **error_fields(exc, status=429, retry_after_seconds=max(0.01, delay)),
-                    )
-                else:
-                    result["blocked"] = True
-                    event("privacy_blocked", reason="audit_error",
-                          **error_fields(exc, status=exc.status or 0))
-                break
-            except (ValueError, KeyError, TypeError):
-                assessment = {"ok": False}
+                guard(
+                    _AuditClient(client, stopping),
+                    state.get("guild_id"),
+                    state,
+                    caller="channel",
+                    stop_event=stopping,
+                )
             finally:
                 result["audit_seconds"] += time.monotonic() - audit_started
-            if assessment.get("ok") is not True:
-                result["blocked"] = True
-                event("privacy_blocked", reason="privacy_audit")
-                break
             if stopping.is_set():
                 break
             wave, routes = [], []

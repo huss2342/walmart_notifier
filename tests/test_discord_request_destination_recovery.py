@@ -112,11 +112,13 @@ def test_member_404_remains_unverified_without_changing_dm_readiness(tmp_path, p
     assert provider.messages == []
 
 
-def test_audit_404_preserves_readiness_and_retries_membership_verification(tmp_path):
+def test_audit_404_preserves_readiness_and_never_holds_the_dm(tmp_path):
     def audit(*_args):
         raise DiscordError(status=404, provider_code=10003)
 
+    # 2026-11-25: audit errors only warn; live Pro membership still gates the DM.
     store, _, provider, worker = setup(tmp_path, auditor=audit)
-    assert worker.tick(now=12)["retried"] == 1
+    result = worker.tick(now=12)
+    assert result["sent"] == 1 and result["retried"] == 0
     assert store.dm_status(USER) == "ready"
-    assert provider.messages == []
+    assert len(provider.messages) == 1

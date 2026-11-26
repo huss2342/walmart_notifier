@@ -277,8 +277,17 @@ an exactly-once delivery guarantee.
 Known provider route/global cooldowns are checked before auditing and claiming.
 Frozen-envelope retry lookups use a covering batch index so future Free jobs do
 not make paid claims hold the SQLite writer lock for long scans.
-Every bounded send wave still requires the full privacy audit. Shutdown is
-checked between audit calls and before sending; the HTTP transport has a total
+The runtime privacy audit is advisory and never blocks any sending (channel
+alerts, request DMs, welcomes, membership, startup). On 2026-11-25 a fail-closed
+audit stopped every alert for ~80 minutes over Discord's managed Server Booster
+role. Findings and audit errors now emit a `privacy_warning` event (once per
+distinct finding set, again at most hourly while it persists; `privacy_cleared`
+on recovery) and appear in `/health` under `discord.privacy`. One shared guard
+caches the result, pass or fail, for `DISCORD_AUDIT_TTL_SECONDS` (default 300,
+minimum 60) and audits on its own thread. Extra roles holding only reader bits,
+Add Reactions or bits `@everyone` already has are not findings. The CLI
+`audit` command still reports every finding and exits 2. Shutdown is
+checked before sending; the HTTP transport has a total
 request deadline and never automatically resubmits a write. `/health` separates
 queued item destinations from message count, audit/delivery timing, queue age,
 throttles and recent confirmed delivery. Future tier-delayed work is normal.
@@ -662,8 +671,8 @@ When real account/role tests pass and the collector is ready:
 .venv/Scripts/python.exe -m discord_bridge serve --live
 ```
 
-Only this explicit flag enables sending. The service refuses startup on a failed
-audit and checks permissions again before release batches. Sender retries and
+Only this explicit flag enables sending. A failed startup audit only warns
+(`privacy_warning`); the service still starts and sends. Sender retries and
 Discord rate limits do not change durable release times. Keep the machine awake;
 this does not make the Walmart collector independently hosted.
 

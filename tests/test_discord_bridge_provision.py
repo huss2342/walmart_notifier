@@ -1002,3 +1002,45 @@ def test_everyone_may_hold_add_reactions_only(tmp_path):
     client.roles[0]["permissions"] = str(reactions | CREATE_INVITE)
     provision(client, GUILD, BOT, tmp_path / "fresh.json", apply=True)
     assert client.roles[0]["permissions"] == str(reactions)
+
+
+def test_extra_role_with_harmless_base_permissions_is_not_a_finding(tmp_path):
+    # 2026-11-25: a boost made Discord create its managed Server Booster role
+    # with Add Reactions; the runtime audit flagged it and alerts stopped.
+    reactions, manage_messages = 1 << 6, 1 << 13
+    client, _, state = apply_server(tmp_path)
+    booster = {
+        "id": "300000000000000009",
+        "name": "Server Booster",
+        "permissions": str(reactions),
+        "managed": True,
+        "tags": {"premium_subscriber": None},
+    }
+    client.roles.append(booster)
+    assert audit(client, GUILD, state)["ok"]
+    booster["permissions"] = str(reactions | VIEW | HISTORY)
+    assert audit(client, GUILD, state)["ok"]
+    # Real privileges on an extra role are still reported.
+    booster["permissions"] = str(reactions | manage_messages)
+    result = audit(client, GUILD, state)
+    assert not result["ok"]
+    assert any(booster["id"] in finding for finding in result["findings"])
+
+
+def test_extra_role_may_repeat_everyone_bits_but_setup_cannot_rely_on_them(tmp_path):
+    from discord_bridge.provision import _role_findings, _snapshot
+
+    client, _, state = apply_server(tmp_path)
+    client.roles[0]["permissions"] = str(CREATE_INVITE)
+    client.roles.append(
+        {"id": "300000000000000009", "name": "Extra", "permissions": str(CREATE_INVITE)}
+    )
+    result = audit(client, GUILD, state)
+    # @everyone itself is the finding; the extra role grants nothing more.
+    assert not result["ok"]
+    assert any(GUILD in finding for finding in result["findings"])
+    assert not any("300000000000000009" in finding for finding in result["findings"])
+    # Provisioning resets @everyone, so the same extra role then blocks setup.
+    snapshot = _snapshot(client, GUILD, BOT)
+    blockers = _role_findings(snapshot, state, allow_setup=True, ignore_everyone=True)
+    assert any("300000000000000009" in finding for finding in blockers)

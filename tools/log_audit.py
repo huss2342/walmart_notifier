@@ -74,6 +74,8 @@ EVENTS = frozenset(
         "dispatch_throttled",
         "worker_error",
         "privacy_blocked",
+        "privacy_warning",
+        "privacy_cleared",
         "audit_throttled",
         "queue_summary",
         "delivery_cycle",

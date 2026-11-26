@@ -244,6 +244,20 @@ def _role_findings(
     paid_roles = set(state["roles"].values())
     membership_role_id, membership_findings = _membership_role(snapshot, state)
     findings.extend(membership_findings)
+    # An extra role (e.g. Discord's managed Server Booster role, created with
+    # Add Reactions on 2026-11-25) grants nothing new with reader bits, the
+    # policy's @everyone bits, or bits every member already has via @everyone.
+    # Provisioning (ignore_everyone) is about to reset @everyone, so it cannot
+    # rely on that role's current bits.
+    harmless = READER_PERMISSIONS | EVERYONE_PERMISSIONS
+    if not ignore_everyone:
+        everyone = next((r for r in snapshot["roles"] if r.get("id") == state["guild_id"]), {})
+        try:
+            everyone_bits = int(everyone.get("permissions", "0"))
+        except (TypeError, ValueError):
+            everyone_bits = 0
+        if everyone_bits >= 0 and not everyone_bits & ADMINISTRATOR:
+            harmless |= everyone_bits
     for role in snapshot["roles"]:
         role_id = role["id"]
         try:
@@ -287,7 +301,7 @@ def _role_findings(
         else:
             if role.get("mentionable"):
                 findings.append(f"Role {role_id}: role is mentionable.")
-            if permissions & ~READER_PERMISSIONS:
+            if permissions & ~harmless:
                 findings.append(
                     f"Role {role_id}: unexpected privileged base permissions "
                     "can bypass the intended policy."

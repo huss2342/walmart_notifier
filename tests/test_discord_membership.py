@@ -180,9 +180,19 @@ def test_failed_or_deferred_scan_never_invents_new_subscribers(tmp_path):
     assert advance(worker, clock)["sent"] == 1
 
 
-def test_privacy_audit_failure_blocks_scanning_and_sending(tmp_path):
-    worker, client, _ = make(tmp_path, auditor=lambda *_: {"ok": False})
-    assert worker.tick()["blocked"] and client.calls == []
+def test_privacy_audit_failure_only_warns_and_celebrations_continue(tmp_path):
+    events = []
+    worker, client, clock = make(tmp_path, auditor=lambda *_: {"ok": False})
+    worker.event_sink = worker.auditor.event_sink = (
+        lambda name, **fields: events.append((name, fields))
+    )
+    client.members = [member()]
+    result = worker.tick()
+    assert not result["blocked"] and result["baseline"] and client.calls
+    assert worker.health()["configured"] is True
+    client.members[0] = member(USER, STARTER)
+    assert advance(worker, clock)["sent"] == 1
+    assert [name for name, _ in events].count("privacy_warning") == 1
 
 
 @pytest.mark.parametrize("acknowledged", [False, True])

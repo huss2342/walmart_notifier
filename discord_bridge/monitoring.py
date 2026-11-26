@@ -27,6 +27,9 @@ _EVENTS = {
     "dispatch_failed",
     "dispatch_skipped",
     "privacy_blocked",
+    # Advisory audit (audit_guard.py): findings/errors warn, never block.
+    "privacy_warning",
+    "privacy_cleared",
     "audit_throttled",
     "worker_error",
     "queue_summary",
@@ -163,6 +166,7 @@ _NUMBERS = {
     "unavailable",
     "value_missing",
     "searched",
+    "findings_count",
 }
 _ENUMS = {
     "component": {"channel", "personal", "request-runtime", "gateway", "welcome", "membership",
@@ -214,6 +218,9 @@ _ENUMS = {
                "request-runtime", "other"},
     "method": {"GET", "POST", "PATCH", "PUT", "DELETE"},
 }
+# Audit findings are fixed sentences written by provision.py with role/channel
+# snowflakes; anything else in them is masked rather than logged.
+_FINDING_UNSAFE = re.compile(r"[^A-Za-z0-9 .,:;'()/_+\-]")
 _ENDPOINT = re.compile(r"(?:/(?:[a-z@-]{1,32}|\{[a-z_]{1,20}\}))+")
 
 # Derive result names from trusted numeric SQLite constants, never from an
@@ -548,6 +555,12 @@ class DeliveryMonitor:
                     for item in value[:maximum]
                     if isinstance(item, str) and re.fullmatch(pattern, item)
                 ]
+            elif key == "findings" and isinstance(value, list):
+                row[key] = [
+                    _FINDING_UNSAFE.sub("?", item)[:240]
+                    for item in value[:20]
+                    if isinstance(item, str)
+                ]
             elif key == "value_cents" and isinstance(value, list):
                 row[key] = [item if item is None or _number(item) else None for item in value[:10]]
             elif key == "queue":
@@ -571,7 +584,8 @@ class DeliveryMonitor:
             if event in {"worker_error", "dispatch_failed", "privacy_blocked", "welcome_error",
                          "referral_error", "pro_access_error", "free_role_error"}:
                 level = logging.ERROR
-            elif event in {"dispatch_retry", "dispatch_throttled", "audit_throttled"}:
+            elif event in {"dispatch_retry", "dispatch_throttled", "audit_throttled",
+                           "privacy_warning"}:
                 level = logging.WARNING
             log.log(level, encoded.decode().rstrip())
         return True

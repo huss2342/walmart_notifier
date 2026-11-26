@@ -15,6 +15,7 @@ import threading
 from pathlib import Path
 
 from .api import DiscordClient, DiscordError
+from .audit_guard import AuditGuard
 from .core import JobStore, render_message, route_keys, validate_batch
 from .elite_signal import EliteSignal
 from .monitoring import DeliveryMonitor, emit_event
@@ -187,33 +188,11 @@ def main(argv=None) -> int:
         monitor = DeliveryMonitor(store.path.parent, entry_point="standalone_worker")
         state = read_state(args.state) if args.live else {}
         client = DiscordClient(os.environ.get("DISCORD_BOT_TOKEN", "")) if args.live else None
+        # Advisory only (audit_guard.py): findings or an audit error at startup
+        # emit privacy_warning and the worker still starts and sends.
+        audit_guard = AuditGuard(event_sink=monitor.emit)
         if args.live:
-            from .provision import audit
-
-            try:
-                assessment = audit(client, state["guild_id"], state)
-            except (DiscordError, ValueError, KeyError, TypeError, OSError) as exc:
-                emit_event(
-                    monitor.emit,
-                    "privacy_blocked",
-                    reason="audit_error",
-                    phase="audit",
-                    error_type=type(exc).__name__,
-                    status=getattr(exc, "status", None) or 0,
-                )
-                monitor.heartbeat(store, force=True)
-                print(
-                    json.dumps({"error": "Startup audit failed; queued jobs retained"}),
-                    file=sys.stderr,
-                )
-                return 2
-            if assessment.get("ok") is not True:
-                emit_event(monitor.emit, "privacy_blocked", reason="privacy_audit", phase="audit")
-                monitor.heartbeat(store, force=True)
-                print(
-                    json.dumps({"error": "Permission audit failed; sending refused", **assessment})
-                )
-                return 2
+            audit_guard(client, state.get("guild_id"), state, caller="channel")
         stopping, waking = threading.Event(), threading.Event()
         server = make_server(
             store,
@@ -239,6 +218,7 @@ def main(argv=None) -> int:
                         live=True,
                         stop_event=stopping,
                         event_sink=monitor.emit,
+                        auditor=audit_guard,
                     )
                     wait_seconds = result["wait_seconds"]
                 except Exception as exc:
@@ -264,6 +244,7 @@ def main(argv=None) -> int:
                 token=os.environ.get("DISCORD_BOT_TOKEN", ""),
                 stop_event=stopping,
                 event_sink=monitor.emit,
+                auditor=audit_guard,
             )
             requests_runtime.start()
         if args.live:

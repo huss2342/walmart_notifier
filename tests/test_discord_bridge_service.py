@@ -113,16 +113,21 @@ class FakeClient:
         return {"id": "123456789012345678"}
 
 
-def test_worker_defaults_to_preview_and_fails_closed_on_audit(tmp_path):
+def test_worker_defaults_to_preview_and_a_failed_audit_only_warns(tmp_path):
     store = JobStore(tmp_path / "worker.sqlite3")
     store.record(
         [normalize_item({"item_id": "ip-20449164214", "title": "Audio", "value_usd": 29.99})],
         now=1000,
     )
     client = FakeClient()
-    state = {"guild_id": "123456789012345678", "channels": {}}
+    routes = ["pro-all", "type-other", "price-20-40", "starter-items"]
+    state = {
+        "guild_id": "123456789012345678",
+        "channels": {route: str(100000000000000000 + index) for index, route in enumerate(routes)},
+    }
     assert deliver_due(store, client, state, now=1000)["sent"] == 0
     assert not client.sent
+    events = []
     result = deliver_due(
         store,
         client,
@@ -130,9 +135,14 @@ def test_worker_defaults_to_preview_and_fails_closed_on_audit(tmp_path):
         live=True,
         now=1000,
         auditor=lambda *_args: {"ok": False, "findings": ["leak"]},
+        event_sink=lambda name, **fields: events.append((name, fields)),
     )
-    assert result["blocked"] and not client.sent
-    assert store.counts() == {"pending": 4}
+    # 2026-11-25: audit findings never stop delivery; the owner gets a warning.
+    assert result["blocked"] is False and len(client.sent) == 3
+    assert [name for name, _ in events].count("privacy_blocked") == 0
+    warnings = [fields for name, fields in events if name == "privacy_warning"]
+    assert len(warnings) == 1 and warnings[0]["findings"] == ["leak"]
+    assert warnings[0]["blocked"] is False
 
 
 def test_worker_rate_limit_retry_and_price_update_cannot_leak_starter(tmp_path):

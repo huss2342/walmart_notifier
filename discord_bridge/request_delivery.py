@@ -10,6 +10,7 @@ import time
 import uuid
 
 from .api import DeliveryOutcome, DiscordError
+from .audit_guard import AuditGuard
 from .monitoring import emit_event, error_fields
 from .payload_limits import payload_problems
 from .request_render import product_link, render_bundle_message, render_request_message
@@ -51,7 +52,7 @@ def _size_rejected(exc):
 class RequestWorker:
     """At most one member/product per cycle, with no public fallback.
 
-    An optional startup/readiness auditor can block sends. Live Pro membership
+    An optional privacy auditor only warns (audit_guard.py). Live Pro membership
     is always fetched immediately before the product POST; cached celebration
     state and the Gateway interaction's roles never authorize this worker.
     """
@@ -62,7 +63,10 @@ class RequestWorker:
         trial_store=None,
     ):
         self.client, self.state, self.store = client, state, store
-        self.enabled, self.auditor, self.event_sink = bool(enabled), auditor, event_sink
+        self.enabled, self.event_sink = bool(enabled), event_sink
+        self.auditor = (
+            AuditGuard.wrap(auditor, event_sink=event_sink) if auditor is not None else None
+        )
         self.stop_event = stop_event if stop_event is not None else threading.Event()
         self.guild = state.get("guild_id")
         self.pro = state.get("roles", {}).get("pro")
@@ -390,13 +394,11 @@ class RequestWorker:
             self._event("dispatch_claimed", phase="claim")
             phase = "audit"
             if self.auditor is not None:
-                assessment = self.auditor(self.client, self.guild, self.state)
-                if not isinstance(assessment, dict) or assessment.get("ok") is not True:
-                    self.store.retry(job, now=current(), delay=30, reason="privacy_audit")
-                    self._last_error = "privacy_audit"
-                    result["blocked"] += 1
-                    self._event("privacy_blocked", phase=phase, reason="privacy_audit")
-                    return result
+                # Advisory: findings/errors warn; the DM is still sent.
+                self.auditor(
+                    self.client, self.guild, self.state,
+                    caller="personal", stop_event=self.stop_event,
+                )
             # Reject known former members before even opening a private channel.
             phase = "member"
             try:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
+from .audit_guard import AuditGuard
 from .monitoring import emit_event, error_fields
 from .request_setup import request_audit
 from .request_store import RequestStore
@@ -28,17 +29,25 @@ class RequestRuntime:
     ):
         self.client, self.state, self.path, self.token = client, state, path, token
         self.release_hook = release_hook
-        self.auditor, self.event_sink = auditor, event_sink
+        self.event_sink = event_sink
         self._worker_factory, self._gateway_factory = worker_factory, gateway_factory
         self.referral_handler = referral_handler
         self._external_stop = stop_event
         self._stop = threading.Event()
+        # Advisory (audit_guard.py): a finding or audit error warns and the
+        # request feature starts anyway; it is never a readiness gate.
+        self.auditor = AuditGuard.wrap(
+            auditor if auditor is not None else self._request_audit, event_sink=event_sink
+        )
         self._thread = None
         self.worker = self.gateway = None
         self.trials = None
         self._ready = False
         self._error = None
         self._reported_error = None
+
+    def _request_audit(self, client, _guild_id, state):
+        return request_audit(client, state, stop_event=self._stop)
 
     def search_queries(self):
         """Only an audited, running request service supplies scanner work."""
@@ -59,7 +68,7 @@ class RequestRuntime:
         )
 
     def prepare(self):
-        """Audit and start once; failures disable this feature, retaining feeds."""
+        """Start once; setup failures disable this feature, retaining feeds."""
         if self._stopped():
             return False
         if self._ready:
@@ -73,15 +82,10 @@ class RequestRuntime:
                 self._error = "configuration"
                 self._report_error(self._error)
                 return False
-            assessment = (
-                self.auditor(self.client, self.state["guild_id"], self.state)
-                if self.auditor is not None
-                else request_audit(self.client, self.state, stop_event=self._stop)
+            self.auditor(
+                self.client, self.state["guild_id"], self.state,
+                caller="request-runtime", stop_event=self._stop,
             )
-            if not isinstance(assessment, dict) or assessment.get("ok") is not True:
-                self._error = "privacy_audit"
-                self._report_error(self._error)
-                return False
             if self._stopped():
                 return False
             from .request_commands import RequestGateway

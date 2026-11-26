@@ -17,6 +17,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from discord_bridge.api import DiscordClient, DiscordError
+from discord_bridge.audit_guard import AuditGuard
 from discord_bridge.classification import classify_product
 from discord_bridge.core import JobStore, normalize_item
 from discord_bridge.elite_signal import EliteSignal
@@ -157,7 +158,6 @@ class DiscordNotifier:
         self.client = client
         self.state = state or {}
         self.live = live
-        self.auditor = auditor
         self.last_diagnostic = (
             "Discord delivery enabled." if live else "Discord preview: sending OFF."
         )
@@ -179,16 +179,23 @@ class DiscordNotifier:
             "recovered_at": None,
         }
         self._poll_started_monotonic = None
-        # Discord roles already keep non-Pro members out of Pro channels. The
-        # permission audit is a backstop for misconfiguration, so a passing
-        # result is reused for this long instead of re-reading the server
-        # before every delivery wave (that read was ~half of alert latency).
-        self.audit_ttl = _env_seconds("DISCORD_AUDIT_TTL_SECONDS", 600)
-        self._audit_cache = {}
         # A live bot writes its receipts from a background thread, so intake,
         # dispatches and Discord calls never wait on the (slow) log disk.
         self.monitor = DeliveryMonitor(
             private, entry_point="collector_worker",
+            background=live and isinstance(client, DiscordClient),
+        )
+        # Discord roles and channel overwrites are the access control. The
+        # permission audit only warns the owner (privacy_warning, /health
+        # discord.privacy) and never blocks any worker: on 2026-11-25 a
+        # fail-closed audit stopped every alert for ~80 min. One guard serves
+        # every worker, caching pass, findings and errors alike for the TTL;
+        # a live bot audits on its own thread, so no send waits on it.
+        self.audit_ttl = max(60.0, _env_seconds("DISCORD_AUDIT_TTL_SECONDS", 300))
+        self.audit_guard = AuditGuard.wrap(
+            auditor,
+            ttl=self.audit_ttl,
+            event_sink=self.monitor.emit,
             background=live and isinstance(client, DiscordClient),
         )
         # New/restocked in-stock items also go to the owner's auto-claim service
@@ -211,7 +218,7 @@ class DiscordNotifier:
                 self.state,
                 welcome_path or self.store.path.parent / "welcome.sqlite3",
                 enabled=True,
-                auditor=self.auditor,
+                auditor=self.audit_guard,
                 stop_event=self._stop,
                 paid_due=self._paid_due,
                 event_sink=self.monitor.emit,
@@ -225,7 +232,7 @@ class DiscordNotifier:
                 self.state,
                 membership_path or self.store.path.parent / "membership.sqlite3",
                 enabled=True,
-                auditor=self.auditor,
+                auditor=self.audit_guard,
                 stop_event=self._stop,
                 paid_due=self._paid_due,
                 event_sink=self.monitor.emit,
@@ -261,7 +268,7 @@ class DiscordNotifier:
                 self.state,
                 self.store.path,
                 token=requests_token or "",
-                auditor=self.auditor,
+                auditor=self.audit_guard,
                 stop_event=self._stop,
                 event_sink=self.monitor.emit,
                 release_hook=self._wake.set,
@@ -420,19 +427,19 @@ class DiscordNotifier:
                 self.client,
                 self.state,
                 live=self.live,
-                auditor=self.auditor,
+                auditor=self.audit_guard,
                 stop_event=self._stop,
                 event_sink=self.monitor.emit,
-                audit_cache=self._audit_cache,
-                audit_ttl=self.audit_ttl,
             )
         finally:
             self.monitor.heartbeat(self.store)
+        privacy = self.audit_guard.status()
         with self._lock:
             self._last_delivery = result
-            if result["blocked"]:
+            if self.live and privacy["findings_count"]:
                 self.last_diagnostic = (
-                    "Discord sending blocked by the privacy audit; queued items retained."
+                    "Discord delivery enabled; privacy audit warning "
+                    "(see /health discord.privacy)."
                 )
             elif self.live:
                 self.last_diagnostic = "Discord delivery enabled."
@@ -585,6 +592,8 @@ class DiscordNotifier:
             if self.back_again is not None
             else {"enabled": False},
             "pruning": self.pruner.health() if self.pruner is not None else {"enabled": False},
+            # Advisory permission audit: current findings, never a send gate.
+            "privacy": self.audit_guard.status(),
         }
 
     def send(self, item: Item, priority="normal") -> bool:
@@ -595,14 +604,13 @@ class DiscordNotifier:
             or item.item_id not in {"notifier-test", "bot-check", "relay-stale"}
         ):
             return False
-        from discord_bridge.provision import audit
-
         try:
-            assessment = (self.auditor or audit)(
-                self.client, self.state.get("guild_id"), self.state
+            # Advisory only; collector-health is the owner's private channel.
+            self.audit_guard(
+                self.client, self.state.get("guild_id"), self.state, caller="other"
             )
             channel = self.state.get("channels", {}).get("collector-health", "")
-            if assessment.get("ok") is not True or not re.fullmatch(r"\d{17,20}", channel):
+            if not re.fullmatch(r"\d{17,20}", channel):
                 return False
             response = self.client.request(
                 "POST",

@@ -5,6 +5,7 @@ import threading
 
 import pytest
 from discord_bridge.api import DiscordError
+from discord_bridge.audit_guard import AuditGuard
 from discord_bridge.welcome import WelcomeWorker
 
 GUILD = "1700000000000000001"
@@ -145,18 +146,21 @@ def test_bots_self_and_malformed_ids_never_greet(tmp_path, extra):
     assert posts(client) == []
 
 
-def test_paids_audit_failure_and_wrong_system_channel_fail_closed(tmp_path):
+def test_paid_work_defers_audit_findings_only_warn_and_wrong_system_channel_fails_closed(
+    tmp_path,
+):
     busy = [True]
-    worker, client, clock = make(tmp_path, paid=lambda: busy[0])
+    worker, client, clock = make(tmp_path, paid=lambda: busy[0], auditor=lambda *_: {"ok": False})
     assert worker.tick()["deferred"]
     assert client.calls == []
     busy[0] = False
-    worker.auditor = lambda *_: {"ok": False}
-    assert advance(worker, clock)["blocked"]
-    assert client.calls == []
-    worker.auditor = lambda *_: {"ok": True}
+    # 2026-11-25: audit findings never stop welcomes; they only warn.
+    result = advance(worker, clock)
+    assert not result["blocked"] and client.calls
+    assert worker.health()["last_error"] is None
+    worker, client, _ = make(tmp_path / "wrong")
     client.guild["system_channel_id"] = DEST
-    assert advance(worker, clock)["blocked"]
+    assert worker.tick()["blocked"]
     assert worker.health()["last_error"] == "system_channel"
     assert posts(client) == []
 
@@ -423,10 +427,16 @@ def test_notifier_stops_welcome_before_closing_the_shared_client(tmp_path):
     assert closed == [True]
 
 
-def test_idle_polls_skip_the_audit_but_every_send_gets_a_fresh_one(tmp_path):
-    audits = []
+def test_idle_polls_skip_the_audit_and_a_failing_audit_never_blocks_a_send(tmp_path):
+    audits, events = [], []
     verdict = {"ok": True}
-    worker, client, clock = make(tmp_path, auditor=lambda *_: audits.append(clock[0]) or verdict)
+    clock = [((int(EVENT) >> 22) + 1420070400000 + 1) / 1000]
+    guard = AuditGuard(
+        lambda *_: audits.append(clock[0]) or verdict,
+        clock=lambda: clock[0],
+        event_sink=lambda name, **fields: events.append((name, fields)),
+    )
+    worker, client, clock = make(tmp_path, clock=clock, auditor=guard)
     client.source = [join()]
     worker.tick()
     assert len(audits) == 1
@@ -435,11 +445,11 @@ def test_idle_polls_skip_the_audit_but_every_send_gets_a_fresh_one(tmp_path):
     assert len(audits) == 1, "idle polls only read history"
     client.source.append(join(event_id(2)))
     assert advance(worker, clock)["sent"] == 1
-    assert len(audits) == 2 and audits[-1] == clock[0], "the send tick audits first"
+    assert len(audits) == 1, "the send reuses the cached (TTL) audit"
     client.source.append(join(event_id(3), user="1700000000000000009"))
-    verdict = {"ok": False}
+    verdict = {"ok": False, "findings": ["Role 1700000000000000099: privileged."]}
+    clock[0] += 300
     result = advance(worker, clock)
-    assert result["blocked"] and result["sent"] == 0 and len(posts(client)) == 1
-    clock[0] += 600
-    worker.tick()
-    assert len(audits) == 4, "a failed audit is retried, idle audits resume every 10 min"
+    assert len(audits) == 2
+    assert not result["blocked"] and result["sent"] == 1 and len(posts(client)) == 2
+    assert [name for name, _ in events] == ["privacy_warning"]

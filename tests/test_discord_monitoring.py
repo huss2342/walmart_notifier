@@ -229,18 +229,29 @@ def test_permanent_failure_and_privacy_block_are_sanitized(tmp_path):
     failure = next(row for row in records(monitor.path) if row["event"] == "dispatch_failed")
     assert failure["status"] == 403 and failure["reason"] == "http_403"
     store.record([product(2)], now=1000)
+    only_route(store, "pro-all")
     result = deliver_due(
         store,
         Remote(),
         STATE,
         live=True,
         now=1001,
-        auditor=lambda *_: {"ok": False, "findings": ["PRIVATE"]},
+        auditor=lambda *_: {
+            "ok": False,
+            "findings": ["Role 1700000000000000099: bad <@&1> \"PRIVATE\"" + chr(10) + "x"],
+        },
         event_sink=monitor.emit,
     )
-    assert result["blocked"]
-    assert any(row["event"] == "privacy_blocked" for row in records(monitor.path))
-    assert "PRIVATE" not in monitor.path.read_text(encoding="utf-8")
+    # Findings warn the owner and never block (2026-11-25 incident).
+    assert not result["blocked"] and result["sent"] == 1
+    rows = records(monitor.path)
+    assert not any(row["event"] == "privacy_blocked" for row in rows)
+    warning = next(row for row in rows if row["event"] == "privacy_warning")
+    assert warning["reason"] == "privacy_audit" and warning["blocked"] is False
+    assert warning["findings_count"] == 1
+    # Only the allowlisted finding alphabet is written; the rest is masked.
+    assert warning["findings"] == ["Role 1700000000000000099: bad ???1? ?PRIVATE??x"]
+    assert '"PRIVATE"' not in monitor.path.read_text(encoding="utf-8")
 
 
 def test_broken_event_sink_cannot_turn_a_successful_send_into_a_retry(tmp_path):
@@ -306,14 +317,32 @@ def test_idle_collector_emits_persistent_heartbeat_and_exposes_log_health(tmp_pa
 
 
 @pytest.mark.parametrize("audit_error", [False, True])
-def test_standalone_startup_audit_refusal_is_persisted_before_worker_starts(
+def test_standalone_startup_audit_failure_warns_and_the_worker_still_starts(
     tmp_path, monkeypatch, audit_error, capsys
 ):
     from discord_bridge import __main__ as cli
 
+    class Client:
+        closed = False
+
+        def request(self, *_args, **_kwargs):
+            raise AssertionError("an empty queue needs no Discord call")
+
+        def close(self):
+            Client.closed = True
+
+    class Server:
+        def serve_forever(self):
+            raise KeyboardInterrupt
+
+        def server_close(self):
+            pass
+
+    monkeypatch.delenv("DISCORD_REQUESTS_ENABLED", raising=False)
     monkeypatch.setattr(cli, "load_settings", lambda: None)
     monkeypatch.setattr(cli, "read_state", lambda *_: STATE)
-    monkeypatch.setattr(cli, "DiscordClient", lambda *_: object())
+    monkeypatch.setattr(cli, "DiscordClient", lambda *_: Client())
+    monkeypatch.setattr(cli, "make_server", lambda *_args, **_kwargs: Server())
 
     def refused(*_):
         if audit_error:
@@ -321,10 +350,13 @@ def test_standalone_startup_audit_refusal_is_persisted_before_worker_starts(
         return {"ok": False}
 
     monkeypatch.setattr("discord_bridge.provision.audit", refused)
-    assert cli.main(["serve", "--live", "--database", str(tmp_path / "q")]) == 2
+    assert cli.main(["serve", "--live", "--database", str(tmp_path / "q")]) == 0
     rows = records(tmp_path / "delivery.jsonl")
-    assert [row["event"] for row in rows] == ["privacy_blocked", "queue_summary"]
-    assert rows[0]["entry_point"] == "standalone_worker"
+    events = [row["event"] for row in rows]
+    assert events[0] == "privacy_warning" and "privacy_blocked" not in events
+    assert rows[0]["reason"] == ("audit_error" if audit_error else "privacy_audit")
+    assert rows[0]["blocked"] is False and rows[0]["entry_point"] == "standalone_worker"
+    assert "queue_summary" in events and Client.closed
     assert "PRIVATE" not in json.dumps(rows)
     assert "PRIVATE" not in capsys.readouterr().err
 

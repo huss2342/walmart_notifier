@@ -43,19 +43,30 @@ def test_atomic_collector_intake_matches_a_fresh_reobservation(tmp_path):
     assert watches.claim(now=102 + 60)["user_id"] == USER  # Older match: gathered first.
 
 
-def test_feature_startup_audits_before_any_child_starts(tmp_path):
-    runtime = RequestRuntime(
-        object(),
-        STATE,
-        tmp_path / "q",
-        token="offline",
-        auditor=lambda *_: {"ok": False},
-        worker_factory=Child,
-        gateway_factory=Child,
-    )
-    assert runtime.prepare() is False
-    assert runtime.health()["ready"] is False
-    assert runtime.worker is None and runtime.gateway is None
+def test_failed_startup_audit_warns_and_the_feature_still_starts(tmp_path):
+    events = []
+
+    def failing(*_):
+        raise RuntimeError("audit unavailable")
+
+    for auditor in (lambda *_: {"ok": False}, failing):
+        runtime = RequestRuntime(
+            object(),
+            STATE,
+            tmp_path / "q",
+            token="offline",
+            auditor=auditor,
+            worker_factory=Child,
+            gateway_factory=Child,
+            event_sink=lambda name, **fields: events.append((name, fields)),
+        )
+        # 2026-11-25: findings and audit errors never disable member requests.
+        assert runtime.prepare() is True
+        assert runtime.worker.started and runtime.gateway.started
+        assert runtime.health()["ready"] is True and runtime.health()["last_error"] is None
+        runtime.stop()
+    reasons = [fields["reason"] for name, fields in events if name == "privacy_warning"]
+    assert reasons == ["privacy_audit", "audit_error"]
 
 
 def test_feature_children_start_and_stop_together(tmp_path):

@@ -5,6 +5,7 @@ import threading
 import time
 
 from discord_bridge.api import DiscordError
+from discord_bridge.audit_guard import AuditGuard
 from discord_bridge.core import JobStore
 from discord_bridge.delivery import deliver_due
 
@@ -230,28 +231,43 @@ def test_stop_during_audit_does_not_claim_or_submit_products(tmp_path):
     assert store.counts() == {"pending": 4}
 
 
-def test_audit_failure_blocks_every_channel_before_any_claim(tmp_path):
+def test_audit_failure_never_blocks_any_channel(tmp_path):
+    # 2026-11-25: a managed Server Booster role failed the audit and the
+    # fail-closed gate stopped every alert for ~80 minutes. Findings now warn.
     store = JobStore(tmp_path / "q")
     store.record([product(i) for i in range(10)], now=1000)
-    remote = Remote()
+    remote, events = Remote(), []
     result = deliver_due(
-        store, remote, STATE, live=True, now=1000, auditor=lambda *_: {"ok": False}
+        store, remote, STATE, live=True, now=1000,
+        auditor=lambda *_: {"ok": False, "findings": ["Role 1700000000000000099: privileged."]},
+        event_sink=lambda name, **fields: events.append((name, fields)),
     )
-    assert result["blocked"] is True and not remote.calls
-    assert store.counts() == {"pending": 40}
+    assert result["blocked"] is False and result["sent"] == 30 and remote.calls
+    names = [name for name, _ in events]
+    assert "privacy_blocked" not in names and names.count("privacy_warning") == 1
+    warning = next(fields for name, fields in events if name == "privacy_warning")
+    assert warning["reason"] == "privacy_audit" and warning["findings_count"] == 1
 
 
-def test_audit_429_defers_without_spending_item_attempts(tmp_path):
+def test_audit_429_warns_and_still_sends_without_a_global_defer(tmp_path):
     store = JobStore(tmp_path / "q")
     store.record([product(1)], now=1000)
+    only_route(store, "pro-all")
+    events = []
 
     def limited(*_):
         raise DiscordError(status=429, retry_after=17)
 
-    result = deliver_due(store, Remote(), STATE, live=True, now=1000, auditor=limited)
-    assert result["wait_seconds"] == 17 and result["throttled"] == 1
+    result = deliver_due(
+        store, Remote(), STATE, live=True, now=1000, auditor=limited,
+        event_sink=lambda name, **fields: events.append((name, fields)),
+    )
+    assert result["sent"] == 1 and result["throttled"] == 0 and not result["blocked"]
+    warning = next(fields for name, fields in events if name == "privacy_warning")
+    assert warning["reason"] == "audit_error" and warning["status"] == 429
+    assert "audit_throttled" not in [name for name, _ in events]
     with store._connect() as db:
-        assert db.execute("SELECT SUM(attempts) FROM jobs").fetchone()[0] == 0
+        assert db.execute("SELECT SUM(attempts) FROM jobs").fetchone()[0] == 1
 
 
 def test_single_alert_keeps_original_format_and_has_no_fill_delay(tmp_path):
@@ -281,7 +297,7 @@ def test_old_quiet_pro_category_cannot_starve_behind_three_fresh_paid_channels(t
     assert any(STATE["channels"]["type-pets"] in route for route, _ in remote.calls)
 
 
-def test_full_privacy_audit_still_runs_before_each_four_channel_wave(tmp_path):
+def test_privacy_audit_runs_once_per_call_not_before_every_wave(tmp_path):
     store = JobStore(tmp_path / "q")
     store.record([product(i) for i in range(30)], now=1000)
     remote, audits = Remote(), []
@@ -292,22 +308,22 @@ def test_full_privacy_audit_still_runs_before_each_four_channel_wave(tmp_path):
 
     result = deliver_due(store, remote, STATE, live=True, now=1000, auditor=audited)
     assert result["sent"] == 90 and result["messages"] == 9
-    assert audits == [0, 3, 6]
+    assert audits == [0]
 
 
-def test_failed_reaudit_stops_after_the_first_successful_wave(tmp_path):
+def test_failing_audit_does_not_stop_later_waves(tmp_path):
     store = JobStore(tmp_path / "q")
     store.record([product(i) for i in range(30)], now=1000)
     remote, audits = Remote(), []
 
     def audited(*_):
         audits.append(True)
-        return {"ok": len(audits) == 1}
+        return {"ok": False}
 
     result = deliver_due(store, remote, STATE, live=True, now=1000, auditor=audited)
-    assert result["blocked"] is True
-    assert result["sent"] == 30 and len(remote.calls) == 3
-    assert len(audits) == 2
+    assert result["blocked"] is False
+    assert result["sent"] == 90 and len(remote.calls) == 9
+    assert len(audits) == 1
     with store._connect() as db:
         assert db.execute("SELECT COUNT(*) FROM jobs WHERE state='leased'").fetchone()[0] == 0
 
@@ -360,24 +376,35 @@ def test_ready_paid_routes_take_free_slot_while_free_uses_spare_capacity(tmp_pat
     assert any(state["channels"]["price-200-plus"] in route for route, _ in remote.calls)
 
 
-def test_passing_audit_is_reused_within_its_ttl_and_failures_are_never_cached(tmp_path):
+def test_shared_guard_caches_pass_and_failure_for_its_ttl(tmp_path):
     store = JobStore(tmp_path / "q")
-    cache, audits, verdict = {}, [], {"ok": True}
+    audits, verdict, events, clock = [], {"ok": True}, [], [0.0]
 
     def audited(*_):
         audits.append(True)
         return dict(verdict)
 
+    guard = AuditGuard(
+        audited, ttl=300, event_sink=lambda name, **fields: events.append((name, fields)),
+        clock=lambda: clock[0],
+    )
+
     def deliver(item, now):
         store.record([product(item)], now=now)
-        return deliver_due(store, Remote(), STATE, live=True, now=now, auditor=audited,
-                           audit_cache=cache, audit_ttl=600)
+        return deliver_due(store, Remote(), STATE, live=True, now=now, auditor=guard)
 
     assert deliver(1, 1000)["sent"] and len(audits) == 1
     assert deliver(2, 1001)["sent"] and len(audits) == 1, "a recent pass is reused"
-    cache["until"] = 0  # TTL elapsed
-    verdict["ok"] = False
-    assert deliver(3, 1002)["blocked"] and len(audits) == 2
-    assert deliver(4, 1003)["blocked"] and len(audits) == 3, "failures are rechecked every wave"
-    verdict["ok"] = True
-    assert deliver(5, 1004)["sent"] and len(audits) == 4
+    clock[0] = 301  # TTL elapsed
+    verdict.update(ok=False, findings=["Role 1700000000000000099: privileged."])
+    assert deliver(3, 1002)["sent"] and len(audits) == 2, "a failure still sends"
+    assert deliver(4, 1003)["sent"] and len(audits) == 2, "a failure is cached too"
+    clock[0] = 602
+    assert deliver(5, 1004)["sent"] and len(audits) == 3
+    names = [name for name, _ in events]
+    assert names.count("privacy_warning") == 1, "same findings warn once, not every cycle"
+    verdict.update(ok=True, findings=[])
+    clock[0] = 903
+    assert deliver(6, 1005)["sent"] and len(audits) == 4
+    assert [name for name, _ in events].count("privacy_cleared") == 1
+    assert guard.status()["ok"] is True and guard.status()["findings"] == []

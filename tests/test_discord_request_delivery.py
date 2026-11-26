@@ -246,14 +246,19 @@ def test_delete_while_verifying_prevents_send(tmp_path):
     assert provider.messages == []
 
 
-def test_disabled_and_failed_audit_never_send(tmp_path):
+def test_disabled_never_sends_and_a_failed_audit_only_warns(tmp_path):
     store, _, provider, _ = setup(tmp_path)
     RequestWorker(provider, STATE, store).tick(now=12)
     assert provider.calls == []
-    RequestWorker(provider, STATE, store, enabled=True, auditor=lambda *_: {"ok": False}).tick(
-        now=12
-    )
-    assert provider.messages == []
+    events = []
+    result = RequestWorker(
+        provider, STATE, store, enabled=True, auditor=lambda *_: {"ok": False},
+        event_sink=lambda name, **fields: events.append((name, fields)),
+    ).tick(now=12)
+    # 2026-11-25: audit findings never stop a member's DM.
+    assert result["sent"] == 1 and result["blocked"] == 0 and len(provider.messages) == 1
+    names = [name for name, _ in events]
+    assert "privacy_blocked" not in names and names.count("privacy_warning") == 1
 
 
 def test_one_tick_has_bounded_fanout(tmp_path):

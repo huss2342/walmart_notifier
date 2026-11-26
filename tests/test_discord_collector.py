@@ -227,17 +227,30 @@ def test_seed_mode_suppresses_future_jobs_after_restart(tmp_path):
     assert restarted.store.counts() == {}
 
 
-def test_dry_mode_and_failed_privacy_audit_do_not_send(tmp_path):
+def test_dry_mode_does_not_send_and_a_failed_privacy_audit_only_warns(tmp_path):
     client = FakeDiscord()
     notifier = DiscordNotifier(JobStore(tmp_path / "q"), client=client, state=mapping())
     notifier.ingest([Item.from_dict(product())])
     assert notifier.deliver_once()["sent"] == 0 and client.calls == []
-    notifier.live = True
-    notifier.auditor = lambda *_: {"ok": False, "findings": ["bad permissions"]}
-    assert notifier.deliver_once()["blocked"] is True and client.calls == []
+    client = FakeDiscord()
+    notifier = DiscordNotifier(
+        JobStore(tmp_path / "q2"),
+        client=client,
+        state=mapping(),
+        live=True,
+        auditor=lambda *_: {"ok": False, "findings": ["Role 1700000000000000099: bad."]},
+    )
+    notifier.ingest([Item.from_dict(product())])
+    result = notifier.deliver_once()
+    # 2026-11-25: findings never block; the owner sees them in /health.
+    assert result["blocked"] is False and result["sent"] and client.calls
+    privacy = notifier.health()["privacy"]
+    assert privacy["blocks_delivery"] is False and privacy["ok"] is False
+    assert privacy["findings"] == ["Role 1700000000000000099: bad."]
+    assert "privacy audit warning" in notifier.last_diagnostic
 
 
-def test_diagnostics_only_use_private_operations_after_audit(tmp_path):
+def test_diagnostics_only_use_private_operations_and_ignore_audit_findings(tmp_path):
     client = FakeDiscord()
     notifier = DiscordNotifier(
         JobStore(tmp_path / "q"),
@@ -255,9 +268,15 @@ def test_diagnostics_only_use_private_operations_after_audit(tmp_path):
     assert client.calls[0][2]["allowed_mentions"] == {"parse": []}
     assert notifier.store.counts() == {}
     assert not notifier.send(Item.from_dict(product()))
-    notifier.auditor = lambda *_: {"ok": False}
-    assert not notifier.send(Item(title="blocked", item_id="bot-check", source="diagnostic"))
-    assert len(client.calls) == 1
+    failing = DiscordNotifier(
+        JobStore(tmp_path / "q2"),
+        client=client,
+        state=mapping(),
+        live=True,
+        auditor=lambda *_: {"ok": False},
+    )
+    assert failing.send(Item(title="still sent", item_id="bot-check", source="diagnostic"))
+    assert len(client.calls) == 2
 
 
 def test_registry_selects_discord_without_telegram(monkeypatch, tmp_path):

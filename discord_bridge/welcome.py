@@ -19,6 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .api import DiscordError, retry_local_contention
+from .audit_guard import AuditGuard
 from .monitoring import emit_event, error_fields
 from .request_store import member_ref
 
@@ -60,10 +61,11 @@ class WelcomeWorker:
         self.enabled = enabled
         self.path = Path(path)
         self.paid_due = paid_due or (lambda: False)
-        self.auditor = auditor
         self.stop_event = stop_event if stop_event is not None else threading.Event()
         self.clock = clock or time.time
         self.event_sink = event_sink
+        # Advisory (audit_guard.py): warns, never gates reading or sending.
+        self.auditor = AuditGuard.wrap(auditor, event_sink=event_sink)
         self._lock = threading.RLock()
         self._cycle_lock = threading.Lock()
         self._next_poll = 0
@@ -174,12 +176,10 @@ class WelcomeWorker:
         return rows
 
     def _ready(self):
-        from .provision import audit
-
-        assessment = (self.auditor or audit)(self, self.guild, self.state)
-        if not isinstance(assessment, dict) or assessment.get("ok") is not True:
-            self._last_error = "privacy_audit"
-            return False
+        self.auditor(
+            self, self.guild, self.state,
+            caller=self.component, stop_event=self.stop_event, interrupts=(_Deferred,),
+        )
         guild = self.request("GET", f"/guilds/{self.guild}")
         flags = guild.get("system_channel_flags") if isinstance(guild, dict) else None
         if (
@@ -417,10 +417,9 @@ class WelcomeWorker:
             previous_error = self._last_error
             try:
                 self._available()
-                # The audit gates sending, not reading. Polling only reads one
-                # page, so a full multi-request audit runs before any send and
-                # otherwise at most every _IDLE_AUDIT_SECONDS to keep health
-                # current. Every send still gets a fresh, uncached audit.
+                # The readiness check (system-channel config, plus the cached
+                # advisory privacy audit, which never blocks) runs before any
+                # send and otherwise at most every _IDLE_AUDIT_SECONDS.
                 audited = now >= self._next_audit
                 if audited and not self._audit(now):
                     result["blocked"] = True

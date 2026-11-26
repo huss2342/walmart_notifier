@@ -10,7 +10,7 @@ import hashlib
 import uuid
 
 from .api import DiscordError, retry_local_contention
-from .welcome import WelcomeWorker, _snowflake
+from .welcome import WelcomeWorker, _Deferred, _snowflake
 
 _PAGE_SIZE = 1000
 _MAX_PENDING = 1000
@@ -50,13 +50,13 @@ class MembershipWorker(WelcomeWorker):
             """)
 
     def _ready(self):
-        from .provision import audit
-
-        assessment = (self.auditor or audit)(self, self.guild, self.state)
-        self._configured = isinstance(assessment, dict) and assessment.get("ok") is True
-        if not self._configured:
-            self._last_error = "privacy_audit"
-        return self._configured
+        # Advisory (audit_guard.py): findings warn; celebrations keep running.
+        self.auditor(
+            self, self.guild, self.state,
+            caller="membership", stop_event=self.stop_event, interrupts=(_Deferred,),
+        )
+        self._configured = True
+        return True
 
     def _collect(self, result, now):
         with self._db() as db:
