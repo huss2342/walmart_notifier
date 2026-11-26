@@ -31,7 +31,7 @@ def money(value):
 
 
 def product_link(item):
-    """Short canonical product page; the Claim button carries the review link."""
+    """Short canonical product page (older DMs linked it; still matched on reconcile)."""
     return "https://www.walmart.com/ip/" + item["item_id"].removeprefix("ip-")
 
 
@@ -41,7 +41,7 @@ def _meta(job):
 
 
 def render_bundle_message(jobs, *, part=None, parts=None, shown=None, total=None):
-    """Older matches in one DM: one numbered list, links on numbered buttons."""
+    """Older matches in one DM: one numbered list; each title is its claim link."""
     meta = _meta(jobs[0])
     part = part or meta.get("part") or 1
     parts = parts or meta.get("parts") or 1
@@ -64,26 +64,19 @@ def render_bundle_message(jobs, *, part=None, parts=None, shown=None, total=None
         content += " New listings still alert you right away."
     if parts > 1:
         content = f"({part} of {parts}) {content}"
-    lines, buttons = [], []
+    lines = []
     for position, job in enumerate(jobs, 1):
         item = job["item"]
         rank = position if renumber else _meta(job).get("rank") or position
         lines.append(
-            f"**{rank}.** [{plain(item['title'], TITLE_CHARS)}]({product_link(item)})"
+            f"**{rank}.** [{plain(item['title'], TITLE_CHARS)}]({item['review_url']})"
             f" · {money(item.get('value_cents'))}\n"
             f"Matched: {plain(', '.join(job['queries']), MATCHED_CHARS)}"
-        )
-        buttons.append(
-            {"type": 2, "style": 5, "label": f"{rank} · Claim item", "url": item["review_url"]}
         )
     return {
         "content": content,
         "allowed_mentions": {"parse": []},
         "embeds": [{"title": "Already-listed matches", "description": "\n\n".join(lines)}],
-        "components": [
-            {"type": 1, "components": buttons[start:start + 5]}
-            for start in range(0, len(buttons), 5)
-        ],
         "nonce": jobs[0]["nonce"],
         "enforce_nonce": True,
     }

@@ -1,5 +1,6 @@
 """Catch-up DMs for older matches: compact, size-checked, split safely; /request listed."""
 
+import re
 import sqlite3
 import time
 from urllib.parse import urlencode
@@ -87,8 +88,14 @@ class SizeProvider(Provider):
         return super().request(method, path, payload)
 
 
-def buttons(payload):
-    return [button for row in payload.get("components", []) for button in row["components"]]
+_CLAIM = re.compile(r"^\*\*(\d+)\.\*\* \[.*\]\((https://[^)\s]+)\)", re.M)
+
+
+def claims(payload):
+    """(rank, link) per listed match: each numbered title links its claim page."""
+    assert "components" not in payload, "catch-up DMs carry no buttons"
+    return [(int(rank), url) for embed in payload.get("embeds", [])
+            for rank, url in _CLAIM.findall(embed.get("description") or "")]
 
 
 def test_worst_case_items_and_requests_fill_the_old_format_past_discords_limit():
@@ -107,7 +114,7 @@ def test_worst_case_catchup_parts_each_pass_every_discord_limit(count):
         payload = render_bundle_message(part, part=number, parts=len(packed))
         assert payload_problems(payload) == []
         assert len(encode_payload(payload)) <= BODY_BYTES
-        assert len(payload["embeds"]) == 1 and len(buttons(payload)) == len(part)
+        assert len(payload["embeds"]) == 1 and len(claims(payload)) == len(part)
         assert (f"({number} of {len(packed)})" in payload["content"]) is (len(packed) > 1)
         if count > BUNDLE_LIMIT:
             assert f"Use `/request listed` to see all {count}." in payload["content"]
@@ -123,10 +130,8 @@ def test_typical_ten_older_matches_fit_one_compact_dm():
     assert payload_problems(payload) == [] and len(encode_payload(payload)) < 6000
     description = payload["embeds"][0]["description"]
     assert description.startswith("**1.** [Recliner chair model 0](https://www.walmart.com/ip/")
-    assert [button["label"] for button in buttons(payload)][:2] == ["1 · Claim item",
-                                                                    "2 · Claim item"]
-    assert all(button["style"] == 5 and "sampling" in button["url"].lower()
-               for button in buttons(payload))
+    assert [rank for rank, _ in claims(payload)] == list(range(1, 11))
+    assert all("sampling" in url.lower() for _, url in claims(payload))
 
 
 def test_catchup_text_is_inert_markdown_and_never_mentions():
@@ -214,15 +219,15 @@ def test_oversized_catchup_is_split_at_claim_and_every_part_is_settled(tmp_path)
         assert payload["content"].startswith(f"({number} of {len(messages)}) ")
         assert "Use `/request listed` to see all 12." in payload["content"]
     assert len({payload["nonce"] for payload in messages}) == len(messages)
-    labels = [button["label"] for payload in messages for button in buttons(payload)]
-    assert labels == [f"{rank} · Claim item" for rank in range(1, 11)]
+    ranks = [rank for payload in messages for rank, _ in claims(payload)]
+    assert ranks == list(range(1, 11))
     assert states(store) == {"sent": 10, "skipped": 2}
 
 
 def test_413_splits_a_bundle_and_never_resends_the_rejected_body(tmp_path):
     products = [item(index, value=10000 + index) for index in range(6)]
     store, _ = older_matches(tmp_path, products)
-    provider = SizeProvider(reject=lambda payload: len(buttons(payload)) > 2)
+    provider = SizeProvider(reject=lambda payload: len(claims(payload)) > 2)
     events = []
     worker = RequestWorker(provider, STATE, store, enabled=True,
                            event_sink=lambda event, **fields: events.append((event, fields)))
@@ -232,9 +237,8 @@ def test_413_splits_a_bundle_and_never_resends_the_rejected_body(tmp_path):
     assert len(provider.rejected) == len(set(provider.rejected)), "a rejected body was resent"
     assert not set(provider.rejected) & {encode_payload(payload) for payload in sent}
     assert states(store) == {"sent": 6}
-    assert sorted(button["label"] for payload in sent for button in buttons(payload)) == sorted(
-        f"{rank} · Claim item" for rank in range(1, 7))
-    assert all(len(buttons(payload)) <= 2 for payload in sent)
+    assert sorted(rank for payload in sent for rank, _ in claims(payload)) == list(range(1, 7))
+    assert all(len(claims(payload)) <= 2 for payload in sent)
     # Parts stay in order; a split renumbers only parts not yet sent, so the
     # last DM always reads "(n of n)".
     labels = [payload["content"][1:].split(")")[0].split(" of ") for payload in sent]
@@ -247,7 +251,7 @@ def test_413_splits_a_bundle_and_never_resends_the_rejected_body(tmp_path):
 
 def test_embed_size_400_also_splits_a_bundle(tmp_path):
     store, _ = older_matches(tmp_path, [item(index, value=900 + index) for index in range(4)])
-    provider = SizeProvider(reject=lambda payload: len(buttons(payload)) > 1,
+    provider = SizeProvider(reject=lambda payload: len(claims(payload)) > 1,
                             status=400, provider_code=50035)
     worker = RequestWorker(provider, STATE, store, enabled=True)
     run(worker, 300 + BACKLOG_GATHER_SECONDS)

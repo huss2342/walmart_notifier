@@ -16,7 +16,7 @@ from discord_bridge.request_store import (
     RequestStore,
 )
 
-from test_discord_request_catchup import buttons, item, older_matches, run, states
+from test_discord_request_catchup import claims, item, older_matches, run, states
 from test_discord_request_delivery import DM, STATE, Provider
 from test_discord_requests import GUILD, USER, observe, product
 
@@ -58,8 +58,7 @@ def test_sold_out_top_item_is_dropped_and_the_rest_still_go_out(tmp_path):
     assert len(provider.messages) == 1
     payload = provider.messages[0]
     assert payload["content"].startswith("4 items matching your requests were already listed")
-    assert [button["label"] for button in buttons(payload)] == [
-        f"{rank} · Claim item" for rank in range(1, 5)]
+    assert [rank for rank, _ in claims(payload)] == list(range(1, 5))
     assert products[-1]["review_url"] not in str(payload)
     assert states(store) == {"sent": 4, "cancelled": 1}
     assert reasons(store) == {None: 4, "unavailable": 1}
@@ -74,8 +73,7 @@ def test_sold_out_lower_item_is_dropped_and_numbering_stays_contiguous(tmp_path)
     run(RequestWorker(provider, STATE, store, enabled=True), DUE, ticks=20)
     (payload,) = provider.messages
     assert payload["content"].startswith("3 items matching")
-    assert [button["label"] for button in buttons(payload)] == [
-        f"{rank} · Claim item" for rank in range(1, 4)]
+    assert [rank for rank, _ in claims(payload)] == list(range(1, 4))
     assert states(store) == {"sent": 3, "cancelled": 1}
 
 
@@ -133,7 +131,7 @@ def test_later_search_waves_join_the_same_catchup(tmp_path):
     (payload,) = provider.messages
     assert payload["content"].startswith("8 items matching your requests were already listed")
     assert "/request listed" not in payload["content"]
-    assert len(buttons(payload)) == 8 and states(store) == {"sent": 8}
+    assert len(claims(payload)) == 8 and states(store) == {"sent": 8}
 
 
 def test_two_large_waves_send_one_top_ten_with_the_full_count(tmp_path):
@@ -228,7 +226,7 @@ def bot_copy(payload, *, author=None):
     return {"id": "888888888888888888", "channel_id": DM,
             "author": author or {"id": "999999999999999999", "bot": True},
             "content": payload["content"], "embeds": payload["embeds"],
-            "components": payload["components"]}
+            "components": payload.get("components", [])}
 
 
 def test_parked_dm_found_in_history_is_settled_as_sent(tmp_path):
@@ -299,7 +297,7 @@ def test_parked_catchup_is_matched_by_any_item_and_settled_together(tmp_path):
     assert worker.tick(now=DUE)["review"] == 1
     assert states(store) == {"review": 3}
     payload = provider.messages[-1]
-    # Only the embed links survive (say the buttons were stripped): still found.
+    # Only the embed links carry the items (no buttons): still found.
     provider.history = [{**bot_copy(payload), "components": []}]
     worker.tick(now=later(DUE))
     assert states(store) == {"sent": 3} and reasons(store) == {"reconciled_sent": 3}

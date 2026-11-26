@@ -117,12 +117,9 @@ def test_message_is_safe_without_claim_count_or_pings():
     assert "claims_remaining" not in text
     assert "Claims remaining" not in text
     assert "5-minute delay" not in text
-    # The title opens the product; the single button opens the claim page.
-    buttons = message["components"][0]["components"]
-    assert [(button["label"], button["url"]) for button in buttons] == [
-        ("Claim item", clean["review_url"]),
-    ]
-    assert message["embeds"][0]["url"] == clean["product_url"]
+    # No buttons: the title is the claim link.
+    assert "components" not in message
+    assert message["embeds"][0]["url"] == clean["review_url"]
 
 
 @pytest.mark.parametrize("folder", ["asr", "seo"])
@@ -164,7 +161,7 @@ def test_missing_or_untrusted_optional_image_does_not_block_alert(image):
     assert clean.get("image_url", "") == ""
     message = render_message(clean, first_seen=1000, last_seen=1000, route="pro-all")
     assert "thumbnail" not in message["embeds"][0]
-    assert len(message["components"][0]["components"]) == 1
+    assert message["embeds"][0]["url"] == clean["review_url"]
 
 
 def test_legacy_queued_item_without_image_still_renders():
@@ -198,7 +195,7 @@ def test_later_enrichment_creates_missing_routes_without_resetting_clock(tmp_pat
 def test_long_product_slug_falls_back_to_short_safe_discord_links():
     clean = normalize_item(item(url="https://www.walmart.com/ip/" + "a" * 600 + "/20449164214"))
     message = render_message(clean, first_seen=1000, last_seen=1000, route="pro-all")
-    assert all(len(button["url"]) <= 512 for button in message["components"][0]["components"])
+    assert len(message["embeds"][0]["url"]) <= 512
     assert clean["product_url"] == "https://www.walmart.com/ip/20449164214"
 
 

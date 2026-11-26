@@ -43,7 +43,9 @@ def render_message(
         )
     embed = {
         "title": _embed_title(f"{money} | {title}"),
-        "url": item["product_url"],
+        # The title is the claim link: members tap or long-press it (copyable on
+        # phones, kept when an alert is forwarded). No buttons since 2026-11-26.
+        "url": item["review_url"],
         "description": description,
         "footer": {"text": item["item_id"]},
     }
@@ -52,15 +54,6 @@ def render_message(
     return {
         "allowed_mentions": {"parse": []},
         "embeds": [embed],
-        "components": [
-            {
-                "type": 1,
-                # The card title already opens the product page.
-                "components": [
-                    {"type": 2, "style": 5, "label": "Claim item", "url": item["review_url"]}
-                ],
-            }
-        ],
     }
 
 
@@ -86,21 +79,11 @@ def render_batch(jobs: list[dict]) -> dict:
         "content": f"**{len(jobs)} item alerts**",
         "allowed_mentions": {"parse": []},
         "embeds": [],
-        "components": [],
     }
     for index, message in enumerate(messages, 1):
         embed = message["embeds"][0]
         embed["title"] = _embed_title(f"[{index}] {embed['title']}")
-        # Each card itself opens review context; members needn't scroll through
-        # the other cards to reach the numbered button rows below the bundle.
-        embed["url"] = jobs[index - 1]["item"]["review_url"]
         result["embeds"].append(embed)
-        button = message["components"][0]["components"][0]
-        button["label"] = f"{index} · {button['label']}"
-        # One claim button per item, five per row: ten items fit in two rows.
-        if index % 5 == 1:
-            result["components"].append({"type": 1, "components": []})
-        result["components"][-1]["components"].append(button)
     characters = sum(
         len((embed["title"] + embed["description"] + embed["footer"]["text"]).encode("utf-16-le"))
         // 2

@@ -278,7 +278,8 @@ def test_single_alert_keeps_original_format_and_has_no_fill_delay(tmp_path):
     assert run(store, remote)["sent"] == 1
     payload = remote.calls[0][1]
     assert "content" not in payload
-    assert payload["components"][0]["components"][0]["label"] == "Claim item"
+    assert "components" not in payload
+    assert "sampling" in payload["embeds"][0]["url"].lower()
 
 
 def test_old_quiet_pro_category_cannot_starve_behind_three_fresh_paid_channels(tmp_path):

@@ -1,5 +1,6 @@
 """Minimum-value watches and atomic comma-separated request creation."""
 
+import re
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 
@@ -433,12 +434,12 @@ def test_older_matches_wait_and_bundle_while_new_listings_alert_at_once(tmp_path
     assert sorted(row["item_id"] for row in bundle) == sorted(item["item_id"] for item in old)
     payload = render_request_message(store.begin_send(store.validate(job, now=361), now=361,
                                                       channel_id="555555555555555555"))
-    # One compact list, not a card per item; numbered Claim buttons.
+    # One compact list, not a card per item; each numbered title is its claim link.
     assert len(payload["embeds"]) == 1 and "3 items" in payload["content"]
     assert payload["embeds"][0]["description"].count("Matched: recliner") == 3
-    assert sum(len(row["components"]) for row in payload["components"]) == 3
-    buttons = [button for row in payload["components"] for button in row["components"]]
-    assert all("Claim item" in b["label"] and "sampling" in b["url"].lower() for b in buttons)
+    assert "components" not in payload
+    links = re.findall(r"\]\((https://[^)\s]+)\)", payload["embeds"][0]["description"])
+    assert len(links) == 3 and all("sampling" in link.lower() for link in links)
     assert store.settle(job, "sent", message_id="666666666666666666")
     with sqlite3.connect(store.path) as db:
         states = db.execute(

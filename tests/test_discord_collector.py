@@ -116,9 +116,8 @@ def test_http_image_survives_queue_restart_and_reaches_existing_alert(discord_se
     assert len(client.calls) == 3  # No separate image message or upload.
     for _, _, payload in client.calls:
         assert payload["embeds"][0]["thumbnail"] == {"url": image}
-        assert [button["label"] for button in payload["components"][0]["components"]] == [
-            "Claim item",
-        ]
+        assert "components" not in payload
+        assert "sampling" in payload["embeds"][0]["url"].lower()
         assert "private" not in json.dumps(payload)
 
 

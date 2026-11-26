@@ -158,15 +158,14 @@ def test_definitively_rejected_single_is_terminal_without_nonce_repack(tmp_path)
         ).fetchone()[:] == (batch["id"], "http_413")
 
 
-def test_ready_burst_has_five_items_one_frozen_message_and_one_claim_button_each(tmp_path):
+def test_ready_burst_has_five_items_one_frozen_message_and_claim_link_titles(tmp_path):
     store = core.JobStore(tmp_path / "q")
     store.record([product(i) for i in range(8)], now=1000)
     only_route(store, "pro-all")
     batch = store.claim_batch(now=1000)
     assert len(batch["jobs"]) == 5
     payload = batch["payload"]
-    assert len(payload["embeds"]) == 5 and len(payload["components"]) == 1
-    assert len(payload["components"][0]["components"]) == 5  # One claim button per item.
+    assert len(payload["embeds"]) == 5 and "components" not in payload  # Titles are the claim links.
     assert payload["nonce"] == batch["id"] and payload["enforce_nonce"] is True
     assert payload["allowed_mentions"] == {"parse": []}
     assert all("sampling" in embed["url"].lower() for embed in payload["embeds"])
@@ -175,7 +174,7 @@ def test_ready_burst_has_five_items_one_frozen_message_and_one_claim_button_each
     assert len(store.claim_batch(now=1001)["jobs"]) == 3
 
 
-def test_paid_ten_item_dispatch_keeps_all_cards_and_buttons_within_provider_limits(tmp_path):
+def test_paid_ten_item_dispatch_keeps_all_cards_within_provider_limits(tmp_path):
     # The renderer's official embed/component bounds are independent of the
     # stricter application wire-byte guard tested above at reservation time.
     jobs = [
@@ -189,11 +188,8 @@ def test_paid_ten_item_dispatch_keeps_all_cards_and_buttons_within_provider_limi
     ]
     payload = core.render_batch(jobs)
     assert len(payload["embeds"]) == 10
-    assert len(payload["components"]) == 2
-    buttons = [button for row in payload["components"] for button in row["components"]]
-    assert len(buttons) == 10
-    assert all(len(row["components"]) == 5 for row in payload["components"])
-    assert all(len(button["label"]) <= 80 and len(button["url"]) <= 512 for button in buttons)
+    assert "components" not in payload
+    assert all(len(embed["url"]) <= 512 for embed in payload["embeds"])
     assert payload["allowed_mentions"] == {"parse": []}
     assert (
         sum(
@@ -203,8 +199,7 @@ def test_paid_ten_item_dispatch_keeps_all_cards_and_buttons_within_provider_limi
         <= 6000
     )
     for index, job in enumerate(jobs, 1):
-        assert buttons[index - 1]["url"] == job["item"]["review_url"]
-        assert buttons[index - 1]["label"] == f"{index} · Claim item"
+        assert payload["embeds"][index - 1]["url"] == job["item"]["review_url"]
         assert payload["embeds"][index - 1]["title"].startswith(f"[{index}]")
 
 
@@ -416,7 +411,4 @@ def test_maximum_title_batch_stays_inside_discord_embed_and_button_limits(tmp_pa
         for embed in payload["embeds"]
     )
     assert characters <= 6000
-    assert len(payload["embeds"]) <= 10 and len(payload["components"]) <= 5
-    assert all(
-        len(button["label"]) <= 80 for row in payload["components"] for button in row["components"]
-    )
+    assert len(payload["embeds"]) <= 10 and "components" not in payload
