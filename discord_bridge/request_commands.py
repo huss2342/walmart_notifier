@@ -24,6 +24,8 @@ from .request_render import money, plain
 from .request_store import LISTED_FRESH_SECONDS, member_ref
 
 _SNOWFLAKE = re.compile(r"[0-9]{17,20}\Z")
+GATEWAY_RETRY_FIRST = 5  # seconds before retrying a failed gateway connect
+GATEWAY_RETRY_MAX = 60
 _DM_HELP = (
     "Enable direct messages from this server in Discord's Privacy Settings, "
     "unblock the bot if needed, then run /request test-dm. "
@@ -1100,11 +1102,31 @@ class RequestGateway:
         emit_event(self._events, "worker_lifecycle", component="gateway", transition="started")
 
     def _run(self):
+        # discord.py reconnects by itself only after a first successful login.
+        # A failed first connect (network not up yet after a restart) used to
+        # end this thread for good: every command then said "The application
+        # did not respond". Keep retrying with backoff until stopped.
+        delay = GATEWAY_RETRY_FIRST
         try:
-            asyncio.run(self._connect())
-        except Exception:
-            self._last_error = "gateway_connection"
-            self._event("gateway_error")
+            while not self._stop.is_set():
+                began = time.monotonic()
+                try:
+                    asyncio.run(self._connect())
+                except Exception:
+                    self._last_error = "gateway_connection"
+                    self._event("gateway_error")
+                self._connected = False
+                self._loop = None
+                if self._stop.is_set() or self._last_error == "gateway_identity":
+                    break
+                emit_event(self._events, "worker_lifecycle", component="gateway",
+                           transition="retrying", retry_seconds=delay)
+                if self._stop.wait(delay):
+                    break
+                # A session that lasted a while starts the backoff over.
+                long_run = time.monotonic() - began >= GATEWAY_RETRY_MAX * 5
+                delay = GATEWAY_RETRY_FIRST if long_run else min(delay * 2, GATEWAY_RETRY_MAX)
+                self._last_lifecycle = None  # report the next attempt's outcome again
         finally:
             self._connected = False
             self._loop = None

@@ -855,3 +855,53 @@ def test_delete_autocomplete_keeps_earlier_picks(tmp_path):
     choices = invoke(commands.autocomplete, interaction, f"{first['id']}, men", multiple=True)
     assert choices == [(f"{first['id']}, mens hat", f"{first['id']}, {second['id']}")]
     assert invoke(commands.autocomplete, interaction, "men")[0][1] == str(second["id"])
+
+
+def test_gateway_retries_when_the_first_connect_fails(monkeypatch):
+    """A restart while the network is still down must not leave commands dead."""
+    import discord
+    import discord_bridge.request_commands as module
+
+    monkeypatch.setattr(module, "GATEWAY_RETRY_FIRST", 0.01)
+    entered = threading.Event()
+    events, attempts = [], []
+
+    class Gateway(discord.Client):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self._connection.user = SimpleNamespace(id=int(STATE["bot_user_id"]))
+            self._connection.application_id = int(STATE["bot_user_id"])
+            self.done = asyncio.Event()
+
+        async def start(self, token, *, reconnect):
+            attempts.append(token)
+            if len(attempts) < 3:
+                raise OSError("network is unreachable")
+            await self.on_ready()
+            entered.set()
+            await self.done.wait()
+
+        async def close(self):
+            self.done.set()
+
+    monkeypatch.setattr(
+        module,
+        "_sdk",
+        lambda: SimpleNamespace(
+            Client=Gateway, Intents=discord.Intents, AllowedMentions=discord.AllowedMentions,
+            app_commands=discord.app_commands, Object=discord.Object, ui=discord.ui,
+            ButtonStyle=discord.ButtonStyle, SelectOption=discord.SelectOption,
+            InteractionType=discord.InteractionType,
+        ),
+    )
+    gateway = RequestGateway(Client(), STATE, Store(), token="secret", enabled=True,
+                             event_sink=lambda event, **fields: events.append((event, fields)))
+    gateway.start()
+    try:
+        assert entered.wait(5)
+        assert len(attempts) == 3
+        assert gateway.health()["connected"] is True and gateway.health()["running"]
+        assert sum(f.get("transition") == "retrying" for _, f in events) == 2
+    finally:
+        gateway.stop()
+    assert not gateway.health()["running"]
