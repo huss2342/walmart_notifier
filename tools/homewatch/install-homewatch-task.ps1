@@ -16,6 +16,8 @@ Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'homewatch-beat.ps1') -Destinati
 Set-Content -LiteralPath (Join-Path $dir 'key.txt') -Value $key -NoNewline -Encoding ascii
 
 $name = 'Reviewer homewatch heartbeat'
+# A running loop keeps the old script in memory: stop it so the new copy starts below.
+if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) { Stop-ScheduledTask -TaskName $name }
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
     -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$dir\homewatch-beat.ps1`""
 # At boot, plus every 5 minutes so a crashed loop comes back (IgnoreNew skips it while running).

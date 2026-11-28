@@ -2,13 +2,16 @@
 # Runs as SYSTEM from boot, signed in or not (install-homewatch-task.ps1 copies it to
 # %ProgramData%\homewatch). Every minute it posts whether someone is signed in, whether the
 # bot's /health answers, how long since the scanner's last page batch and whether channel
-# sending has stalled. The server pings the owner when beats stop or a problem lasts.
+# sending has stalled, plus whether bot commands and DM alerts work. The server pings the owner when beats stop or a problem lasts.
 $ErrorActionPreference = 'Stop'
 $dir = Join-Path $env:ProgramData 'homewatch'
 $key = (Get-Content -LiteralPath (Join-Path $dir 'key.txt') -Raw).Trim()
 $url = 'https://178-105-83-9.sslip.io/homewatch/beat'
 $headers = @{ Authorization = "Bearer $key" }
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+# Exit when this file is replaced: the task's 5-minute trigger starts the new copy.
+$self = $MyInvocation.MyCommand.Path
+$selfStamp = (Get-Item -LiteralPath $self).LastWriteTimeUtc
 
 while ($true) {
     $started = Get-Date
@@ -30,6 +33,13 @@ while ($true) {
             $beat.due_items = $wd.due_items
         }
         if ($null -ne $h.discord.live_sending) { $beat.live_sending = [bool]$h.discord.live_sending }
+        $req = $h.discord.requests
+        if ($req -and $req.enabled) {
+            # Slash commands and buttons need the gateway; DM alerts need the delivery worker.
+            $beat.commands_ok = [bool]($req.gateway.running -and $req.gateway.connected)
+            $beat.dm_ok = [bool]($req.delivery.running -and $req.delivery.last_poll_status -eq 'ok')
+            $beat.dm_due_age = $req.delivery.queue.oldest_due_age_seconds
+        }
         if (-not $beat.bot_ok) { $beat.bot_error = "health status $($h.status)" }
     } catch {
         $beat.bot_error = ($_.Exception.GetType().Name)
@@ -45,4 +55,5 @@ while ($true) {
         Set-Content -LiteralPath (Join-Path $dir 'last.txt') -Encoding utf8
     $wait = 60 - ((Get-Date) - $started).TotalSeconds
     if ($wait -gt 0) { Start-Sleep -Seconds $wait }
+    if ((Get-Item -LiteralPath $self).LastWriteTimeUtc -ne $selfStamp) { exit 0 }
 }
