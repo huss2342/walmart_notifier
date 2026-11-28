@@ -22,6 +22,9 @@ sim_after.txt). Expected +2 items in this window (~88%). 98% is not reachable
 at ~48 reads/min: the rest are first seen by searches read every 10-30 min.
 Owner must reload the extension. Rollback: revert this commit (old scheduler
 in data/opt-20261128/before/fast-reads.js).
+Next run: remeasure.py only detects the 2.32.9 reload. Find the 2.32.10 reload
+as the first min_price=79 page 5 or 6 read ~40 s after the previous one while it
+held no $80+ offer (was ~3 min), and pass that window to delay_bounds.py --hours.
 
 ## Search optimisation (November 26; extension 2.32.9 reload pending, no backend change)
 
