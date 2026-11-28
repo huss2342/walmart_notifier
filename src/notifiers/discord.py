@@ -283,6 +283,9 @@ class DiscordNotifier:
                            **error_fields(exc))
         if self.membership is not None:
             self.membership.referrals_enabled = self.referrals is not None
+            pro = getattr(self.referrals, "pro", None)
+            if pro is not None:
+                self.membership.trial_members = lambda: pro.trial_members
         self.requests = None
         if live and requests_enabled:
             def request_runtime():

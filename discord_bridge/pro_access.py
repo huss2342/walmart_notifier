@@ -217,6 +217,9 @@ class ProAccessService:
         self._founding_at = None
         self._reasserted = None
         self._reassert_queue = []
+        # Discord IDs whose Pro comes only from a free trial; None until the
+        # first poll. The membership celebration waits for the paid start.
+        self.trial_members = None
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread = None
@@ -350,11 +353,14 @@ class ProAccessService:
     def poll(self):
         rows = self.provider.list_memberships()
         paid_ids = self._paid_ids(rows)
-        wanted = {}
+        wanted, paying = {}, set()
         for row in rows:
             discord_id = _discord_of(row)
             if discord_id and entitled(row, paid_ids):
                 wanted[discord_id] = row["id"]
+                if row.get("status") != "trialing":
+                    paying.add(discord_id)
+        self.trial_members = frozenset(set(wanted) - paying)
         granted = self.store.granted()
         now = self.clock()
         limited = False

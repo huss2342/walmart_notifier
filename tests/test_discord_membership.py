@@ -273,3 +273,35 @@ def test_preview_mode_does_not_start_membership_announcements(tmp_path):
     notifier = DiscordNotifier(JobStore(tmp_path / "queue.sqlite3"), membership_enabled=True)
     assert notifier.membership is None
     assert notifier.health()["membership"]["enabled"] is False
+
+
+def test_free_trial_pro_is_not_celebrated_until_the_paid_start(tmp_path):
+    worker, client, clock = make(tmp_path)
+    trials = [None]
+    worker.trial_members = lambda: trials[0]
+    worker.tick()
+    client.members = [member(USER, PRO), member(OTHER, PRO)]
+    # Trial status not loaded yet: wait instead of guessing.
+    assert advance(worker, clock)["sent"] == 0
+    trials[0] = frozenset({USER})
+    assert advance(worker, clock)["sent"] == 1  # OTHER paid directly
+    assert len(posts(client)) == 1 and f"<@{OTHER}>" in posts(client)[0][2]["content"]
+    assert advance(worker, clock)["sent"] == 0  # still on the trial
+    trials[0] = frozenset()  # first charge after the trial
+    assert advance(worker, clock)["sent"] == 1
+    assert f"<@{USER}>" in posts(client)[1][2]["content"]
+    assert advance(worker, clock)["sent"] == 0
+
+
+def test_canceled_trial_then_purchase_celebrates_once(tmp_path):
+    worker, client, clock = make(tmp_path)
+    trials = [frozenset({USER})]
+    worker.trial_members = lambda: trials[0]
+    worker.tick()
+    client.members = [member(USER, PRO)]
+    assert advance(worker, clock)["sent"] == 0
+    client.members, trials[0] = [], frozenset()  # trial canceled: Pro removed
+    assert advance(worker, clock)["sent"] == 0
+    client.members = [member(USER, PRO)]  # bought Pro
+    assert advance(worker, clock)["sent"] == 1
+    assert len(posts(client)) == 1

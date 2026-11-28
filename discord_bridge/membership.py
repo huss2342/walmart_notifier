@@ -25,6 +25,10 @@ class MembershipWorker(WelcomeWorker):
 
     def __init__(self, *args, **kwargs):
         self.referrals_enabled = False
+        # Callable -> set of Discord IDs on a free Pro trial (None = not known
+        # yet). Set when Pro checkout runs: trials are not celebrated; the
+        # celebration comes when the first paid membership starts.
+        self.trial_members = None
         super().__init__(*args, **kwargs)
         if not self.enabled:
             return
@@ -109,6 +113,7 @@ class MembershipWorker(WelcomeWorker):
             pending = db.execute(
                 "SELECT COUNT(*) FROM welcomes WHERE state IN ('pending','sending')"
             ).fetchone()[0]
+            trials = self.trial_members() if self.trial_members and not baseline else frozenset()
             complete = True
             for member in members:
                 user, tier = member["user_id"], member["tier"]
@@ -123,6 +128,10 @@ class MembershipWorker(WelcomeWorker):
                     "SELECT until FROM cooldowns WHERE user_hash=?", (cooldown_key,)
                 ).fetchone()
                 celebrate = not baseline and changed and (not cooldown or cooldown[0] <= now)
+                if celebrate and tier == "pro" and (trials is None or user in trials):
+                    # On a free trial (or trial status not loaded yet): no
+                    # message and no ledger row, so the paid start celebrates.
+                    continue
                 if celebrate and pending >= _MAX_PENDING:
                     complete = False
                     continue

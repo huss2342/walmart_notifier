@@ -570,3 +570,15 @@ def test_cooldown_is_shared_across_buttons(tmp_path, monkeypatch):
     finally:
         pro.close()
         redeem.close()
+
+
+def test_poll_reports_who_is_only_on_a_free_trial(tmp_path):
+    whop = Whop([member("mem_a", status="trialing"), member("mem_b", discord=OTHER),
+                 member("mem_c", status="trialing", discord=OTHER)])
+    svc = service(tmp_path, whop)
+    assert svc.trial_members is None  # unknown until the first poll
+    svc.poll()
+    assert svc.trial_members == {USER}  # OTHER also pays on mem_b
+    whop.rows = [member("mem_a"), member("mem_b", discord=OTHER)]  # trial converted
+    svc.poll()
+    assert svc.trial_members == frozenset()
