@@ -11,3 +11,4 @@ data/
 # Per-machine coding-tool settings and backups
 /opencode.json
 /opencode.json.runpod-backup
+tasks/coverage-loop/chat.log
