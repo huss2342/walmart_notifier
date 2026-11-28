@@ -10,7 +10,8 @@
 //   0  sort=price_high page 1 every 10 s (first of all), every other page holding $80+ items
 //      every 30 s (the owner's two most valuable reads), the page after them
 //      while it holds none every 2 min; the min_price=79 list (about 8 pages),
-//      each page holding an $80+ offer every 40 s, the rest every 3 min; the
+//      each page holding an $80+ offer and the two pages after the last of them
+//      (never the list's last page) every 40 s, the rest every 3 min; the
 //      same list newest first (new80), page 1 every 40 s; the 13 hot searches
 //      (page 1) every 48 s
 //   1  the slow, fixed checks: sort=new page 1 (30 min) and member or priority
@@ -23,6 +24,18 @@
 //   5  department pages, deepest first, only in slots nothing above needs
 // Within a rank, a page re-read to settle a held restock goes first, then the
 // target most overdue for its own interval.
+// Nov 28 (2.32.10, coverage loop, same read load). Page snapshot log, 58.9 h
+// since the 2.32.9 reload: 78 of 91 new $80+ items surely on time (85.7%; 6 more
+// fell in the Nov 26 01:37-07:15 alert-server outage). Two of the 13 late ones,
+// and one in the 95 h before, turned up first at position 1 of min_price=79
+// page 5 or 6, the first or second page after the $80+ block, read every 3 min
+// (181-184 s late); those pages sat without an $80+ offer for 1-3 days, so
+// keeping a page fast for hours after it last held one would not have caught
+// them. The two pages after the last $80+ page are now read every 40 s, except
+// the list's last page (its short $79.xx tail; no $80+ item first there).
+// Simulated (data/opt-20261126/cadence_sim.mjs, seeds 20261126 / 7): 47.96 /
+// 47.97 -> 47.73 / 47.90 direct reads a minute; pages 5-6 182 -> 41.5 s p50;
+// member searches with products 7.1 -> 8.7 min p50, priority 22 -> 29.5 min.
 // Nov 26 (2.32.9, owner-approved, same read load; data/opt-20261126/REPORT.md).
 // Page snapshot log, 52 h after the 2.32.8 reload: 90 of 96 new $80+ items surely
 // on time (93.8%); every item a catalogue list showed within 60 s was. The 6 late
@@ -172,6 +185,9 @@ const ReviewerFastReads = (() => {
   const VALUE_MAX_PAGES = 12;
   const VALUE80_MAX_PAGES = 12; // The min_price=79 list ran to 8 pages on Nov 12.
   const VALUE80_MIN_PRICE = 79; // $80+ offers can sit on listings Walmart prices at $79.xx.
+  // The two min_price=79 pages after the last one holding an $80+ offer are read
+  // at 40 s too (3 min until Nov 28), except the list's last page (its short tail).
+  const VALUE80_EDGE_PAGES = 2;
   const DEPARTMENT_PAGES = 25; // Walmart's own page ceiling.
   const DEPARTMENT_FAILURES = 3; // Unreadable department pages in a row pause that filler.
   const DEPARTMENT_PAUSE_MS = 30 * 60_000;
@@ -372,9 +388,13 @@ const ReviewerFastReads = (() => {
         lane: 'value', page: index + 1, rank: index ? RANK.value : RANK.valueTop,
         interval: INTERVALS.value[index] ??
           (valueSpill.has(index + 1) ? INTERVALS.valueSpill : INTERVALS.valueHigh) }));
+      // New $80+ offers turned up first at position 1 of the first or second page
+      // after the $80+ block (3 of 265 new $80+ items, Nov 19-28, all ~3 min late).
+      const lastHot = Math.max(0, ...value80.hot);
+      const edge = page => lastHot > 0 && page > lastHot && page <= lastHot + VALUE80_EDGE_PAGES && page < value80.pages;
       for (let page = 1; page <= value80.pages; page += 1) {
         targets.push({ key: `value80:${page}`, lane: 'value80', page, rank: RANK.value,
-          interval: value80.hot.has(page) ? INTERVALS.value80 : INTERVALS.value80Idle });
+          interval: value80.hot.has(page) || edge(page) ? INTERVALS.value80 : INTERVALS.value80Idle });
       }
       // The pages under $80 are read as one pass, top-down and back to back. A
       // newly listed item only pushes the ones below it further down, onto a

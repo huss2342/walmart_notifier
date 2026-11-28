@@ -502,6 +502,19 @@ test('the min_price=79 list is read page by page: $80+ pages every 40 s, the res
     'its offers are ingested like any other read');
 });
 
+// Nov 28: 3 of 265 new $80+ items turned up first at position 1 of the first or
+// second page after the $80+ block, ~3 min late; those two pages are read at 40 s.
+test('the two min_price=79 pages after the $80+ block are read every 40 s, the last page stays idle', async () => {
+  const h = harness({ respond: value80Reply({ 1: [206, 79], 2: [142, 60], 3: [101, 50], 4: [96, 40], 5: [70, 30],
+    6: [70, 20], 7: [32, 5] }) });
+  await h.steps(400, 1_600); // about 10.7 minutes
+  for (const page of [1, 2, 3, 4, 5, 6]) {
+    const late = gaps(h.asked, `value80:${page}`).slice(2);
+    assert.ok(late.length >= 8 && late.every(gap => gap >= 40_000 && gap <= 48_000), `page ${page}: ${late}`);
+  }
+  assert.ok(gaps(h.asked, 'value80:7').slice(1).every(gap => gap >= 180_000), 'the last page is idle');
+});
+
 test('a page that held back a restock is re-read 10 s later and re-sent even when unchanged', async () => {
   let holds = 1;
   let awaiting = false;

@@ -2,6 +2,27 @@
 
 Updated November 12, 2026 (America/Chicago).
 
+## Coverage loop run 1 (November 28; extension 2.32.10 reload pending, no backend change)
+
+Measured 58.9 h since the 2.32.9 reload (data/opt-20261126/remeasure-20261128-1053.txt):
+78 of 91 new $80+ items surely on time, **85.7%** without the 6 items of the
+Nov 26 01:37-07:15 alert-server outage (80.4% with them, 97 items). Late 13:
+member searches 6 (3 empty ones on the 30-min check, ~1810 s; 3 at ~10 min,
+450-680 s), priority 'dresser' 1 (1822 s), tabs 4 (requests 3, departments 1),
+min_price=79 pages 5/6 2 (181-184 s). Lists missed the search/tab items (list
+lag up to 13 min, or never listed); hot searches missed them through search
+lag or because the word was not hot. Change (equal load): the two min_price=79
+pages after the last $80+ page are read every 40 s, not 3 min, except the
+list's last page (`VALUE80_EDGE_PAGES = 2`). Those pages sat without $80+ for
+1-3 days before the items appeared at position 1 (3 of 265 items in A+B), so a
+"keep fast for hours" rule would not have helped. Simulated: 47.96/47.97 ->
+47.73/47.90 reads/min, pages 5-6 182 -> 41.5 s p50, member searches 7.1 -> 8.7
+min p50, priority 22 -> 29.5 min (data/opt-20261128/sim_before.txt,
+sim_after.txt). Expected +2 items in this window (~88%). 98% is not reachable
+at ~48 reads/min: the rest are first seen by searches read every 10-30 min.
+Owner must reload the extension. Rollback: revert this commit (old scheduler
+in data/opt-20261128/before/fast-reads.js).
+
 ## Search optimisation (November 26; extension 2.32.9 reload pending, no backend change)
 
 Study (read-only, data/opt-20261126/REPORT.md): since the 2.32.8 reload 90/96
